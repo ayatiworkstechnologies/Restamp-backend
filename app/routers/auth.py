@@ -29,13 +29,12 @@ def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
 
 @router.post("/otp/request")
 def otp_request(body: schemas.OTPRequest):
-    """Generate an OTP and return it directly in the response.
-
-    The ``otp`` field always contains the generated code. Once a real SMS
-    provider is integrated, remove the ``otp`` field and rely on SMS delivery.
-    """
     code = otp_service.request_code(body.phone)
-    return {"message": "OTP generated successfully.", "otp": code}
+    # The code leaves the server ONLY in OTP_DEBUG (local dev/tests).
+    resp = {"message": "If the number is valid, an OTP was sent."}
+    if code is not None:
+        resp["debug_code"] = code
+    return resp
 
 
 @router.post("/otp/verify", response_model=schemas.TokenOut)

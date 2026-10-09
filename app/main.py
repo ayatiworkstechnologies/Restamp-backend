@@ -2,13 +2,6 @@
 import logging
 from contextlib import asynccontextmanager
 
-# Load .env (local dev). On Render/production, env vars are injected by the platform.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv optional; env vars set directly in production
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,9 +19,10 @@ from .services import storage as storage_svc
 
 log = logging.getLogger("restamp")
 
-# Local-development browser origins only (Expo web :8081, classic :19006).
-# Overridable via RESTAMP_CORS_ORIGINS (comma-separated).
-# Set RESTAMP_CORS_ORIGINS=* on Render to allow all origins (fine for mobile API).
+# Allowed browser origins. Local-development defaults (Expo web :8081,
+# classic :19006); override via RESTAMP_CORS_ORIGINS (comma-separated) on
+# Render with the exact production frontend origins. Never "*" with
+# credentials; native apps are unaffected by CORS.
 _DEFAULT_LOCAL_ORIGINS = [
     "http://localhost:8081",
     "http://127.0.0.1:8081",
@@ -38,9 +32,7 @@ _DEFAULT_LOCAL_ORIGINS = [
 
 
 def _cors_origins() -> list[str]:
-    raw = settings.CORS_ORIGINS.strip()
-    if raw == "*":
-        return ["*"]
+    raw = settings.CORS_ORIGINS
     if raw:
         return [o.strip() for o in raw.split(",") if o.strip()]
     return _DEFAULT_LOCAL_ORIGINS

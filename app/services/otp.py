@@ -1,11 +1,10 @@
 """RESTAMP Phase 4 — phone OTP foundation.
 
 - Provider abstraction: connect a real SMS vendor later by implementing OTPProvider.
-- DevOTPProvider generates random codes and logs them; the plaintext code is also
-  returned directly in the API response (no SMS provider yet — API is the channel).
+- DevOTPProvider generates random codes and only logs them; the code is returned
+  to the caller ONLY when RESTAMP_OTP_DEBUG=1 (local dev/tests).
 - Only salted SHA-256 hashes are kept in memory; plaintext codes are never stored
-  beyond the initial return value. Rate limiting + attempt caps live here (in-memory,
-  per phone).
+  and never logged. Rate limiting + attempt caps live here (in-memory, per phone).
 """
 import hashlib
 import logging
@@ -77,13 +76,8 @@ class OTPService:
                 detail="Too many attempts. Try again later.",
             )
 
-    def request_code(self, phone: str) -> str:
-        """Issue a code; always returns the plaintext code to the caller.
-
-        The plaintext code is returned so the API endpoint can include it
-        directly in the response. When a real SMS provider is wired in,
-        remove this return value and switch to a confirmation-only response.
-        """
+    def request_code(self, phone: str) -> str | None:
+        """Issue a code; returns it only in OTP_DEBUG mode, else None."""
         with self._lock:
             self._ensure_not_blocked(phone)
             now = time.time()
@@ -101,8 +95,7 @@ class OTPService:
                 code_hash=self._hash(phone, code), expires_at=now + settings.OTP_TTL_SECONDS
             )
             self.provider.send(phone, code)
-            log.info("OTP generated for phone (code delivered via API response)")
-            return code
+            return code if settings.OTP_DEBUG else None
 
     def verify_code(self, phone: str, code: str) -> bool:
         """True on success (consumes the code); False on wrong/expired code."""

@@ -24,9 +24,14 @@ services:
         value: "30"
 
       # ── OTP ─────────────────────────────────────────────────────────────────
-      # OTP code is ALWAYS returned in the API response (no SMS provider yet).
-      # To switch to SMS-only delivery, wire in a real OTPProvider and remove
-      # the `otp` field from the /auth/otp/request response.
+      # OTP codes are NEVER returned in API responses (debug_code appears only
+      # when RESTAMP_OTP_DEBUG=1, which must stay "0" in production).
+      # RESTAMP_OTP_DEMO_MODE enables fixed demo codes for local demos only;
+      # it MUST stay "0" in production.
+      - key: RESTAMP_OTP_DEBUG
+        value: "0"
+      - key: RESTAMP_OTP_DEMO_MODE
+        value: "0"
       - key: RESTAMP_OTP_TTL_SECONDS
         value: "300"
       - key: RESTAMP_OTP_MAX_REQUESTS_PER_HOUR
@@ -37,10 +42,9 @@ services:
         value: "900"
 
       # ── CORS ────────────────────────────────────────────────────────────────
-      # "*" allows all origins (fine for a mobile-only API).
-      # Replace with your exact frontend URL(s) for stricter production CORS.
+      # Exact production frontend origin(s) only. Never "*" with credentials.
       - key: RESTAMP_CORS_ORIGINS
-        value: "*"
+        value: "https://restamp-app.vercel.app,https://restamp-alpha.vercel.app"
 
       # ── Google OAuth (optional) ──────────────────────────────────────────────
       - key: RESTAMP_GOOGLE_CLIENT_ID
