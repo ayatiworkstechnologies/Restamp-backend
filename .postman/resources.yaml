@@ -1,0 +1,10 @@
+# Use this workspace to collaborate
+workspace:
+  id: 0a07cdf8-8fa0-416c-88a3-c328c0027ae5
+
+localResources:
+  collections:
+    - ../report/RESTAMP - Local Backend
+    - ../report/RESTAMP - Local API
+  environments:
+    - ../report/RESTAMP - Local.environment.yaml

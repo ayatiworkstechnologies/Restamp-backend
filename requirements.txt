@@ -1,0 +1,12 @@
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5
+SQLAlchemy==2.1.1
+PyMySQL==1.2.3
+alembic==1.20.0
+cloudinary==1.44.1
+cryptography==45.0.7
+PyJWT==2.15.1
+python-multipart==0.0.20
+pytest==9.1.1
+httpx==0.28.1

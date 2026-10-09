@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: restamp-backend
+    runtime: python
+    region: oregon          # Change to the region closest to your users
+    plan: free              # Upgrade to starter/standard for production
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    envVars:
+      # ── Database ────────────────────────────────────────────────────────────
+      # Paste your Render PostgreSQL (or external MySQL) internal URL here.
+      # Format (PostgreSQL): postgresql+psycopg2://USER:PASSWORD@HOST:PORT/DBNAME
+      # Format (MySQL):       mysql+pymysql://USER:PASSWORD@HOST:PORT/DBNAME
+      - key: RESTAMP_DATABASE_URL
+        sync: false           # Set this manually in the Render dashboard
+
+      # ── JWT ─────────────────────────────────────────────────────────────────
+      - key: RESTAMP_JWT_SECRET
+        generateValue: true   # Render auto-generates a secure random string
+
+      - key: RESTAMP_JWT_EXPIRE_MINUTES
+        value: "30"
+
+      # ── OTP ─────────────────────────────────────────────────────────────────
+      # OTP code is ALWAYS returned in the API response (no SMS provider yet).
+      # To switch to SMS-only delivery, wire in a real OTPProvider and remove
+      # the `otp` field from the /auth/otp/request response.
+      - key: RESTAMP_OTP_TTL_SECONDS
+        value: "300"
+      - key: RESTAMP_OTP_MAX_REQUESTS_PER_HOUR
+        value: "5"
+      - key: RESTAMP_OTP_MAX_VERIFY_ATTEMPTS
+        value: "5"
+      - key: RESTAMP_OTP_BLOCK_SECONDS
+        value: "900"
+
+      # ── CORS ────────────────────────────────────────────────────────────────
+      # "*" allows all origins (fine for a mobile-only API).
+      # Replace with your exact frontend URL(s) for stricter production CORS.
+      - key: RESTAMP_CORS_ORIGINS
+        value: "*"
+
+      # ── Google OAuth (optional) ──────────────────────────────────────────────
+      - key: RESTAMP_GOOGLE_CLIENT_ID
+        value: ""
+      - key: RESTAMP_GOOGLE_DEV_MODE
+        value: "0"
