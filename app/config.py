@@ -24,6 +24,11 @@ class Settings:
         "RESTAMP_DATABASE_URL",
         "mysql+pymysql://user:pass@localhost/restamp",
     )
+    # Aiven MySQL CA certificate path (production only, never hardcoded).
+    # Download ca.pem from Aiven Console -> service -> Connection information,
+    # mount it on Render as a Secret File, and set this to the mount path
+    # (e.g. the Secret File path). Empty = local dev (no SSL via unix socket).
+    DB_SSL_CA: str = _get("RESTAMP_DB_SSL_CA", "")
     # JWT signing secret — MUST be overridden via env outside local dev.
     JWT_SECRET: str = _get("RESTAMP_JWT_SECRET", "restamp-local-dev-secret-change-me")
     JWT_ALGORITHM: str = "HS256"

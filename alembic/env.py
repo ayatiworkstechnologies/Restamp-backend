@@ -24,10 +24,28 @@ target_metadata = Base.metadata
 # Phase 3: prefer environment-based credentials for the dedicated LOCAL
 # development database. Falls back to alembic.ini (placeholder) when unset.
 # Never hardcode real passwords here; export RESTAMP_DATABASE_URL per shell.
+# Aiven URLs may contain ?ssl-mode=REQUIRED which PyMySQL rejects, so the URL
+# is normalised via app.db (same helper as the app runtime) and the translated
+# SSL connect_args are applied to the migration engine. SSL stays required.
 _db_url = os.environ.get("RESTAMP_DATABASE_URL")
 if _db_url:
-    # Escape % for configparser interpolation (e.g. %40 in passwords).
-    config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
+    try:
+        from app.db import normalize_database_url as _normalize_db_url
+
+        _clean_url, _connect_args = _normalize_db_url(_db_url)
+        # Escape % for configparser interpolation (e.g. %40 in passwords).
+        config.set_main_option("sqlalchemy.url", _clean_url.replace("%", "%%"))
+        # Stash connect_args for run_migrations_online (configparser is str-only).
+        _migration_connect_args = dict(_connect_args)
+    except Exception:
+        # Fail-closed for remote hosts without a CA would break `alembic`
+        # bootstrapping; fall back to the raw URL so the underlying error
+        # surfaces from the driver with full context instead of at config time.
+        # Local URLs never take this branch.
+        config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
+        _migration_connect_args = {}
+else:
+    _migration_connect_args = {}
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -66,11 +84,23 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    from sqlalchemy import create_engine
+
+    if _db_url:
+        # Env-based URL (already normalised above): use the cleaned URL plus
+        # the translated SSL connect_args so ?ssl-mode=REQUIRED never reaches
+        # PyMySQL during migrations either.
+        url = config.get_main_option("sqlalchemy.url")
+        if url:
+            url = url.replace("%%", "%")
+        connect_args = globals().get("_migration_connect_args", {})
+        connectable = create_engine(url, poolclass=pool.NullPool, connect_args=connect_args)
+    else:
+        connectable = engine_from_config(
+            config.get_section(config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+        )
 
     with connectable.connect() as connection:
         context.configure(
