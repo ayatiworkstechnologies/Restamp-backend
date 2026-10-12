@@ -293,6 +293,45 @@ def test_patch_media_endstate_reorder_remove_insert(client):
     assert r.json()["cover_image_url"] is None
 
 
+def test_patch_delete_single_photo_from_existing_listing_regression(client):
+    """Regression for the edit-screen photo-deletion failure.
+
+    Frontend flow: user opens an existing 2-photo listing, deletes one photo
+    on the form, then Review sends PATCH with the reduced end-state. The
+    backend must reconcile (delete the missing URL, renumber cover to 0)
+    with a 200 — not a 500. Requires migration e6f7a8b9c0d1
+    (property_media.public_id); every _reconcile_media / DELETE path loads
+    the full ORM row, so a DB missing that column fails with
+    "Unknown column 'property_media.public_id' in 'field list'".
+    """
+    c, session = client
+    col = session.execute(text(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'property_media' "
+        "AND COLUMN_NAME = 'public_id'")).fetchone()[0]
+    assert col == 1, "migration e6f7a8b9c0d1 not applied: property_media.public_id missing"
+    token = _setup_owner_with_phone(c, "+919876543409")
+    lid = _post_listing(c, token, "Delete Single Photo Regression").json()["listing_id"]
+    got = c.get(f"/owner/listings/{lid}", headers=auth_header(token))
+    assert got.status_code == 200, got.text
+    assert [p["url"] for p in got.json()["photos"]] == [
+        "https://t.test/e1.jpg", "https://t.test/e2.jpg"]
+    # Delete the cover (e1): end-state keeps only e2, which must become cover.
+    r = c.patch(f"/owner/listings/{lid}",
+                json={"photos": [
+                    {"url": "https://t.test/e2.jpg", "category": "Bedroom"}]},
+                headers=auth_header(token))
+    assert r.status_code == 200, r.text
+    photos = r.json()["photos"]
+    assert [(p["url"], p["order_index"], p["is_cover"]) for p in photos] == [
+        ("https://t.test/e2.jpg", 0, True)]
+    assert r.json()["cover_image_url"] == "https://t.test/e2.jpg"
+    rows = session.execute(text(
+        "SELECT url, order_index FROM property_media "
+        "WHERE property_listing_id=:i ORDER BY order_index"), {"i": lid}).fetchall()
+    assert [(u, idx) for (u, idx) in rows] == [("https://t.test/e2.jpg", 0)]
+
+
 def test_delete_photo_renumbers_cover_and_destroys_cloud(client, monkeypatch):
     calls = []
     _mock_cloud(monkeypatch, calls)

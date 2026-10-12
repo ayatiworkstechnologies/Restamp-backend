@@ -568,7 +568,7 @@ class OwnerListingCreate(BaseModel):
             return None
         s = str(v).strip()
         if not s:
-            raise ValueError("contact_email cannot be empty")
+            return None
         if not _EMAIL_RE.fullmatch(s):
             raise ValueError("Enter a valid email address")
         return s
