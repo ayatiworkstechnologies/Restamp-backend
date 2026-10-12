@@ -253,5 +253,6 @@ def test_schema_regression_29_tables(client):
     assert "amenity_master" in tables
     assert "listing_amenities" in tables
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == (
-        "d5e6f7a8b9c0"
+        # Edit phase: + property_media.public_id (photo delete support).
+        "e6f7a8b9c0d1"
     )

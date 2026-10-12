@@ -68,7 +68,7 @@ def test_create_and_fetch_owner_listing(client):
         "price_period": "TOTAL",
         "locality": "Indiranagar",
         "city": "Bengaluru",
-        "pincode": "560038",
+        "pincode": "600115",
         "address_line": "100 Feet Road, 12th Main",
         "area_value": 1850,
         "area_unit": "sqft",
@@ -133,7 +133,7 @@ def test_owner_cannot_access_other_owner_listing(client):
             "price_rupees": 5000000,
             "locality": "Whitefield",
             "city": "Bengaluru",
-            "pincode": "560066",
+            "pincode": "600116",
         },
         headers=auth_header(token_a),
     )
@@ -291,13 +291,45 @@ def test_listing_without_submitted_at_never_auto_verifies(client):
 
 def test_seed_listings_unchanged_by_auto_verify(client):
     c, session = client
+    # Self-contained replica of the dev-seed trio (same titles/statuses,
+    # submitted_at NULL) under a fresh isolated owner. The test must not
+    # depend on externally seeded rows for '+16501110002' (scripts/
+    # seed_dev_data.py), which exist in restamp_dev but not in a clean
+    # isolated database such as restamp_test.
+    phone = "+919876543237"
+    token = _setup_owner_with_phone(c, phone)
+    draft_id = _create_listing(c, token, "Seed Draft Flat")["listing_id"]
+    sold_id = _create_listing(c, token, "Seed Sold Flat")["listing_id"]
+    emerald_id = _create_listing(c, token, "Seed Emerald 3BHK")["listing_id"]
+    session.execute(
+        text("UPDATE property_listings SET verification_status='PENDING', "
+             "listing_status='AVAILABLE', submitted_at=NULL WHERE id=:i"),
+        {"i": draft_id},
+    )
+    session.execute(
+        text("UPDATE property_listings SET verification_status='VERIFIED', "
+             "listing_status='SOLD', submitted_at=NULL WHERE id=:i"),
+        {"i": sold_id},
+    )
+    session.execute(
+        text("UPDATE property_listings SET verification_status='VERIFIED', "
+             "listing_status='AVAILABLE', submitted_at=NULL WHERE id=:i"),
+        {"i": emerald_id},
+    )
+    session.commit()
+
+    # Fetch runs the backend auto-verification; rows without submitted_at
+    # must survive it unchanged.
+    r = c.get("/owner/listings", headers=auth_header(token))
+    assert r.status_code == 200, r.text
+
     # The seeded PENDING row has no submitted_at and must stay PENDING; all
     # other seeded rows must stay exactly as seeded.
     rows = session.execute(text(
         "SELECT title, verification_status, listing_status FROM property_listings "
         "WHERE user_id=(SELECT user_id FROM auth_identities WHERE provider='phone' "
-        "AND provider_identifier='+16501110002')"
-    )).fetchall()
+        "AND provider_identifier=:p)"
+    ), {"p": phone}).fetchall()
     by_title = {r[0]: (r[1], r[2]) for r in rows}
     assert by_title["Seed Draft Flat"] == ("PENDING", "AVAILABLE")
     assert by_title["Seed Sold Flat"] == ("VERIFIED", "SOLD")
@@ -478,7 +510,7 @@ def test_full_rent_create_persists_everywhere(client):
     c, session = client
     token = _setup_owner_with_phone(c, "+919876543271")
     body = {
-        "district": "Test District 271", "locality": "Test Nagar 271", "pincode": "600271",
+        "district": "Test District 271", "locality": "Test Nagar 271", "pincode": "600117",
         "sub_locality": "5th Avenue", "society_name": "Green Acres", "house_no": "Flat 402",
         "landmark": "Tower Park", "latitude": 13.0850, "longitude": 80.2101,
         "bedrooms": 2, "bathrooms": 2, "balconies": 2, "area_value": 1200,
@@ -510,7 +542,13 @@ def test_full_rent_create_persists_everywhere(client):
     assert created["rent_terms"]["lock_in_months"] == 12
     assert created["rent_terms"]["agreement_months"] == 11
     assert created["amenities"] == ["Gym", "Lift"] or sorted(created["amenities"]) == ["Gym", "Lift"]
-    assert created["photos"][0] == {"url": "https://t.test/a.jpg", "category": "Living Room"}
+    assert created["photos"][0]["url"] == "https://t.test/a.jpg"
+    assert created["photos"][0]["category"] == "Living Room"
+    assert created["photos"][0]["order_index"] == 0
+    assert created["photos"][0]["is_cover"] is True
+    assert isinstance(created["photos"][0]["id"], int)
+    assert created["photos"][1]["order_index"] == 1
+    assert created["photos"][1]["is_cover"] is False
     assert created["cover_image_url"] == "https://t.test/a.jpg"
     # DB destinations
     row = _db_row(session, lid)
@@ -591,9 +629,11 @@ def test_legacy_images_fallback_category_null(client):
                       images=["https://t.test/1.jpg", "https://t.test/2.jpg"])
     assert r.status_code == 201, r.text
     assert r.json()["cover_image_url"] == "https://t.test/1.jpg"
-    assert r.json()["photos"] == [
-        {"url": "https://t.test/1.jpg", "category": None},
-        {"url": "https://t.test/2.jpg", "category": None}]
+    assert [(p["url"], p["category"], p["order_index"], p["is_cover"])
+            for p in r.json()["photos"]] == [
+        ("https://t.test/1.jpg", None, 0, True),
+        ("https://t.test/2.jpg", None, 1, False)]
+    assert all(isinstance(p["id"], int) for p in r.json()["photos"])
 
 
 def test_create_validation_errors(client):
@@ -602,6 +642,13 @@ def test_create_validation_errors(client):
     bad_bodies = [
         ({"pincode": "12345"}, "pincode"),
         ({"pincode": "abcdef"}, "pincode"),
+        ({"pincode": "600000"}, "pincode-range-lo"),
+        ({"pincode": "600119"}, "pincode-range-hi"),
+        ({"pincode": "600500"}, "pincode-range-far"),
+        ({"pincode": "60001"}, "pincode-short"),
+        ({"pincode": "6000118"}, "pincode-long"),
+        ({"pincode": ""}, "pincode-empty"),
+        ({"pincode": "      "}, "pincode-blank"),
         ({"rent_terms": {"security_deposit_rupees": -5}}, "deposit"),
         ({"rent_terms": {"maintenance_rupees": -1}}, "maintenance"),
         ({"furnishing": "Gold-Plated"}, "furnishing"),
@@ -618,6 +665,61 @@ def test_create_validation_errors(client):
     for idx, (override, _label) in enumerate(bad_bodies):
         r = _post_listing(c, token, f"Invalid Flat {idx}", **override)
         assert r.status_code == 422, (override, r.status_code, r.text)
+
+
+def test_normalize_chennai_pincode_helper():
+    from app.schemas import (
+        CHENNAI_PINCODE_ERROR, CHENNAI_PINCODE_MAX, CHENNAI_PINCODE_MIN,
+        normalize_chennai_pincode,
+    )
+    assert (CHENNAI_PINCODE_MIN, CHENNAI_PINCODE_MAX) == (600001, 600118)
+    assert "600001 and 600118" in CHENNAI_PINCODE_ERROR
+    for pin in ["600001", "600089", "600118", "600040"]:
+        assert normalize_chennai_pincode(pin) == pin
+    # Strings preserved (never int-converted); surrounding spaces trimmed.
+    assert normalize_chennai_pincode(" 600089 ") == "600089"
+    assert normalize_chennai_pincode(None) is None
+    for bad in ["600000", "600119", "600500", "560038", "60001", "6000118",
+                "abcdef", "", "      "]:
+        with pytest.raises(ValueError, match="600001 and 600118"):
+            normalize_chennai_pincode(bad)
+
+
+def test_chennai_pincode_range_boundaries(client):
+    c, session = client
+    token = _setup_owner_with_phone(c, "+919876543281")
+    # Boundaries + interior (incl. 600089 Ramapuram) accepted. Each pin gets
+    # a unique locality: the resolver falls back to locality match before
+    # creating, so shared localities would read back a different pincode.
+    for idx, pin in enumerate(["600001", "600089", "600118", "600040"]):
+        r = _post_listing(c, token, f"Range Flat {idx}", pincode=pin,
+                          locality=f"Range Nagar R{idx}")
+        assert r.status_code == 201, (pin, r.status_code, r.text)
+        assert r.json()["pincode"] == pin
+    # Out-of-range six-digit pincodes rejected (schema-level, unbypassable
+    # via direct API calls). Note 600119/600500/560038 are format-valid six
+    # digits, so the 422 proves range enforcement specifically. (App-level
+    # schema errors collapse to a generic detail string; service-level
+    # errors keep their message — asserted where applicable.)
+    for idx, pin in enumerate(["600000", "600119", "600500", "560038"]):
+        r = _post_listing(c, token, f"Range Reject {idx}", pincode=pin)
+        assert r.status_code == 422, (pin, r.status_code, r.text)
+    # PATCH enforces the same rule on the same listing (locality paired so
+    # the resolver stores the submitted pincode, never a different one).
+    lid = _post_listing(c, token, "Range Patch Flat",
+                        locality="Range Patch Nagar").json()["listing_id"]
+    r = c.patch(f"/owner/listings/{lid}",
+                json={"locality": "Range Patch Nagar 2", "pincode": "600089"},
+                headers=auth_header(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["pincode"] == "600089"
+    for pin in ["600000", "600119", "abcdef", ""]:
+        r = c.patch(f"/owner/listings/{lid}", json={"pincode": pin},
+                    headers=auth_header(token))
+        assert r.status_code == 422, (pin, r.status_code, r.text)
+    # Rejected PATCH changed nothing.
+    assert c.get(f"/owner/listings/{lid}",
+                 headers=auth_header(token)).json()["pincode"] == "600089"
 
 
 def test_create_security(client):
@@ -655,7 +757,7 @@ def test_create_rollback_on_invalid_amenity(client):
             svc.create_owner_listing(
                 session, owner_id, title="Rollback Flat", transaction_type="RENT",
                 property_type="APARTMENT", price_paise=2500000, price_period="MONTHLY",
-                locality="Rollback Nagar", city="Chennai", pincode="600280",
+                locality="Rollback Nagar", city="Chennai", pincode="600112",
                 address_line=None, area_value=None, area_unit=None, bedrooms=2,
                 bathrooms=2, description=None, construction_status=None,
                 image_urls=["https://t.test/r.jpg"], amenities=["Gym", "Bogus Room X"])

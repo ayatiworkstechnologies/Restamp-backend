@@ -4,7 +4,9 @@ Endpoints:
   POST /owner/listings       — create a new property listing (OWNER role required)
   GET  /owner/listings       — list caller's own listings (all statuses)
   GET  /owner/listings/{id}  — single owner listing detail
+  PATCH /owner/listings/{id} — update own listing in place (OWNER, partial)
   POST /owner/listings/{id}/photos — upload a photo for own listing (multipart)
+  DELETE /owner/listings/{id}/photos/{media_id} — remove one photo (OWNER)
 
 No admin endpoints here; see users.py for admin grants.
 No schema changes; all writes use existing property_listings / physical_properties tables.
@@ -177,6 +179,7 @@ async def upload_listing_photo(
             db, owner_id, listing_id,
             url=secure_url,
             category=canonical_category, mime_type=mime, byte_size=byte_size,
+            public_id=public_id,
         )
         if media is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
@@ -201,6 +204,95 @@ async def upload_listing_photo(
         order_index=media.order_index,
         is_cover=media.order_index == 0,
     )
+
+
+@router.patch("/listings/{listing_id}", response_model=schemas.OwnerListingOut)
+def update_listing(
+    listing_id: int,
+    body: schemas.OwnerListingUpdate,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Update the caller's own listing in place (partial PATCH).
+
+    Only keys present in the request are touched; omitted keys keep their
+    stored values and ``0``/``False`` are preserved. The listing and
+    physical-property IDs never change — no duplicate rows are created.
+    Returns 404 when the listing does not belong to the caller, 422 on
+    validation failures (nothing committed). Never falls back to creating
+    a listing.
+    """
+    updates = body.model_dump(exclude_unset=True)
+    if updates.get("rent_terms") is not None and "rent_terms" in updates:
+        # Nested exclude_unset already applied recursively; normalize to a
+        # plain dict of supplied sub-keys for the service merge.
+        updates["rent_terms"] = dict(updates["rent_terms"])
+    # Savepoint (not a full rollback): the shared test session reuses one
+    # transaction per test, so a full rollback would wipe the test's own
+    # setup rows. Rolling back only this request's work keeps setup intact
+    # while still guaranteeing nothing partial commits. In production
+    # (request-scoped sessions) this behaves like a normal rollback.
+    sp = db.begin_nested()
+    try:
+        listing, removed_public_ids = owner_svc.update_owner_listing(
+            db, owner_id, listing_id, updates
+        )
+        if listing is None:
+            sp.rollback()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        sp.commit()
+        db.commit()
+    except HTTPException:
+        raise
+    except ValueError as e:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    # Best-effort Cloudinary cleanup for implicitly removed gallery rows:
+    # the DB commit already succeeded, so a storage failure must never fail
+    # the request — at worst an orphaned asset remains (documented).
+    for public_id in removed_public_ids:
+        try:
+            photo_storage.delete_uploaded_image(public_id)
+        except Exception:
+            pass
+    card = owner_svc.get_owner_listing(db, owner_id, listing.id)
+    if card is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error")
+    return card
+
+
+@router.delete("/listings/{listing_id}/photos/{media_id}", status_code=204)
+def delete_listing_photo(
+    listing_id: int,
+    media_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Remove one gallery photo from the caller's own listing.
+
+    The media row is deleted and siblings renumbered (cover stays index 0);
+    the Cloudinary asset is destroyed best-effort after the DB commit.
+    Returns 404 when the listing/photo does not belong to the caller.
+    """
+    sp = db.begin_nested()
+    try:
+        found, public_id = owner_svc.delete_listing_photo(db, owner_id, listing_id, media_id)
+        if not found:
+            sp.rollback()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        sp.commit()
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Delete failed")
+    if public_id:
+        try:
+            photo_storage.delete_uploaded_image(public_id)
+        except Exception:
+            pass
+    return None
 
 
 # ---------------------------------------------------------------------------

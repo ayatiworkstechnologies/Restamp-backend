@@ -303,7 +303,8 @@ def test_regression_foundation_intact(client):
     ):
         assert required in idx, required
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == (
-        "d5e6f7a8b9c0"
+        # Edit phase: + property_media.public_id (photo delete support).
+        "e6f7a8b9c0d1"
     )
     from app.models import Base
 

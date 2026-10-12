@@ -185,6 +185,35 @@ _AGREEMENT_MONTHS = {"11 months": 11, "1 year": 12, "2 years": 24, "3 years": 36
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
+# Chennai-only pincode rule (temporary business rule, Phase 2): every
+# listing pincode must be exactly six numeric digits in the inclusive range
+# 600001–600118. Single source of truth for both OwnerListingCreate and
+# OwnerListingUpdate — direct API calls cannot bypass it. Pincodes stay
+# strings end-to-end (never int-converted) so leading zeros survive.
+CHENNAI_PINCODE_MIN = 600001
+CHENNAI_PINCODE_MAX = 600118
+CHENNAI_PINCODE_PATTERN = r"^\d{6}$"
+CHENNAI_PINCODE_ERROR = (
+    "Please enter a valid pincode between 600001 and 600118."
+)
+
+
+def normalize_chennai_pincode(value: str | None) -> str | None:
+    """Validate a listing pincode: exactly six digits within the Chennai
+    range. Returns the trimmed string unchanged. ``None`` passes through
+    (optional update fields); empty/whitespace and out-of-range values raise
+    ValueError (→ 422)."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        raise ValueError(CHENNAI_PINCODE_ERROR)
+    if not re.fullmatch(r"\d{6}", s):
+        raise ValueError(CHENNAI_PINCODE_ERROR)
+    if not (CHENNAI_PINCODE_MIN <= int(s) <= CHENNAI_PINCODE_MAX):
+        raise ValueError(CHENNAI_PINCODE_ERROR)
+    return s
+
 
 def _normalize_label(value: str | None, mapping: dict[str, str | None], field: str) -> str | None:
     """Map a frontend chip label to its canonical DB value (case-insensitive)."""
@@ -373,7 +402,7 @@ class OwnerListingCreate(BaseModel):
     locality: str = Field(min_length=1, max_length=255)
     city: str = Field(min_length=1, max_length=255)
     district: str | None = Field(default=None, max_length=255)
-    pincode: str = Field(pattern=r"^\d{6}$", max_length=10)
+    pincode: str = Field(pattern=CHENNAI_PINCODE_PATTERN, max_length=10)
     address_line: str | None = Field(default=None, max_length=500)
     sub_locality: str | None = Field(default=None, max_length=255)
     society_name: str | None = Field(default=None, max_length=255)
@@ -404,7 +433,8 @@ class OwnerListingCreate(BaseModel):
     # Per-listing contact overrides (identity stays in auth_identities)
     contact_phone: str | None = Field(default=None, max_length=20)
     contact_email: str | None = Field(default=None, max_length=255)
-    # RENT terms (only persisted for RENT listings; see service)
+    # Terms (persisted for RENT and LEASE listings; non-empty terms on
+    # RESALE/BUY are rejected — see service)
     rent_terms: RentTermsIn | None = None
     # Amenity/feature/room NAMES (never client IDs; resolved server-side)
     amenities: list[str] = Field(default_factory=list)
@@ -416,7 +446,9 @@ class OwnerListingCreate(BaseModel):
 
     @field_validator("transaction_type")
     @classmethod
-    def validate_tx(cls, v: str) -> str:
+    def validate_tx(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         u = v.upper()
         if u not in _TX_TYPES:
             raise ValueError(f"transaction_type must be one of {_TX_TYPES}")
@@ -424,7 +456,9 @@ class OwnerListingCreate(BaseModel):
 
     @field_validator("property_type")
     @classmethod
-    def validate_prop(cls, v: str) -> str:
+    def validate_prop(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         u = v.upper()
         if u not in _PROP_TYPES:
             raise ValueError(f"property_type must be one of {_PROP_TYPES}")
@@ -432,7 +466,9 @@ class OwnerListingCreate(BaseModel):
 
     @field_validator("price_period")
     @classmethod
-    def validate_period(cls, v: str) -> str:
+    def validate_period(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         u = v.upper()
         if u not in {"TOTAL", "MONTHLY"}:
             raise ValueError("price_period must be TOTAL or MONTHLY")
@@ -457,6 +493,11 @@ class OwnerListingCreate(BaseModel):
         if not s:
             raise ValueError("district cannot be empty; omit it to fall back to city")
         return s
+
+    @field_validator("pincode", mode="before")
+    @classmethod
+    def _pincode(cls, v):
+        return normalize_chennai_pincode(v)
 
     @field_validator("furnishing", mode="before")
     @classmethod
@@ -541,6 +582,27 @@ class OwnerListingCreate(BaseModel):
         return self
 
 
+class OwnerListingUpdate(OwnerListingCreate):
+    """Partial update payload for PATCH /owner/listings/{id}.
+
+    Every field is optional; only keys present in the request are touched
+    (the route passes ``model_dump(exclude_unset=True)`` to the service).
+    An explicit null clears a nullable column; an explicit null on a
+    non-nullable column (title/price/locality/city/pincode) is a 422 raised
+    by the service. ``photos`` is the desired ordered end-state of the
+    gallery (cover = index 0); rows whose URL is absent are deleted.
+    """
+
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    transaction_type: str | None = None
+    property_type: str | None = None
+    price_rupees: int | None = Field(default=None, ge=1)
+    price_period: str | None = None
+    locality: str | None = Field(default=None, min_length=1, max_length=255)
+    city: str | None = Field(default=None, min_length=1, max_length=255)
+    pincode: str | None = Field(default=None, pattern=CHENNAI_PINCODE_PATTERN, max_length=10)
+
+
 class RentTermsOut(BaseModel):
     """Persisted RENT terms (paise/months/DATE — canonical DB form)."""
 
@@ -555,10 +617,18 @@ class RentTermsOut(BaseModel):
 
 
 class ListingPhotoOut(BaseModel):
-    """One gallery photo with its persisted category (cover = index 0)."""
+    """One gallery photo with its stable media id, order, and category.
 
+    ``id`` is the ``property_media`` primary key — the frontend must use it
+    (not the URL) to track removals, cover selection, and ordering in Edit
+    mode. Cover = ``order_index`` 0 (``is_cover`` mirrors that rule).
+    """
+
+    id: int
     url: str
     category: str | None = None
+    order_index: int = 0
+    is_cover: bool = False
 
 
 class OwnerListingOut(BaseModel):
