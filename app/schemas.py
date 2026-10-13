@@ -1,6 +1,7 @@
 """RESTAMP Phase 4 — request/response schemas (pydantic v2)."""
 import re
 from datetime import date, datetime, timedelta, timezone
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -146,6 +147,40 @@ class EnquiriesResponse(BaseModel):
     page: int
     page_size: int
     total: int
+
+
+class OwnerLeadOut(BaseModel):
+    """One buyer enquiry visible to its owner (P3 leads MVP).
+
+    Phone numbers are NEVER included: the buyer's contact stays hidden until
+    an explicitly authorized reveal. Buyer identity is the stable user id
+    only — display names are withheld because phone-registered accounts
+    default display_name to the phone number.
+    """
+
+    id: int
+    property_listing_id: int
+    buyer_user_id: int
+    message: str | None
+    status: str
+    closing_reason: str | None
+    listing: EnquiryListingSnapshot
+
+
+class OwnerLeadsResponse(BaseModel):
+    items: list[OwnerLeadOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class OwnerLeadUpdate(BaseModel):
+    """Owner-side status transition (P4). Only the existing backend
+    lifecycle statuses are accepted; anything else is a 422. closing_reason
+    is stored as supplied (e.g. "Not Converted") — there is no LOST status."""
+
+    status: Literal["NEW", "CONTACTED", "CLOSED"]
+    closing_reason: str | None = Field(default=None, max_length=500)
 
 
 # --- Owner V1 listing management (Phase 7) ------------------------------------

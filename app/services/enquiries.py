@@ -137,3 +137,118 @@ def get_enquiry(db: Session, buyer_id: int, enquiry_id: int) -> dict:
     if enquiry is None or enquiry.buyer_user_id != buyer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     return _snapshot(db, enquiry)
+
+
+# Owner-side lifecycle (P4): NEW -> CONTACTED -> CLOSED, plus NEW -> CLOSED
+# directly. Same-status writes are idempotent no-ops. CLOSED is terminal
+# (reopening is not supported); anything else is a 422. Closing frees the
+# buyer's active-enquiry row so re-enquiry creates a fresh row, mirroring
+# the buyer-tested close semantics. The listing is never touched.
+_ALLOWED_OWNER_TRANSITIONS = {
+    "NEW": {"NEW", "CONTACTED", "CLOSED"},
+    "CONTACTED": {"CONTACTED", "NEW", "CLOSED"},
+    "CLOSED": {"CLOSED"},
+}
+
+
+def _owner_snapshot(db: Session, enquiry: Enquiry) -> dict:
+    listing = db.get(PropertyListing, enquiry.property_listing_id)
+    return {
+        "id": enquiry.id,
+        "property_listing_id": enquiry.property_listing_id,
+        "buyer_user_id": enquiry.buyer_user_id,
+        "message": enquiry.message,
+        "status": enquiry.status,
+        "closing_reason": enquiry.closing_reason,
+        "listing": {
+            "title": listing.title,
+            "price_paise": listing.price_paise,
+            "price_period": listing.price_period,
+        },
+    }
+
+
+def transition_owner_lead(
+    db: Session, owner_id: int, lead_id: int, to_status: str, closing_reason: str | None
+) -> dict:
+    """Persist an owner-side status change. Raises 404 for foreign/missing
+    leads, 422 for unsupported transitions. CLOSED removes the active row
+    (buyer may re-enquire); other transitions keep it. Never touches the
+    property listing."""
+    enquiry = db.get(Enquiry, lead_id)
+    if enquiry is None or enquiry.owner_user_id != owner_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if to_status not in _ALLOWED_OWNER_TRANSITIONS.get(enquiry.status, set()):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
+    enquiry.status = to_status
+    if closing_reason is not None:
+        enquiry.closing_reason = closing_reason
+    db.flush()
+    if to_status == "CLOSED":
+        db.query(ActiveEnquiry).filter(ActiveEnquiry.enquiry_id == enquiry.id).delete()
+        db.flush()
+    return _owner_snapshot(db, enquiry)
+
+
+def list_owner_leads(
+    db: Session,
+    owner_id: int,
+    page: int,
+    page_size: int,
+    property_listing_id: int | None = None,
+    stat: str | None = None,
+) -> tuple[list[dict], int]:
+    """List buyer enquiries belonging to the authenticated owner (P3 leads MVP).
+
+    Ownership authority is the enquiry's stored owner_user_id (written from
+    physical_properties.user_id at creation, the same authority contact
+    reveal uses). A property filter is validated against the caller's owned
+    physical properties — a foreign id raises 404, never an empty list, so
+    callers cannot probe other owners' listings. No phone numbers, names, or
+    avatars are selected: buyer identity is the stable user id only.
+    """
+    from sqlalchemy import func as _func
+
+    if property_listing_id is not None:
+        owned = (
+            db.query(PropertyListing.id)
+            .join(PhysicalProperty, PhysicalProperty.id == PropertyListing.physical_property_id)
+            .filter(
+                PropertyListing.id == property_listing_id,
+                PhysicalProperty.user_id == owner_id,
+            )
+            .first()
+        )
+        if owned is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    base = (
+        db.query(
+            Enquiry,
+            PropertyListing.title,
+            PropertyListing.price_paise,
+            PropertyListing.price_period,
+        )
+        .join(PropertyListing, PropertyListing.id == Enquiry.property_listing_id)
+        .filter(Enquiry.owner_user_id == owner_id)
+    )
+    if property_listing_id is not None:
+        base = base.filter(Enquiry.property_listing_id == property_listing_id)
+    if stat is not None:
+        base = base.filter(Enquiry.status == stat)
+    total = base.with_entities(_func.count(Enquiry.id)).scalar() or 0
+    rows = (
+        base.order_by(Enquiry.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    )
+    return [
+        {
+            "id": e.id,
+            "property_listing_id": e.property_listing_id,
+            "buyer_user_id": e.buyer_user_id,
+            "message": e.message,
+            "status": e.status,
+            "closing_reason": e.closing_reason,
+            "listing": {"title": title, "price_paise": price_paise, "price_period": price_period},
+        }
+        for e, title, price_paise, price_period in rows
+    ], total

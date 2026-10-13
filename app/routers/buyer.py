@@ -17,6 +17,7 @@ router = APIRouter(prefix="/buyer", tags=["buyer"])
 
 Deal = Literal["BUY", "RESALE", "RENT", "LEASE"]
 PropType = Literal["APARTMENT", "VILLA", "HOUSE", "COMMERCIAL", "PLOT", "AGRICULTURAL_LAND"]
+ConstructionStatus = Literal["READY_TO_MOVE", "UNDER_CONSTRUCTION", "NEW_LAUNCH"]
 Sort = Literal["relevance", "price_asc", "price_desc", "area_asc", "area_desc"]
 
 
@@ -32,6 +33,7 @@ def list_listings(
     min_price_paise: int | None = Query(default=None, ge=0),
     max_price_paise: int | None = Query(default=None, ge=0),
     q: str | None = Query(default=None, max_length=255),
+    construction_status: ConstructionStatus | None = Query(default=None),
     sort: Sort = Query(default="relevance"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -52,6 +54,7 @@ def list_listings(
         min_price_paise=min_price_paise,
         max_price_paise=max_price_paise,
         query=q,
+        construction_status=construction_status,
         sort=sort,
     )
     if count_only:
@@ -94,6 +97,11 @@ def reveal_listing_contact(
     buyer_id: int = Depends(require_buyer),
 ):
     phone, _audit = contact_svc.reveal_contact(db, buyer_id, listing_id)
+    # P3 leads MVP: a successful reveal guarantees exactly one ACTIVE lead
+    # (NEW enquiry) for this buyer+listing. Reuses the existing row on
+    # repeats (idempotent 200 path), so unique lead counts never inflate
+    # while every reveal still keeps its own audit record above.
+    enquiry_svc.create_enquiry(db, buyer_id, listing_id, None)
     db.commit()
     return schemas.ContactRevealOut(phone=phone)
 

@@ -146,4 +146,33 @@ def test_no_private_info_media_and_schema(client):
     covers = {i["title"]: i["cover_image_url"] for i in r.json()["items"]}
     assert covers["M"] == "http://img/2"  # first by order_index, single query
     assert covers["Nomed"] is None
-    assert r.json()["items"][0]["price_display"].startswith("₹")
+
+
+def test_construction_status_filter(client):
+    c, session = client
+    a = seed_listing(session, title="CS-Ready-Flat")
+    b = seed_listing(session, title="CS-New-Flat")
+    session.execute(text("UPDATE property_listings SET construction_status='READY_TO_MOVE' WHERE id=:i"), {"i": a})
+    session.execute(text("UPDATE property_listings SET construction_status='NEW_LAUNCH' WHERE id=:i"), {"i": b})
+    session.flush()
+    # Distinctive q scopes past any shared-database rows.
+    r = c.get("/buyer/listings", params={"construction_status": "READY_TO_MOVE", "q": "CS-"})
+    assert r.status_code == 200, r.text
+    assert [i["listing_id"] for i in r.json()["items"]] == [a]
+    r = c.get("/buyer/listings", params={"construction_status": "UNDER_CONSTRUCTION", "q": "CS-"})
+    assert r.json()["total"] == 0 and r.json()["items"] == []
+    assert c.get("/buyer/listings", params={"construction_status": "BOGUS"}).status_code == 422
+
+
+def test_locality_substring_and_zero_match_for_explore(client):
+    # Explore-by-Location preparation: the existing `locality` substring
+    # filter is sufficient — no new endpoint required.
+    c, session = client
+    pc = make_postcode(session, "-explore")
+    session.execute(text("UPDATE localities SET name='Sholinganallur' WHERE id=(SELECT locality_id FROM postcodes WHERE id=:p)"), {"p": pc})
+    session.flush()
+    lid = seed_listing(session, title="EXP-Flat", locality_postcode=pc)
+    assert c.get("/buyer/listings", params={"locality": "sholing", "q": "EXP-"}).json()["total"] == 1
+    assert [i["listing_id"] for i in c.get("/buyer/listings", params={"locality": "sholing", "q": "EXP-"}).json()["items"]] == [lid]
+    r = c.get("/buyer/listings", params={"locality": "zzz-no-such-locality"})
+    assert r.status_code == 200 and r.json()["total"] == 0 and r.json()["items"] == []

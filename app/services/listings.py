@@ -64,11 +64,14 @@ def apply_listing_filters(
     min_price_paise: int | None = None,
     max_price_paise: int | None = None,
     query: str | None = None,
+    construction_status: str | None = None,
 ):
     if deal is not None:
         q = q.filter(PropertyListing.transaction_type == deal)
     if property_type is not None:
         q = q.filter(PropertyListing.property_type == property_type)
+    if construction_status is not None:
+        q = q.filter(PropertyListing.construction_status == construction_status)
     if locality is not None:
         q = q.filter(Locality.name.ilike(f"%{locality}%"))
     if city is not None:

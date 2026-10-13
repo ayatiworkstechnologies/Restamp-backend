@@ -13,11 +13,13 @@ No schema changes; all writes use existing property_listings / physical_properti
 """
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
+from typing import Literal
 
 from .. import schemas
 from ..db import get_db
 from ..deps import require_owner
 from ..services import owner_listings as owner_svc
+from ..services import enquiries as enquiry_svc
 from ..services import photo_storage
 from ..services import storage as storage_svc
 
@@ -118,6 +120,69 @@ def get_my_listing(
     card = owner_svc.get_owner_listing(db, owner_id, listing_id)
     if card is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return card
+
+
+# ---------------------------------------------------------------------------
+# Owner leads MVP (P3): read-only buyer-enquiry projection for the
+# authenticated owner. No new tables or columns — enquiries, active_enquiries,
+# and contact_reveal_audits already persist everything this returns.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/leads", response_model=schemas.OwnerLeadsResponse)
+def list_my_leads(
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+    property_listing_id: int | None = Query(default=None, ge=1),
+    status: Literal["NEW", "CONTACTED", "CLOSED"] | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List buyer enquiries for the caller's own properties (newest first).
+
+    Only rows with owner_user_id == caller are ever returned. An optional
+    property filter is validated against the caller's owned properties: a
+    foreign or missing id raises 404 (never an empty list). Only the
+    existing backend statuses NEW/CONTACTED/CLOSED are accepted. Buyer
+    phone numbers are never included (see OwnerLeadOut).
+    """
+    items, total = enquiry_svc.list_owner_leads(
+        db, owner_id, page, page_size, property_listing_id, status
+    )
+    return schemas.OwnerLeadsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.patch("/leads/{lead_id}", response_model=schemas.OwnerLeadOut)
+def update_my_lead(
+    lead_id: int,
+    body: schemas.OwnerLeadUpdate,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Persist an owner-side lead status change (P4).
+
+    Only NEW/CONTACTED/CLOSED are accepted (anything else is 422 via the
+    schema). Returns 404 when the lead does not belong to the caller.
+    CLOSING a lead stores the supplied closing_reason (e.g. "Not Converted"),
+    frees the buyer's active-enquiry row so re-enquiry is possible, and never
+    modifies the property listing. Phone-free OwnerLeadOut response.
+    """
+    # Savepoint (not a full rollback): same shared-test-session reason as the
+    # listing PATCH above — only this request's work is discarded on failure.
+    sp = db.begin_nested()
+    try:
+        card = enquiry_svc.transition_owner_lead(
+            db, owner_id, lead_id, body.status, body.closing_reason
+        )
+    except HTTPException as e:
+        sp.rollback()
+        raise e
+    except ValueError as e:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    sp.commit()
+    db.commit()
     return card
 
 
