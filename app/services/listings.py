@@ -85,15 +85,31 @@ def apply_listing_filters(
     if max_price_paise is not None:
         q = q.filter(PropertyListing.price_paise <= max_price_paise)
     if query is not None:
-        like = f"%{query}%"
-        q = q.filter(
-            or_(
-                PropertyListing.title.ilike(like),
-                PropertyListing.description.ilike(like),
-                Locality.name.ilike(like),
+        # Smart multi-term text search: normalize whitespace, split into at
+        # most 5 terms, and require EVERY term (AND) to match ANY searchable
+        # field (OR): title, description, locality, address line, city.
+        # Matching stays case-insensitive substring (ilike with %...%), so
+        # mid-word partials keep working. LIKE specials are escaped so user
+        # input is always literal. Empty terms add no filter.
+        for term in query.split()[:5]:
+            like = f"%{escape_like_term(term)}%"
+            q = q.filter(
+                or_(
+                    PropertyListing.title.ilike(like, escape="\\"),
+                    PropertyListing.description.ilike(like, escape="\\"),
+                    Locality.name.ilike(like, escape="\\"),
+                    PhysicalProperty.address_line.ilike(like, escape="\\"),
+                    City.name.ilike(like, escape="\\"),
+                )
             )
-        )
     return q
+
+
+def escape_like_term(term: str) -> str:
+    """Escape MySQL LIKE specials so the term matches literally."""
+    return (
+        term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
 
 
 def _card_row(row) -> dict:
