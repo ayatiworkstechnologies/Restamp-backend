@@ -7,6 +7,8 @@ the git repository (see RESTAMP_MEDIA_ROOT default + .gitignore).
 
 Layout: <root>/listings/<listing_id>/<uuid>.<ext>
 """
+from __future__ import annotations
+
 import os
 import uuid
 from pathlib import Path

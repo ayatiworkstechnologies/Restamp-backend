@@ -23,21 +23,33 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column('property_media', sa.Column('category', sa.String(length=50), nullable=True))
-    op.add_column('property_media', sa.Column('mime_type', sa.String(length=100), nullable=True))
-    op.add_column('property_media', sa.Column('byte_size', sa.BigInteger(), nullable=True))
-    op.alter_column(
-        'property_listings', 'verification_status',
-        existing_type=mysql.ENUM('PENDING', 'VERIFIED'),
-        type_=mysql.ENUM('PENDING', 'VERIFIED', 'REJECTED'),
-        existing_nullable=False, server_default='PENDING',
-    )
-    op.alter_column(
-        'property_listings', 'listing_status',
-        existing_type=mysql.ENUM('AVAILABLE', 'SOLD', 'RENTED', 'LEASED'),
-        type_=mysql.ENUM('AVAILABLE', 'SOLD', 'RENTED', 'LEASED', 'CLOSED', 'EXPIRED'),
-        existing_nullable=False, server_default='AVAILABLE',
-    )
+    bind = op.get_bind()
+    is_sqlite = bind.dialect.name == "sqlite"
+    existing_cols = set()
+    if is_sqlite:
+        insp = sa.inspect(bind)
+        existing_cols = {c["name"] for c in insp.get_columns("property_media")}
+
+    if "category" not in existing_cols:
+        op.add_column('property_media', sa.Column('category', sa.String(length=50), nullable=True))
+    if "mime_type" not in existing_cols:
+        op.add_column('property_media', sa.Column('mime_type', sa.String(length=100), nullable=True))
+    if "byte_size" not in existing_cols:
+        op.add_column('property_media', sa.Column('byte_size', sa.BigInteger(), nullable=True))
+
+    if not is_sqlite:
+        op.alter_column(
+            'property_listings', 'verification_status',
+            existing_type=mysql.ENUM('PENDING', 'VERIFIED'),
+            type_=mysql.ENUM('PENDING', 'VERIFIED', 'REJECTED'),
+            existing_nullable=False, server_default='PENDING',
+        )
+        op.alter_column(
+            'property_listings', 'listing_status',
+            existing_type=mysql.ENUM('AVAILABLE', 'SOLD', 'RENTED', 'LEASED'),
+            type_=mysql.ENUM('AVAILABLE', 'SOLD', 'RENTED', 'LEASED', 'CLOSED', 'EXPIRED'),
+            existing_nullable=False, server_default='AVAILABLE',
+        )
 
 
 def downgrade():

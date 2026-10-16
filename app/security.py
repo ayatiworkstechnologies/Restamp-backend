@@ -4,6 +4,8 @@
 - Secret comes from RESTAMP_JWT_SECRET. Invalid/expired tokens are rejected.
 - Role enforcement lives in app.deps (authorization), kept separate here.
 """
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 
 import jwt

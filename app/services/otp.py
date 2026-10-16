@@ -6,6 +6,8 @@
 - Only salted SHA-256 hashes are kept in memory; plaintext codes are never stored
   and never logged. Rate limiting + attempt caps live here (in-memory, per phone).
 """
+from __future__ import annotations
+
 import hashlib
 import logging
 import secrets

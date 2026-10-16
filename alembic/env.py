@@ -18,8 +18,43 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 from app.models import Base
 target_metadata = Base.metadata
+
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.dialects.mysql import TINYINT, INTEGER, SMALLINT, DECIMAL, BIGINT, MEDIUMINT, ENUM
+
+@compiles(TINYINT, "sqlite")
+def _compile_tinyint(type_, compiler, **kw):
+    return "INTEGER"
+
+@compiles(INTEGER, "sqlite")
+def _compile_integer(type_, compiler, **kw):
+    return "INTEGER"
+
+@compiles(SMALLINT, "sqlite")
+def _compile_smallint(type_, compiler, **kw):
+    return "INTEGER"
+
+@compiles(BIGINT, "sqlite")
+def _compile_bigint(type_, compiler, **kw):
+    return "INTEGER"
+
+@compiles(MEDIUMINT, "sqlite")
+def _compile_mediumint(type_, compiler, **kw):
+    return "INTEGER"
+
+@compiles(DECIMAL, "sqlite")
+def _compile_decimal(type_, compiler, **kw):
+    return "NUMERIC"
+
+@compiles(ENUM, "sqlite")
+def _compile_enum(type_, compiler, **kw):
+    return "VARCHAR(50)"
+
+
 
 # Phase 3: prefer environment-based credentials for the dedicated LOCAL
 # development database. Falls back to alembic.ini (placeholder) when unset.

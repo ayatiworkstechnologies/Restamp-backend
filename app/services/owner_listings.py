@@ -21,6 +21,8 @@ Automatic verification (backend-driven, no scheduler):
   Rows without submitted_at (seed data and listings created before the
   submitted_at column existed) are never auto-verified.
 """
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 import re
 

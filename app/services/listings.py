@@ -4,6 +4,8 @@ Visibility (VERIFIED + AVAILABLE) is enforced inside every builder here, never b
 Reads use explicit column lists only (no SELECT *); cover media is fetched in ONE batched
 query (no N+1); private data (phones, identities, owners, payments, audits) is never selected.
 """
+from __future__ import annotations
+
 from sqlalchemy import asc, desc, func, or_
 from sqlalchemy.orm import Session
 

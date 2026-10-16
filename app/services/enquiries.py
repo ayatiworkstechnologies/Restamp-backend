@@ -5,6 +5,8 @@ Owner-side transitions belong to future Owner APIs. One ACTIVE enquiry per
 buyer+listing is enforced by active_enquiries' UNIQUE plus an IntegrityError
 fallback for true races. No snapshots, no display tables, no chat.
 """
+from __future__ import annotations
+
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session

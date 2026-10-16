@@ -11,6 +11,8 @@ Business rules enforced here (never in the frontend):
 - ADMIN is never assignable through role switching or public registration; only
   grant_admin() (itself gated behind the admin-only endpoint) creates it.
 """
+from __future__ import annotations
+
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session

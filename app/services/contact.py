@@ -5,6 +5,8 @@ property_listings.user_id). Phone authority: auth_identities phone identity.
 Every successful reveal inserts exactly one contact_reveal_audits row;
 failed/invisible lookups return before any write, leaving no audit rows.
 """
+from __future__ import annotations
+
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 

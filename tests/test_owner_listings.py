@@ -6,6 +6,8 @@
 - Automatic verification: PENDING -> VERIFIED 2 minutes after submission
   (backend-driven on owner-listings fetch, persisted, idempotent)
 """
+from __future__ import annotations
+
 from datetime import date, datetime, timedelta, timezone
 
 import pytest

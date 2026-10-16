@@ -81,11 +81,13 @@ def upgrade():
     )
     # Idempotent seed: INSERT IGNORE keeps existing IDs, adds only missing names.
     bind = op.get_bind()
+    insert_prefix = "INSERT OR IGNORE" if bind.dialect.name == "sqlite" else "INSERT IGNORE"
     for name, kind in AMENITY_SEED:
         bind.execute(
-            sa.text("INSERT IGNORE INTO amenity_master (name, kind) VALUES (:n, :k)"),
+            sa.text(f"{insert_prefix} INTO amenity_master (name, kind) VALUES (:n, :k)"),
             {"n": name, "k": kind},
         )
+
 
 
 def downgrade():

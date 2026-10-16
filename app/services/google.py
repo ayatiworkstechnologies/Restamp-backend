@@ -10,6 +10,8 @@ Real verification requires RESTAMP_GOOGLE_CLIENT_ID plus a production verifier
 "dev:<subject>" tokens when RESTAMP_GOOGLE_DEV_MODE=1, so tests and local
 development can exercise the flow honestly without pretending real Google auth works.
 """
+from __future__ import annotations
+
 from fastapi import HTTPException, status
 
 import jwt

@@ -1,4 +1,6 @@
 """RESTAMP Buyer V1 — discovery/detail/similar + contact + enquiries + saved (6B-1..6)."""
+from __future__ import annotations
+
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status

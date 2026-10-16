@@ -7,6 +7,8 @@ Mirrors exactly what the future Expo/mobile/web frontend must implement:
 - backend error mapping: 401 -> 'login', 403 -> 'denied', 404 -> 'missing',
   422/400 -> 'validation', 5xx -> 'retry'
 """
+from __future__ import annotations
+
 import os
 
 DEFAULT_BASE_URL = "http://testserver"

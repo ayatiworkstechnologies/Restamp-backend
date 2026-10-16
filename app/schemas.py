@@ -1,4 +1,6 @@
 """RESTAMP Phase 4 — request/response schemas (pydantic v2)."""
+from __future__ import annotations
+
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal

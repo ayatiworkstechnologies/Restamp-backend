@@ -4,6 +4,8 @@ Uses saved_properties exactly: composite PK makes duplicates impossible;
 IntegrityError fallback keeps concurrent double-saves safe and idempotent.
 Listings that lose visibility are excluded from list results (never leaked).
 """
+from __future__ import annotations
+
 from fastapi import HTTPException, status
 from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError

@@ -10,6 +10,8 @@ API_SECRET via settings); they are never hardcoded and never logged.
 Layout: <CLOUDINARY_FOLDER>/listings/<listing_id>/photos/<uuid>.<ext>
 (default folder "restamp").
 """
+from __future__ import annotations
+
 import io
 import uuid
 
