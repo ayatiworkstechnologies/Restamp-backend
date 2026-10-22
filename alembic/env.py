@@ -18,7 +18,11 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional: python-dotenv is not a pinned dependency
+    def load_dotenv(*args, **kwargs):
+        return False
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 from app.models import Base
 target_metadata = Base.metadata

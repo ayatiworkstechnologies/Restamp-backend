@@ -2,9 +2,16 @@
 
 Endpoints:
   POST /owner/listings       — create a new property listing (OWNER role required)
-  GET  /owner/listings       — list caller's own listings (all statuses)
-  GET  /owner/listings/{id}  — single owner listing detail
-  PATCH /owner/listings/{id} — update own listing in place (OWNER, partial)
+  GET  /owner/listings       — list caller's own listings (all statuses; pure read)
+  GET  /owner/listings/{id}  — single owner listing detail (pure read)
+  PATCH /owner/listings/{id} — update own listing in place (OWNER, partial;
+                               never changes verification/listing status)
+  POST /owner/listings/{id}/submit  — resubmit REJECTED -> PENDING for re-review
+  POST /owner/listings/{id}/verify  — explicit PENDING -> VERIFIED
+  POST /owner/listings/{id}/reject  — explicit PENDING -> REJECTED (optional reason)
+  POST /owner/listings/{id}/publish — publish CLOSED -> AVAILABLE (VERIFIED only)
+  POST /owner/listings/{id}/archive — archive AVAILABLE -> CLOSED
+  POST /owner/listings/{id}/status  — validated AVAILABLE/CLOSED/SOLD/RENTED/LEASED
   POST /owner/listings/{id}/photos — upload a photo for own listing (multipart)
   DELETE /owner/listings/{id}/photos/{media_id} — remove one photo (OWNER)
 
@@ -23,6 +30,7 @@ from ..db import get_db
 from ..deps import require_owner
 from ..services import owner_listings as owner_svc
 from ..services import enquiries as enquiry_svc
+from ..services import visits as visit_svc
 from ..services import photo_storage
 from ..services import storage as storage_svc
 
@@ -217,6 +225,11 @@ async def upload_listing_photo(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
+    # Ownership before external side effects: a foreign listing_id fails
+    # with 404 before any Cloudinary upload is spent or stored.
+    if not owner_svc.owner_owns_listing(db, owner_id, listing_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
     # Stream with a hard cap (MIME validated above; never trust the filename).
     chunks: list[bytes] = []
     total = 0
@@ -343,6 +356,151 @@ def update_listing(
     return card
 
 
+# ---------------------------------------------------------------------------
+# Explicit lifecycle transitions (no automatic verification; GETs never write)
+# ---------------------------------------------------------------------------
+
+
+def _transition_card_or_500(db, owner_id: int, listing_id: int) -> schemas.OwnerListingOut:
+    card = owner_svc.get_owner_listing(db, owner_id, listing_id)
+    if card is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error")
+    return card
+
+
+def _run_verification_transition(
+    db, owner_id: int, listing_id: int, to_status: str, reason: str | None = None
+):
+    sp = db.begin_nested()
+    try:
+        listing = owner_svc.transition_verification(db, owner_id, listing_id, to_status, reason)
+        if listing is None:
+            sp.rollback()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        sp.commit()
+        db.commit()
+    except HTTPException:
+        raise
+    except ValueError as e:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    return _transition_card_or_500(db, owner_id, listing.id)
+
+
+def _run_status_transition(
+    db, owner_id: int, listing_id: int, to_status: str, closed_reason: str | None = None
+):
+    sp = db.begin_nested()
+    try:
+        listing = owner_svc.transition_listing_status(
+            db, owner_id, listing_id, to_status, closed_reason
+        )
+        if listing is None:
+            sp.rollback()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        sp.commit()
+        db.commit()
+    except HTTPException:
+        raise
+    except ValueError as e:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    return _transition_card_or_500(db, owner_id, listing.id)
+
+
+@router.post("/listings/{listing_id}/submit", response_model=schemas.OwnerListingOut)
+def submit_listing(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Resubmit a REJECTED listing as PENDING for re-review (refreshes submitted_at).
+
+    Idempotent when already PENDING. Returns 422 when VERIFIED (nothing to
+    resubmit). Returns 404 when the listing does not belong to the caller.
+    """
+    return _run_verification_transition(db, owner_id, listing_id, "PENDING")
+
+
+@router.post("/listings/{listing_id}/verify", response_model=schemas.OwnerListingOut)
+def verify_listing(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Explicitly verify a PENDING listing (PENDING -> VERIFIED, audited).
+
+    Idempotent when already VERIFIED. Returns 422 from REJECTED (submit
+    first) or other invalid states. Returns 404 when not owned by caller.
+    Owner-driven (self-serve preserved); a future admin-moderation step can
+    gate this route without changing the transition validation.
+    """
+    return _run_verification_transition(db, owner_id, listing_id, "VERIFIED")
+
+
+@router.post("/listings/{listing_id}/reject", response_model=schemas.OwnerListingOut)
+def reject_listing(
+    listing_id: int,
+    body: schemas.VerificationRejectIn | None = None,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Explicitly reject a PENDING listing (PENDING -> REJECTED, audited).
+
+    Accepts an optional ``{"reason": ...}`` stored in the verification audit
+    row. Idempotent when already REJECTED. Returns 422 when VERIFIED.
+    Returns 404 when the listing does not belong to the caller.
+    """
+    reason = body.reason if body is not None else None
+    return _run_verification_transition(db, owner_id, listing_id, "REJECTED", reason)
+
+
+@router.post("/listings/{listing_id}/publish", response_model=schemas.OwnerListingOut)
+def publish_listing(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Publish an archived listing (CLOSED -> AVAILABLE). VERIFIED only.
+
+    Idempotent when already AVAILABLE. Returns 422 when the listing is not
+    VERIFIED or is in a terminal deal state (SOLD/RENTED/LEASED/EXPIRED).
+    Returns 404 when the listing does not belong to the caller.
+    """
+    return _run_status_transition(db, owner_id, listing_id, "AVAILABLE")
+
+
+@router.post("/listings/{listing_id}/archive", response_model=schemas.OwnerListingOut)
+def archive_listing(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Archive a live listing (AVAILABLE -> CLOSED, reversible via publish).
+
+    Idempotent when already CLOSED. Terminal deal states cannot be archived
+    (422). Returns 404 when the listing does not belong to the caller.
+    """
+    return _run_status_transition(db, owner_id, listing_id, "CLOSED")
+
+
+@router.post("/listings/{listing_id}/status", response_model=schemas.OwnerListingOut)
+def update_listing_status(
+    listing_id: int,
+    body: schemas.ListingStatusUpdate,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Validated listing-status transition (general form of publish/archive).
+
+    AVAILABLE -> CLOSED/SOLD/RENTED/LEASED, CLOSED -> AVAILABLE (VERIFIED
+    only for AVAILABLE/SOLD/RENTED/LEASED targets). SOLD/RENTED/LEASED are
+    terminal. Same-state repeats are idempotent. Returns 404 when the
+    listing does not belong to the caller, 422 for invalid transitions.
+    """
+    return _run_status_transition(db, owner_id, listing_id, body.status, body.closed_reason)
+
+
 @router.delete("/listings/{listing_id}/photos/{media_id}", status_code=204)
 def delete_listing_photo(
     listing_id: int,
@@ -458,3 +616,89 @@ def delete_draft(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     db.commit()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Property visits (owner side): propose to related buyers; confirm, decline,
+# reschedule, or complete per the state rules. Dual-authority ownership and
+# buyer-relationship checks are enforced in the service.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/visits", response_model=schemas.VisitOut, status_code=201)
+def propose_owner_visit(
+    body: schemas.OwnerVisitCreate,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Propose a visit to a buyer holding an enquiry or contact relationship
+    on one of the caller's own verified, available listings (lands PROPOSED).
+
+    Returns 404 for foreign listings or unknown buyers, 422 for unrelated
+    buyers, past times, or self-visits.
+    """
+    if body.property_listing_id <= 0 or body.buyer_user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
+    try:
+        visit = visit_svc.create_owner_visit(
+            db, owner_id, body.property_listing_id, body.buyer_user_id,
+            body.scheduled_at, body.note,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    db.commit()
+    return visit
+
+
+@router.get("/visits", response_model=schemas.VisitsResponse)
+def list_my_visits(
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+    property_listing_id: int | None = Query(default=None, ge=1),
+    status: Literal["REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List visits for the caller's own properties, newest first. A foreign
+    property filter is 404 (never an empty list)."""
+    items, total = visit_svc.list_owner_visits(
+        db, owner_id, page, page_size, property_listing_id, status
+    )
+    return schemas.VisitsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/visits/{visit_id}", response_model=schemas.VisitOut)
+def get_my_visit(
+    visit_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """One visit for the caller's own properties; 404 otherwise."""
+    return visit_svc.get_owner_visit(db, owner_id, visit_id)
+
+
+@router.patch("/visits/{visit_id}", response_model=schemas.VisitOut)
+def update_my_visit(
+    visit_id: int,
+    body: schemas.VisitUpdate,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Confirm/decline buyer-requested visits, reschedule proposed/confirmed
+    times, cancel open visits, or complete confirmed ones — per the state
+    rules. 404 when the visit is not on the caller's property, 422 for
+    invalid moves, past times, or wrong-actor transitions."""
+    sp = db.begin_nested()
+    try:
+        visit = visit_svc.transition_visit(
+            db, "owner", owner_id, visit_id, body.scheduled_at, body.status
+        )
+    except HTTPException as e:
+        sp.rollback()
+        raise e
+    except ValueError as e:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    sp.commit()
+    db.commit()
+    return visit

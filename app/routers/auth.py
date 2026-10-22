@@ -5,7 +5,7 @@ successful verification (standard OTP registration), default role BUYER.
 Google: unknown identities NEVER auto-create (404 GOOGLE_UNKNOWN); the client
 must onboard through an approved flow before the Google identity can be linked.
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
@@ -19,6 +19,17 @@ from ..services.otp import otp_service
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _client_ip(request: Request | None) -> str | None:
+    """Best-effort client IP for per-IP OTP throttling (never logged)."""
+    try:
+        if request is not None and request.client is not None:
+            host = (request.client.host or "").strip()
+            return host or None
+    except Exception:
+        pass
+    return None
+
+
 def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
     role = users_roles.get_current_role(db, user_id)
     token, ttl = create_access_token(user_id, role)
@@ -28,8 +39,8 @@ def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
 
 
 @router.post("/otp/request")
-def otp_request(body: schemas.OTPRequest):
-    code = otp_service.request_code(body.phone)
+def otp_request(body: schemas.OTPRequest, request: Request):
+    code = otp_service.request_code(body.phone, ip=_client_ip(request))
     # The code leaves the server ONLY in OTP_DEBUG (local dev/tests).
     resp = {"message": "If the number is valid, an OTP was sent."}
     if code is not None:
@@ -38,8 +49,8 @@ def otp_request(body: schemas.OTPRequest):
 
 
 @router.post("/otp/verify", response_model=schemas.TokenOut)
-def otp_verify(body: schemas.OTPVerify, db: Session = Depends(get_db)):
-    if not otp_service.verify_code(body.phone, body.code):
+def otp_verify(body: schemas.OTPVerify, request: Request, db: Session = Depends(get_db)):
+    if not otp_service.verify_code(body.phone, body.code, ip=_client_ip(request)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired code"
         )

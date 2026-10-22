@@ -1,7 +1,9 @@
 """RESTAMP Buyer V1 — audited contact reveal (Phase 6B-4).
 
-Owner authority: property_listings -> physical_properties.user_id (NEVER
-property_listings.user_id). Phone authority: auth_identities phone identity.
+Owner authority: the listing belongs to an owner only when BOTH
+property_listings.user_id and its physical_properties.user_id agree;
+a diverged row matches neither party (fail-closed 404, never a leak).
+Phone authority: auth_identities phone identity.
 Every successful reveal inserts exactly one contact_reveal_audits row;
 failed/invisible lookups return before any write, leaving no audit rows.
 """
@@ -26,7 +28,11 @@ def reveal_contact(db: Session, buyer_id: int, listing_id: int) -> tuple[str, ob
     )
     if listing is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    owner_id = db.get(PhysicalProperty, listing.physical_property_id).user_id
+    physical = db.get(PhysicalProperty, listing.physical_property_id)
+    if physical is None or physical.user_id != listing.user_id:
+        # Diverged ownership columns: fail closed, never attribute to anyone.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    owner_id = physical.user_id
     phone_row = (
         db.query(AuthIdentity)
         .filter(AuthIdentity.user_id == owner_id, AuthIdentity.provider == "phone")

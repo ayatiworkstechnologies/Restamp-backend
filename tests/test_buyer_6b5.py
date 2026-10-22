@@ -43,7 +43,12 @@ def test_create_enquiry_new_and_active_row(client):
     assert body["status"] == "NEW" and body["message"] == "Hi"
     assert body["property_listing_id"] == lid
     assert body["listing"]["title"] == "E1"
-    assert session.execute(text("SELECT COUNT(*) FROM active_enquiries")).fetchone()[0] == 1
+    # Scoped to this test's own listing: the shared dev database may hold
+    # enquiries created outside pytest (real app usage).
+    assert session.execute(
+        text("SELECT COUNT(*) FROM active_enquiries WHERE property_listing_id=:l"),
+        {"l": lid},
+    ).fetchone()[0] == 1
     # Message optional; extra buyer_user_id in body is ignored (JWT rules).
     lid2 = seed_listing(session)
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid2, "buyer_user_id": 1}, headers=h)
@@ -61,12 +66,19 @@ def test_create_gates(client):
     assert c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=h).status_code == 403
     buyer = buyer_token(c, "+16300000003")
     hb = auth_header(buyer)
+    bad_ids = []
     for kwargs in ({"verification": "PENDING"}, {"status": "SOLD"}):
         bad = seed_listing(session, **kwargs)
+        bad_ids.append(bad)
         assert c.post("/buyer/enquiries", json={"property_listing_id": bad}, headers=hb).status_code == 404
     assert c.post("/buyer/enquiries", json={"property_listing_id": 999999999}, headers=hb).status_code == 404
     assert c.post("/buyer/enquiries", json={"property_listing_id": 0}, headers=hb).status_code == 422
-    assert session.execute(text("SELECT COUNT(*) FROM enquiries")).fetchone()[0] == 0
+    # Not one enquiry row was written for any listing this test touched.
+    for listing_id in [lid] + bad_ids:
+        assert session.execute(
+            text("SELECT COUNT(*) FROM enquiries WHERE property_listing_id=:l"),
+            {"l": listing_id},
+        ).fetchone()[0] == 0
 
 
 def test_duplicate_prevented_and_closed_allows_new(client):
@@ -77,7 +89,12 @@ def test_duplicate_prevented_and_closed_allows_new(client):
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=h)
     assert r.status_code == 200  # idempotent duplicate, not a second row
     assert r.json()["id"] == first["id"]
-    assert session.execute(text("SELECT COUNT(*) FROM active_enquiries")).fetchone()[0] == 1
+    # Scoped to this test's own listing (the shared dev database may hold
+    # enquiries created outside pytest).
+    assert session.execute(
+        text("SELECT COUNT(*) FROM active_enquiries WHERE property_listing_id=:l"),
+        {"l": lid},
+    ).fetchone()[0] == 1
     # Simulate owner close (status + active-row removal belong to Owner APIs).
     session.execute(text("UPDATE enquiries SET status='CLOSED' WHERE id=:i"), {"i": first["id"]})
     session.execute(text("DELETE FROM active_enquiries WHERE enquiry_id=:i"), {"i": first["id"]})

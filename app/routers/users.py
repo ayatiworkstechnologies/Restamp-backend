@@ -16,14 +16,21 @@ from ..services import users_roles
 router = APIRouter(tags=["users"])
 
 
-@router.post("/users", response_model=schemas.UserOut, status_code=201)
-def create_user(body: schemas.UserCreate, db: Session = Depends(get_db)):
-    """Public registration creates a BUYER only. No role choice, no admin path."""
-    user = users_roles.create_user(db, body.display_name, body.avatar_url)
-    db.commit()
-    db.refresh(user)
-    return schemas.UserOut(
-        id=user.id, display_name=user.display_name, avatar_url=user.avatar_url, status=user.status
+@router.post("/users", status_code=410)
+def create_user(body: schemas.UserCreate):
+    """Public registration is disabled (Phase 1 hardening).
+
+    Unauthenticated POST /users allowed arbitrary account creation without
+    phone/Google proof, bypassing the OTP registration flow. Legitimate
+    registration is POST /auth/otp/verify (auto-creates a BUYER on first
+    success) followed by PATCH /users/me for first-time profile setup.
+    This route is retained with 410 Gone so existing callers get a clear,
+    non-sensitive error instead of silent success. No user is created.
+    Owner/Broker roles remain self-serve via POST /users/me/role.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Public registration is disabled. Use OTP registration.",
     )
 
 

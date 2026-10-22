@@ -22,8 +22,15 @@ FAKE_PUBLIC_ID = "restamp/listings/1/photos/abc123"
 
 
 def _mock_cloud(monkeypatch, calls, fail_with=None):
-    """Stub Cloudinary upload/destroy; records calls for assertions."""
+    """Stub Cloudinary upload/destroy; records calls for assertions.
+
+    Also pins CLOUDINARY_CLOUD_NAME so the upload takes the Cloudinary
+    path (empty names fall back to local storage per the upload route).
+    """
+    from app import config as config_module
     from app.services import photo_storage as photo_svc
+
+    monkeypatch.setattr(config_module.settings, "CLOUDINARY_CLOUD_NAME", "test-cloud")
 
     def fake_upload(listing_id, data, extension, mime_type):
         calls.append(("upload", listing_id, len(data), extension, mime_type))
@@ -212,8 +219,10 @@ def test_cross_owner_is_404_and_destroys_orphan(client, monkeypatch):
     assert r.status_code == 404, r.text
     after = session.execute(text("SELECT COUNT(*) FROM property_media")).fetchone()[0]
     assert after == before
-    # Uploaded image was destroyed (no orphan on Cloudinary either).
-    assert ("destroy", FAKE_PUBLIC_ID) in calls
+    # Ownership is checked before any Cloudinary call: no upload was spent
+    # and therefore no orphan destroy is needed either.
+    assert not [call for call in calls if call[0] == "upload"]
+    assert ("destroy", FAKE_PUBLIC_ID) not in calls
 
 
 def test_db_failure_destroys_cloudinary_orphan(client, monkeypatch):
@@ -251,9 +260,12 @@ def test_cloudinary_failure_creates_no_row(client, monkeypatch):
     assert not [x for x in calls if x[0] == "destroy"]
 
 
-def test_unconfigured_storage_is_500(client, monkeypatch):
+def test_unconfigured_storage_falls_back_to_local(client, monkeypatch, tmp_path):
+    """Empty CLOUDINARY_CLOUD_NAME takes the local-media fallback (201 with
+    a /media URL and a 'local:' public_id), not the legacy 500."""
     from app import config as config_module
     monkeypatch.setattr(config_module.settings, "CLOUDINARY_CLOUD_NAME", "")
+    monkeypatch.setenv("RESTAMP_MEDIA_ROOT", str(tmp_path))
     c, session = client
     token = _setup_owner(c, session, "+919876543317")
     lid = _create_listing(c, token, "Photo Unconfigured Flat")
@@ -261,11 +273,16 @@ def test_unconfigured_storage_is_500(client, monkeypatch):
         "SELECT COUNT(*) FROM property_media WHERE property_listing_id=:i"),
         {"i": lid}).fetchone()[0]
     r = _upload(c, token, lid, PNG_1PX, "a.png", "image/png")
-    assert r.status_code == 500, r.text
+    assert r.status_code == 201, r.text
+    assert "/media/" in r.json()["url"]
     after = session.execute(text(
         "SELECT COUNT(*) FROM property_media WHERE property_listing_id=:i"),
         {"i": lid}).fetchone()[0]
-    assert after == before
+    assert after == before + 1
+    public_id = session.execute(text(
+        "SELECT public_id FROM property_media WHERE property_listing_id=:i"),
+        {"i": lid}).fetchone()[0]
+    assert public_id.startswith("local:")
 
 
 def test_existing_listing_data_intact(client, monkeypatch):

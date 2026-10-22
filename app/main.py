@@ -18,6 +18,7 @@ from .routers import health as health_router
 from .routers import owner as owner_router
 from .routers import users as users_router
 from .services import storage as storage_svc
+from .worker import worker_lifespan
 
 log = logging.getLogger("restamp")
 
@@ -42,12 +43,45 @@ def _cors_origins() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.JWT_SECRET == "restamp-local-dev-secret-change-me":
+    # Phase 1 hardening: fail fast in production when the JWT secret is
+    # missing/weak or dev auth modes are enabled. Messages are
+    # non-sensitive (setting names only, never values).
+    from .config import is_production, validate_security_config
+
+    try:
+        validate_security_config()
+    except RuntimeError as exc:
+        log.error("Insecure production configuration: %s", exc)
+        raise
+    # Resolve the OTP delivery provider at startup so a missing or broken
+    # production SMS configuration fails fast here, never as a silent
+    # "sent" response at request time.
+    from .services import otp as otp_module
+
+    try:
+        provider = otp_module.get_otp_provider()
+    except RuntimeError as exc:
+        log.error("Insecure production configuration: %s", exc)
+        raise
+    # The request handlers use the module-level singleton, so startup must
+    # install the validated provider there, not merely construct it.
+    otp_module.otp_service.provider = provider
+    if not is_production() and not settings.JWT_SECRET:
+        log.warning("JWT secret is empty in local development.")
+    elif settings.JWT_SECRET == "restamp-local-dev-secret-change-me":
         log.warning("Using default local JWT secret; override RESTAMP_JWT_SECRET outside local dev.")
-    # Fail fast when the database is unreachable at startup.
+    if settings.DATABASE_URL == "mysql+pymysql://user:pass@localhost/restamp":
+        log.warning("Using built-in default DATABASE_URL; set RESTAMP_DATABASE_URL explicitly.")
+    # Fail fast when the database is unreachable at startup (no traffic
+    # served without a database; readiness stays red until it returns).
     if not check_db():
         log.error("Database unreachable at startup.")
-    yield
+        raise RuntimeError("Database unreachable at startup.")
+
+    # Start background worker for automatic property verification
+    async with worker_lifespan():
+        yield
+
     # Engine disposal/pool cleanup on shutdown.
     from .db import engine
 
@@ -55,7 +89,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title=settings.APP_NAME, version="4.0.0")
+    app = FastAPI(title=settings.APP_NAME, version="4.0.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins(),

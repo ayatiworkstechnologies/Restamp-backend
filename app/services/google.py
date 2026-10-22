@@ -41,6 +41,11 @@ class GoogleVerifier:
 
 
 class DevGoogleVerifier(GoogleVerifier):
+    """Local/test-only verifier for synthetic "dev:<subject>" tokens.
+
+    Available ONLY outside production (enforced by get_verifier()).
+    """
+
     def verify(self, id_token: str) -> str:
         if not settings.GOOGLE_DEV_MODE:
             raise HTTPException(
@@ -52,6 +57,20 @@ class DevGoogleVerifier(GoogleVerifier):
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential"
             )
         return id_token[4:]
+
+
+class DisabledGoogleVerifier(GoogleVerifier):
+    """Production fallback when Google login is not enabled: always 501.
+
+    Returned instead of the dev verifier so synthetic identities can never
+    be accepted in production, even if development flags are misread.
+    """
+
+    def verify(self, id_token: str) -> str:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Google authentication is not configured",
+        )
 
 
 class ProductionGoogleVerifier(GoogleVerifier):
@@ -97,6 +116,18 @@ class ProductionGoogleVerifier(GoogleVerifier):
 
 
 def get_verifier() -> GoogleVerifier:
+    """Resolve the Google verifier for the current environment.
+
+    Production never falls back to synthetic development identities: with a
+    real GOOGLE_CLIENT_ID the cryptographic production verifier is used,
+    otherwise a disabled verifier that always fails closed with 501.
+    Local/dev/test keep the previous behavior (production verifier when a
+    client ID is set, else the synthetic dev verifier).
+    """
+    from ..config import is_production
+
     if settings.GOOGLE_CLIENT_ID:
         return ProductionGoogleVerifier()
+    if is_production():
+        return DisabledGoogleVerifier()
     return DevGoogleVerifier()

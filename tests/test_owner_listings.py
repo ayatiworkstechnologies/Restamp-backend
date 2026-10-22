@@ -1,10 +1,10 @@
 """Tests for RESTAMP Owner V1 property listing endpoints:
 - POST /owner/listings (create listing)
-- GET /owner/listings (list caller's listings)
-- GET /owner/listings/{listing_id} (detail)
+- GET /owner/listings (list caller's listings; pure read, never writes)
+- GET /owner/listings/{listing_id} (detail; pure read, never writes)
 - Role verification (OWNER required)
-- Automatic verification: PENDING -> VERIFIED 2 minutes after submission
-  (backend-driven on owner-listings fetch, persisted, idempotent)
+- Explicit verification: PENDING -> VERIFIED via POST /owner/listings/{id}/verify
+  (persisted, idempotent; GETs never flip state)
 """
 from __future__ import annotations
 
@@ -148,7 +148,7 @@ def test_owner_cannot_access_other_owner_listing(client):
 
 
 # ---------------------------------------------------------------------------
-# Automatic verification: PENDING -> VERIFIED 2 minutes after submission
+# Explicit verification: PENDING -> VERIFIED via POST verify (GETs never write)
 # ---------------------------------------------------------------------------
 
 
@@ -232,23 +232,28 @@ def test_listing_auto_verifies_after_two_minutes_and_persists(client):
     )
     session.commit()
 
-    # Next fetch transitions PENDING -> VERIFIED + AVAILABLE ...
+    # GETs are pure reads: an old submitted_at alone never flips state ...
     r = c.get("/owner/listings", headers=auth_header(token))
     assert r.status_code == 200, r.text
     found = [i for i in r.json()["items"] if i["listing_id"] == listing_id]
     assert len(found) == 1
-    assert found[0]["verification_status"] == "VERIFIED"
-    assert found[0]["listing_status"] == "AVAILABLE"
+    assert found[0]["verification_status"] == "PENDING"
+
+    # ... explicit verify transitions PENDING -> VERIFIED + AVAILABLE ...
+    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["verification_status"] == "VERIFIED"
+    assert r.json()["listing_status"] == "AVAILABLE"
 
     # ... persisted in MySQL (not just returned temporarily) ...
     vstat, lstat, _ = _db_status(session, listing_id)
     assert vstat == "VERIFIED"
     assert lstat == "AVAILABLE"
 
-    # ... and idempotent: repeated fetches keep it VERIFIED without changes.
-    r = c.get("/owner/listings", headers=auth_header(token))
-    found = [i for i in r.json()["items"] if i["listing_id"] == listing_id]
-    assert found[0]["verification_status"] == "VERIFIED"
+    # ... and idempotent: repeats keep it VERIFIED without changes.
+    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["verification_status"] == "VERIFIED"
     vstat, _, _ = _db_status(session, listing_id)
     assert vstat == "VERIFIED"
 
@@ -264,7 +269,13 @@ def test_listing_detail_fetch_also_auto_verifies(client):
     )
     session.commit()
 
+    # Detail GET is a pure read: still PENDING despite old submitted_at ...
     r = c.get(f"/owner/listings/{listing_id}", headers=auth_header(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["verification_status"] == "PENDING"
+
+    # ... explicit verify flips and persists.
+    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     vstat, _, _ = _db_status(session, listing_id)
@@ -320,8 +331,8 @@ def test_seed_listings_unchanged_by_auto_verify(client):
     )
     session.commit()
 
-    # Fetch runs the backend auto-verification; rows without submitted_at
-    # must survive it unchanged.
+    # Reads are pure (no auto-verification); rows without submitted_at
+    # must survive fetches unchanged.
     r = c.get("/owner/listings", headers=auth_header(token))
     assert r.status_code == 200, r.text
 

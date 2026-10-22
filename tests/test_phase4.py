@@ -17,16 +17,20 @@ def test_database_connection(client):
 
 
 def test_user_create_and_retrieve(client):
-    c, _ = client
+    c, session = client
+    # Phase 1 hardening: public POST /users is disabled (410, no creation).
+    before = session.execute(text("SELECT COUNT(*) FROM users")).fetchone()[0]
     r = c.post("/users", json={"display_name": "Buyer One"})
-    assert r.status_code == 201, r.text
-    uid = r.json()["id"]
-    tok = register_phone(c, "+10000000001")
-    me = c.get("/auth/me", headers=auth_header(tok["access_token"])).json()
-    # Owner of the record or admin may read it; use a fresh admin-less self-read path:
-    r = c.get(f"/users/{uid}", headers=auth_header(tok["access_token"]))
-    # tok belongs to a different user -> 403 proves the read guard works
+    assert r.status_code == 410, r.text
+    after = session.execute(text("SELECT COUNT(*) FROM users")).fetchone()[0]
+    assert before == after
+    # Legitimate registration is OTP verify (auto-creates), then self-read guard:
+    owner = register_phone(c, "+10000000001")
+    other = register_phone(c, "+10000000015")
+    r = c.get(f"/users/{owner['user_id']}", headers=auth_header(other["access_token"]))
+    # other belongs to a different user -> 403 proves the read guard works
     assert r.status_code == 403
+    me = c.get("/auth/me", headers=auth_header(owner["access_token"])).json()
     assert me["providers"] == ["phone"]
 
 
@@ -238,7 +242,7 @@ def test_patch_users_me_profile_update(client):
 
 
 def test_schema_regression_29_tables(client):
-    # Drafts phase: 32 + listing_drafts.
+    # Visits phase: 33 + property_visits.
     c, session = client
     tables = {
         r[0]
@@ -247,12 +251,13 @@ def test_schema_regression_29_tables(client):
                   "WHERE TABLE_SCHEMA = DATABASE()")
         ).fetchall()
     } - {"alembic_version"}
-    assert len(tables) == 33
+    assert len(tables) == 34
     assert "saved_properties" in tables
     assert "rent_terms" in tables
     assert "amenity_master" in tables
     assert "listing_amenities" in tables
+    assert "property_visits" in tables
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == (
-        # Edit phase: + property_media.public_id (photo delete support).
-        "e6f7a8b9c0d1"
+        # Visits phase: + property_visits table.
+        "f2a3b4c5d6e7"
     )

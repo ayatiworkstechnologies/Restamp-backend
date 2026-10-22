@@ -50,6 +50,11 @@ def create_enquiry(
 ) -> tuple[dict, bool]:
     """Create (NEW) or return the existing active enquiry. Returns (body, created)."""
     listing = _visible_listing(db, listing_id)
+    # Consistency gate first (fail-closed before any read of enquiry state):
+    # both ownership columns must agree, or the row matches nobody.
+    physical = db.get(PhysicalProperty, listing.physical_property_id)
+    if physical is None or physical.user_id != listing.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     existing = (
         db.query(ActiveEnquiry)
         .filter(
@@ -60,7 +65,7 @@ def create_enquiry(
     )
     if existing is not None:
         return _snapshot(db, db.get(Enquiry, existing.enquiry_id)), False
-    owner_id = db.get(PhysicalProperty, listing.physical_property_id).user_id
+    owner_id = physical.user_id
     enquiry = Enquiry(
         property_listing_id=listing_id,
         buyer_user_id=buyer_id,
@@ -212,11 +217,14 @@ def list_owner_leads(
     from sqlalchemy import func as _func
 
     if property_listing_id is not None:
+        # Dual-authority check (consistent with owner listing reads): the
+        # filter passes only when BOTH ownership columns equal the caller.
         owned = (
             db.query(PropertyListing.id)
             .join(PhysicalProperty, PhysicalProperty.id == PropertyListing.physical_property_id)
             .filter(
                 PropertyListing.id == property_listing_id,
+                PropertyListing.user_id == owner_id,
                 PhysicalProperty.user_id == owner_id,
             )
             .first()

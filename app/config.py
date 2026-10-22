@@ -3,6 +3,8 @@
 No secrets are hardcoded. Production/cloud configuration is intentionally absent.
 Database passwords come from RESTAMP_DATABASE_URL; the JWT secret from RESTAMP_JWT_SECRET.
 """
+from __future__ import annotations
+
 import os
 
 
@@ -18,6 +20,11 @@ def _get_int(name: str, default: int) -> int:
 
 
 class Settings:
+    # Explicit environment name. Local dev/tests use "local" (default);
+    # production/staging deployments MUST set RESTAMP_ENV=production
+    # (or staging). Production hardening is also triggered automatically
+    # when DATABASE_URL points at a non-local host (see is_production()).
+    ENV: str = _get("RESTAMP_ENV", "local")
     # Local development MySQL. Example:
     #   mysql+pymysql://restamp_dev:<pwd>@localhost/restamp_dev?unix_socket=/tmp/mysql.sock
     DATABASE_URL: str = _get(
@@ -40,6 +47,23 @@ class Settings:
     OTP_MAX_REQUESTS_PER_HOUR: int = _get_int("RESTAMP_OTP_MAX_REQUESTS_PER_HOUR", 5)
     OTP_MAX_VERIFY_ATTEMPTS: int = _get_int("RESTAMP_OTP_MAX_VERIFY_ATTEMPTS", 5)
     OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 900)
+    # Production SMS delivery selection. Names a key in the provider registry
+    # (see app/services/otp.py PRODUCTION_SMS_PROVIDERS). Empty = unconfigured.
+    # No vendor is implemented yet; production requires a real registered
+    # provider (enforced at startup). Local dev/tests always use the dev
+    # provider regardless of this value.
+    SMS_PROVIDER: str = _get("RESTAMP_SMS_PROVIDER", "")
+    # Per-IP abuse protection (in-memory, per process — see otp.py).
+    # These bound total OTP request/verify-failure volume from a single
+    # client IP across all phones, so rotating phones does not bypass
+    # the per-phone caps. Tunable via env; defaults allow normal
+    # NAT sharing while stopping bulk abuse.
+    OTP_MAX_REQUESTS_PER_HOUR_PER_IP: int = _get_int(
+        "RESTAMP_OTP_MAX_REQUESTS_PER_HOUR_PER_IP", 30
+    )
+    OTP_MAX_VERIFY_ATTEMPTS_PER_IP: int = _get_int(
+        "RESTAMP_OTP_MAX_VERIFY_ATTEMPTS_PER_IP", 30
+    )
     # When "1", OTP responses include the code (LOCAL DEV + TESTS ONLY).
     OTP_DEBUG: bool = _get("RESTAMP_OTP_DEBUG", "0") == "1"
     OTP_DEMO_MODE: bool = _get("RESTAMP_OTP_DEMO_MODE", "0") == "1"
@@ -49,8 +73,13 @@ class Settings:
 
     # Google verification. Real verification needs GOOGLE_CLIENT_ID and a real
     # verifier; dev mode accepts only synthetic "dev:<subject>" tokens.
+    # GOOGLE_ENABLED explicitly opts production in to Google login ("1").
+    # Production login additionally requires a real GOOGLE_CLIENT_ID and
+    # GOOGLE_DEV_MODE=0 (enforced at startup); when not enabled, Google
+    # routes fail closed with 501 and never accept synthetic identities.
     GOOGLE_CLIENT_ID: str = _get("RESTAMP_GOOGLE_CLIENT_ID", "")
     GOOGLE_DEV_MODE: bool = _get("RESTAMP_GOOGLE_DEV_MODE", "0") == "1"
+    GOOGLE_ENABLED: bool = _get("RESTAMP_GOOGLE_ENABLED", "0") == "1"
 
     APP_NAME: str = "restamp-backend"
     # Local CORS origins (comma-separated). Empty = built-in local defaults in main.py.
@@ -73,6 +102,121 @@ class Settings:
 
 
 settings = Settings()
+
+
+# --- Phase 1: production hardening helpers (no secrets in messages/logs) ----
+_PROD_ENVS = {"production", "prod", "staging"}
+_JWT_KNOWN_WEAK = {
+    "",
+    "restamp-local-dev-secret-change-me",
+    "change-me-to-a-long-random-secret",
+    "change-me",
+    "changeme",
+    "password",
+    "secret",
+    "test",
+    "phase4-test-secret",
+}
+_JWT_MIN_LENGTH = 32
+
+
+def _is_local_database_url(url: str) -> bool:
+    """True for local dev/test URLs (unix socket or loopback host)."""
+    low = (url or "").lower()
+    if "unix_socket" in low:
+        return True
+    for host in ("localhost", "127.0.0.1", "::1"):
+        if f"@{host}" in low or f"://{host}" in low:
+            return True
+    return False
+
+
+def is_production() -> bool:
+    """True when running against production-like configuration.
+
+    Explicit RESTAMP_ENV=production/prod/staging wins; otherwise a
+    non-local DATABASE_URL (no unix socket, non-loopback host) is
+    treated as production. Fail-closed: unknown/malformed URLs are
+    treated as production so hardening cannot be skipped by misconfig.
+    """
+    env = (settings.ENV or "").strip().lower()
+    if env in _PROD_ENVS:
+        return True
+    try:
+        return not _is_local_database_url(settings.DATABASE_URL)
+    except Exception:
+        return True
+
+
+def is_jwt_secret_strong(secret: str | None) -> bool:
+    """Check length + blocklist without ever logging the value."""
+    if not secret or not isinstance(secret, str):
+        return False
+    s = secret.strip()
+    if len(s) < _JWT_MIN_LENGTH:
+        return False
+    if s in _JWT_KNOWN_WEAK:
+        return False
+    low = s.lower()
+    for marker in ("change-me", "changeme", "password", "secret-change-me", "dev-secret"):
+        if marker in low:
+            return False
+    return True
+
+
+def validate_security_config() -> None:
+    """Fail fast with non-sensitive errors when production config is unsafe.
+
+    Safe in local/dev/test (no-op). Raises RuntimeError in production when:
+    - JWT secret is missing, weak (<32 chars), or a known placeholder;
+    - RESTAMP_OTP_DEBUG / OTP_DEMO_MODE / GOOGLE_DEV_MODE are enabled;
+    - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
+    - no production SMS provider is configured (RESTAMP_SMS_PROVIDER must
+      name a registered production provider);
+    - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
+    Messages name only the setting, never its value.
+    """
+    if not is_production():
+        return
+    if not is_jwt_secret_strong(settings.JWT_SECRET):
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_JWT_SECRET must be "
+            "set to a strong random value at least 32 characters long."
+        )
+    if settings.OTP_DEBUG:
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_OTP_DEBUG must be '0' "
+            "in production (OTP codes must never be returned in API responses)."
+        )
+    if settings.OTP_DEMO_MODE:
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_OTP_DEMO_MODE must be '0' "
+            "in production (fixed demo codes must never be accepted)."
+        )
+    if settings.GOOGLE_DEV_MODE:
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_GOOGLE_DEV_MODE must be '0' "
+            "in production (synthetic dev tokens must never be accepted)."
+        )
+    cors = [o.strip() for o in (settings.CORS_ORIGINS or "").split(",") if o.strip()]
+    if "*" in cors:
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_CORS_ORIGINS must not "
+            "contain '*' when credentials are enabled."
+        )
+    # Lazy imports: services import this module at load time.
+    from .services import otp as otp_module
+
+    if not otp_module.is_sms_configured():
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_SMS_PROVIDER must name "
+            "a configured production SMS provider (no dev fallback in production)."
+        )
+    if settings.GOOGLE_ENABLED and not settings.GOOGLE_CLIENT_ID.strip():
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_GOOGLE_ENABLED requires "
+            "a real RESTAMP_GOOGLE_CLIENT_ID in production."
+        )
 
 
 # Backwards-compatible alias (Phase 3 code read DBConfig.SQLALCHEMY_DATABASE_URI).

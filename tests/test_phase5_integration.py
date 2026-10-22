@@ -275,16 +275,17 @@ def test_regression_foundation_intact(client):
             text("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()")
         ).fetchall()
     } - {"alembic_version"}
-    # Drafts phase: 32 + listing_drafts.
-    assert len(tables) == 33
+    # Visits phase: 33 + property_visits.
+    assert len(tables) == 34
     assert "saved_properties" in tables
-    # Drafts phase: 48 + listing_drafts user FK.
+    assert "property_visits" in tables
+    # Visits phase: 49 + 3 property_visits FKs.
     assert (
         session.execute(
             text("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
                  "WHERE CONSTRAINT_SCHEMA = DATABASE()")
         ).fetchone()[0]
-        == 49
+        == 52
     )
     idx = {
         r[0]
@@ -303,13 +304,13 @@ def test_regression_foundation_intact(client):
     ):
         assert required in idx, required
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == (
-        # Edit phase: + property_media.public_id (photo delete support).
-        "e6f7a8b9c0d1"
+        # Visits phase: + property_visits table.
+        "f2a3b4c5d6e7"
     )
     from app.models import Base
 
-    # Drafts phase: 32 + listing_drafts.
-    assert len(Base.metadata.tables) == 33
+    # Visits phase: 33 + property_visits.
+    assert len(Base.metadata.tables) == 34
 
 
 def test_phase7_e2e_buyer_profile_owner_flow(client):

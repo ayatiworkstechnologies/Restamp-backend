@@ -9,6 +9,7 @@ from .locations import City, District, Taluk, Village, Locality, Postcode
 from .billing import Plan, Payment, PaymentWebhookEvent, Subscription, Entitlement
 from .properties import PhysicalProperty, PropertyListing, Verification, PropertyMedia, PropertyDocument, RentTerms, AmenityMaster, ListingAmenity, ListingDraft
 from .enquiries import Enquiry, ActiveEnquiry
+from .visits import PropertyVisit
 from .brokers import BrokerPostcodeAccessCurrent, BrokerPostcodeAccessHistory
 from .logs import ContactRevealAudit, ActivityLog, AuditLog
 from .saved import SavedProperty
@@ -19,6 +20,7 @@ __all__ = [
     "PhysicalProperty","PropertyListing","Verification","PropertyMedia","PropertyDocument",
     "RentTerms","AmenityMaster","ListingAmenity","ListingDraft",
     "Enquiry","ActiveEnquiry",
+    "PropertyVisit",
     "BrokerPostcodeAccessCurrent","BrokerPostcodeAccessHistory",
     "ContactRevealAudit","ActivityLog","AuditLog",
     "SavedProperty",

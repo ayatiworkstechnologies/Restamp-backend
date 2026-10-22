@@ -14,6 +14,7 @@ from ..services import listings as listing_svc
 from ..services import contact as contact_svc
 from ..services import enquiries as enquiry_svc
 from ..services import saved as saved_svc
+from ..services import visits as visit_svc
 
 router = APIRouter(prefix="/buyer", tags=["buyer"])
 
@@ -184,3 +185,76 @@ def unsave_buyer_listing(
     if saved_svc.unsave_listing(db, buyer_id, listing_id):
         db.commit()
     return None
+
+
+@router.post("/visits", response_model=schemas.VisitOut, status_code=201)
+def schedule_buyer_visit(
+    body: schemas.VisitCreate,
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """Schedule a visit on a verified, available listing (lands REQUESTED).
+
+    The scheduled time must be in the future. Returns 404 for invisible
+    listings or diverged ownership, 422 for past times or self-visits.
+    """
+    if body.property_listing_id <= 0:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
+    try:
+        visit = visit_svc.create_buyer_visit(
+            db, buyer_id, body.property_listing_id, body.scheduled_at, body.note
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    db.commit()
+    return visit
+
+
+@router.get("/visits", response_model=schemas.VisitsResponse)
+def list_buyer_visits(
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+    status: Literal["REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List the caller's own visits, newest first."""
+    items, total = visit_svc.list_buyer_visits(db, buyer_id, page, page_size, status)
+    return schemas.VisitsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/visits/{visit_id}", response_model=schemas.VisitOut)
+def get_buyer_visit(
+    visit_id: int,
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """One own visit; 404 when missing or owned by someone else."""
+    return visit_svc.get_buyer_visit(db, buyer_id, visit_id)
+
+
+@router.patch("/visits/{visit_id}", response_model=schemas.VisitOut)
+def update_buyer_visit(
+    visit_id: int,
+    body: schemas.VisitUpdate,
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """Reschedule and/or confirm/decline/cancel own visit per the state
+    rules (buyers confirm/decline owner-proposed visits, reschedule
+    requested/confirmed times, cancel open visits). 404 when not owned,
+    422 for invalid moves or past times."""
+    sp = db.begin_nested()
+    try:
+        visit = visit_svc.transition_visit(
+            db, "buyer", buyer_id, visit_id, body.scheduled_at, body.status
+        )
+    except HTTPException as e:
+        sp.rollback()
+        raise e
+    except ValueError as e:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    sp.commit()
+    db.commit()
+    return visit

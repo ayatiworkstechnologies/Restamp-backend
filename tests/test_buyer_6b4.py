@@ -55,7 +55,11 @@ def test_buyer_reveal_and_audit(client):
     assert r.status_code == 200, r.text
     assert r.json() == {"phone": owner_phone}
     row = session.execute(
-        text("SELECT user_id, property_listing_id FROM contact_reveal_audits")
+        text(
+            "SELECT user_id, property_listing_id FROM contact_reveal_audits "
+            "WHERE user_id=:u AND property_listing_id=:l"
+        ),
+        {"u": tok["user_id"], "l": lid},
     ).fetchone()
     assert (row[0], row[1]) == (tok["user_id"], lid)
 
@@ -83,7 +87,8 @@ def test_auth_and_visibility_gates(client):
 
 def test_owner_resolution_ignores_listing_user_and_repeat_audited(client):
     c, session = client
-    lid, _owner, owner_phone = seed_owner_listing(session, broker_listed=True)
+    # Consistent row: repeats allowed, each audited; public feeds never leak phones.
+    lid, _owner, owner_phone = seed_owner_listing(session)
     tok = register_phone(c, "+16200000004")
     h = auth_header(tok["access_token"])
     assert c.post(f"/buyer/listings/{lid}/contact", headers=h).json()["phone"] == owner_phone
@@ -96,3 +101,12 @@ def test_owner_resolution_ignores_listing_user_and_repeat_audited(client):
     # Public endpoints never leak phones.
     assert "1610000" not in str(c.get("/buyer/listings").json())
     assert "1610000" not in str(c.get(f"/buyer/listings/{lid}").json())
+    # Diverged ownership columns (listing.user_id != physical.user_id, only
+    # reachable via direct SQL — the API always writes both identically):
+    # fail closed with 404, no audit row, no phone disclosure.
+    bad, _, _ = seed_owner_listing(session, broker_listed=True)
+    before = audit_count(session)
+    r = c.post(f"/buyer/listings/{bad}/contact", headers=h)
+    assert r.status_code == 404
+    assert r.json() == {"detail": "Not found"}
+    assert audit_count(session) == before

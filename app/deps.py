@@ -18,7 +18,14 @@ def require_role(*allowed: str):
     def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
         role = users_roles.get_current_role(db, user_id)
         if role not in allowed:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+            # Actionable detail (caller's own state only, no data leak):
+            # e.g. "BUYER role required" tells a 403 recipient exactly why
+            # their valid token was refused (owner/agent-mode account trying
+            # a buyer action) instead of a bare "Forbidden".
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"{'/'.join(allowed)} role required",
+            )
         return user_id
 
     return _check

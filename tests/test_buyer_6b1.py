@@ -1,10 +1,35 @@
-"""Phase 6B-1: GET /buyer/listings — public discovery (rollback-isolated)."""
+"""Phase 6B-1: GET /buyer/listings — public discovery (rollback-isolated).
+
+Scoping convention
+-------------------
+Tests run inside a rolled-back transaction on the SHARED local dev database,
+so rows committed outside pytest (manual app usage, live checks) are visible
+to every query in this module. An absolute count over the whole table is
+therefore unstable — it depends on what else happens to be in the database.
+
+So every fixture here carries a unique token in its title, and every
+data-dependent request is scoped to that token with `q=`. Each test then
+asserts against exactly the rows it created: the absolute counts stay exact,
+they are just counted inside the test's own scope instead of over the whole
+database. This is the same technique the CS-/EXP-/Q9Z/Q9W/SF4D tests in this
+file already use, so no new production behaviour is involved.
+"""
 from sqlalchemy import text
 
 from tests.conftest import make_postcode
 
 
 _seed_n = {"i": 0}
+
+
+def _scoped(token: str, **params) -> dict:
+    """Query params scoped to this test's own fixture rows.
+
+    `token` is the unique marker the fixtures carry in their titles, so no
+    row committed outside the test suite can match it. An explicit `q=` in
+    `params` overrides the token (used by the multi-term search assertion).
+    """
+    return {"q": token, **params}
 
 
 def seed_listing(
@@ -60,33 +85,46 @@ def seed_listing(
 
 def test_public_access_and_visibility(client):
     c, session = client
-    good = seed_listing(session, title="Good Flat")
-    seed_listing(session, title="Pending Flat", verification="PENDING")
-    seed_listing(session, title="Sold Flat", status="SOLD")
-    seed_listing(session, title="Rented Flat", status="RENTED")
-    seed_listing(session, title="Leased Flat", status="LEASED")
-    r = c.get("/buyer/listings")
+    good = seed_listing(session, title="VIS1 Good Flat")
+    pending = seed_listing(session, title="VIS1 Pending Flat", verification="PENDING")
+    sold = seed_listing(session, title="VIS1 Sold Flat", status="SOLD")
+    rented = seed_listing(session, title="VIS1 Rented Flat", status="RENTED")
+    leased = seed_listing(session, title="VIS1 Leased Flat", status="LEASED")
+    # Scoped to this test's own five rows, so the count is exact whatever
+    # else the shared database holds.
+    r = c.get("/buyer/listings", params=_scoped("VIS1"))
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["total"] == 1
     assert [i["listing_id"] for i in body["items"]] == [good]
     assert body["page"] == 1 and body["page_size"] == 20
+    # Unscoped public feed: our fixtures are the newest rows, so they are on
+    # the first page under the default relevance sort. Exactly the visible one
+    # is exposed — the PENDING/SOLD/RENTED/LEASED ones never are.
+    r = c.get("/buyer/listings", params={"page_size": 100})
+    assert r.status_code == 200, r.text
+    visible = {i["listing_id"] for i in r.json()["items"]}
+    assert good in visible
+    assert not visible & {pending, sold, rented, leased}
 
 
 def test_deal_and_type_filters(client):
     c, session = client
-    b = seed_listing(session, title="B", deal="BUY")
-    seed_listing(session, title="R", deal="RESALE")
-    seed_listing(session, title="Rent", deal="RENT")
-    seed_listing(session, title="Lease", deal="LEASE")
-    seed_listing(session, title="Villa", ptype="VILLA")
-    assert c.get("/buyer/listings", params={"deal": "BUY"}).json()["total"] == 2
+    b = seed_listing(session, title="DF2 B", deal="BUY")
+    seed_listing(session, title="DF2 R", deal="RESALE")
+    seed_listing(session, title="DF2 Rent", deal="RENT")
+    seed_listing(session, title="DF2 Lease", deal="LEASE")
+    seed_listing(session, title="DF2 Villa", ptype="VILLA")
+    assert c.get("/buyer/listings", params=_scoped("DF2", deal="BUY")).json()["total"] == 2
     for deal, expect in (("BUY", 2), ("RESALE", 1), ("RENT", 1), ("LEASE", 1)):
-        r = c.get("/buyer/listings", params={"deal": deal})
+        r = c.get("/buyer/listings", params=_scoped("DF2", deal=deal))
         assert r.json()["total"] == expect, deal
         assert all(i["transaction_type"] == deal for i in r.json()["items"])
-    assert b in {i["listing_id"] for i in c.get("/buyer/listings", params={"deal": "BUY"}).json()["items"]}
-    r = c.get("/buyer/listings", params={"property_type": "VILLA"})
+    assert b in {
+        i["listing_id"]
+        for i in c.get("/buyer/listings", params=_scoped("DF2", deal="BUY")).json()["items"]
+    }
+    r = c.get("/buyer/listings", params=_scoped("DF2", property_type="VILLA"))
     assert r.json()["total"] == 1
     assert c.get("/buyer/listings", params={"deal": "NOPE"}).status_code == 422
 
@@ -96,46 +134,71 @@ def test_bedrooms_price_locality_filters(client):
     pc = make_postcode(session, "-loc")
     session.execute(text("UPDATE localities SET name='Guindy' WHERE id=(SELECT locality_id FROM postcodes WHERE id=:p)"), {"p": pc})
     session.flush()
-    a = seed_listing(session, title="A", beds=2, price=50_00_000_00, locality_postcode=pc)
-    seed_listing(session, title="B", beds=4, price=200_00_000_00, locality_postcode=pc)
-    assert [i["listing_id"] for i in c.get("/buyer/listings", params={"bedrooms": 2}).json()["items"]] == [a]
-    assert c.get("/buyer/listings", params={"bedrooms_min": 4}).json()["total"] == 1
-    r = c.get("/buyer/listings", params={"min_price_paise": 100_00_000_00})
+    a = seed_listing(session, title="BF3 A", beds=2, price=50_00_000_00, locality_postcode=pc)
+    seed_listing(session, title="BF3 B", beds=4, price=200_00_000_00, locality_postcode=pc)
+    assert [i["listing_id"] for i in c.get("/buyer/listings", params=_scoped("BF3", bedrooms=2)).json()["items"]] == [a]
+    assert c.get("/buyer/listings", params=_scoped("BF3", bedrooms_min=4)).json()["total"] == 1
+    r = c.get("/buyer/listings", params=_scoped("BF3", min_price_paise=100_00_000_00))
     assert r.json()["total"] == 1
-    r = c.get("/buyer/listings", params={"max_price_paise": 100_00_000_00})
+    r = c.get("/buyer/listings", params=_scoped("BF3", max_price_paise=100_00_000_00))
     assert r.json()["total"] == 1
     assert c.get("/buyer/listings", params={"min_price_paise": 200, "max_price_paise": 100}).status_code == 422
-    # Locality substring via hierarchy chain.
-    assert c.get("/buyer/listings", params={"locality": "guin"}).json()["total"] == 2
-    assert c.get("/buyer/listings", params={"locality": "zzz-nope"}).json()["total"] == 0
+    # Locality substring via hierarchy chain. Scoped, so the "no match" case
+    # proves the locality filter really excluded the two rows in scope.
+    assert c.get("/buyer/listings", params=_scoped("BF3", locality="guin")).json()["total"] == 2
+    assert c.get("/buyer/listings", params=_scoped("BF3", locality="zzz-nope")).json()["total"] == 0
 
 
 def test_pagination_and_sort_and_search(client):
     c, session = client
     lids = [
-        seed_listing(session, title=f"Flat {i}", price=(i + 1) * 10_00_000_00, area=1000 + i * 100)
+        seed_listing(session, title=f"PG4 Flat {i}", price=(i + 1) * 10_00_000_00, area=1000 + i * 100)
         for i in range(5)
     ]
-    r = c.get("/buyer/listings", params={"page": 2, "page_size": 2})
+    r = c.get("/buyer/listings", params=_scoped("PG4", page=2, page_size=2))
     assert (r.json()["page"], r.json()["page_size"], r.json()["total"]) == (2, 2, 5)
     assert len(r.json()["items"]) == 2
     assert c.get("/buyer/listings", params={"page": 0}).status_code == 422
     assert c.get("/buyer/listings", params={"page_size": 101}).status_code == 422
-    asc = [i["price_paise"] for i in c.get("/buyer/listings", params={"sort": "price_asc", "page_size": 100}).json()["items"]]
+    asc = [i["price_paise"] for i in c.get("/buyer/listings", params=_scoped("PG4", sort="price_asc", page_size=100)).json()["items"]]
     assert asc == sorted(asc)
-    desc = [i["price_paise"] for i in c.get("/buyer/listings", params={"sort": "price_desc", "page_size": 100}).json()["items"]]
+    desc = [i["price_paise"] for i in c.get("/buyer/listings", params=_scoped("PG4", sort="price_desc", page_size=100)).json()["items"]]
     assert desc == sorted(desc, reverse=True)
-    areas = [i["area_value"] for i in c.get("/buyer/listings", params={"sort": "area_desc", "page_size": 100}).json()["items"]]
+    areas = [i["area_value"] for i in c.get("/buyer/listings", params=_scoped("PG4", sort="area_desc", page_size=100)).json()["items"]]
     assert areas == sorted(areas, reverse=True)
     # Multi-term text search is AND across terms (every term must appear
     # somewhere in the record): the exact-title row is always recalled, but
     # sibling rows whose generated location names contain the digit may also
     # match, so only membership — not an exact total — is asserted here.
-    got = c.get("/buyer/listings", params={"q": "Flat 3"}).json()
+    got = c.get("/buyer/listings", params=_scoped("PG4", q="PG4 Flat 3")).json()
     assert got["total"] >= 1
     assert lids[3] in [i["listing_id"] for i in got["items"]]
-    r = c.get("/buyer/listings", params={"count_only": True})
+    r = c.get("/buyer/listings", params=_scoped("PG4", count_only=True))
     assert r.json() == {"items": [], "page": 1, "page_size": 20, "total": 5}
+
+
+def test_scoped_counts_ignore_rows_outside_the_scope(client):
+    """The scope — not a clean database — is what makes the counts stable.
+
+    The shared dev database holds committed listings that pytest never
+    created. A row this test did not scope must not change a scoped count,
+    and must still be visible to the unscoped feed.
+    """
+    c, session = client
+    mine = seed_listing(session, title="SCP1 Mine", deal="BUY")
+    foreign = seed_listing(session, title="OTH1 Foreign", deal="RENT")
+
+    scoped = c.get("/buyer/listings", params=_scoped("SCP1"))
+    assert scoped.status_code == 200, scoped.text
+    assert scoped.json()["total"] == 1
+    assert [i["listing_id"] for i in scoped.json()["items"]] == [mine]
+
+    # The unscoped feed shows both rows — so the exclusion above came from
+    # the scope, not from the row being invisible.
+    unscoped = c.get("/buyer/listings", params={"page_size": 100})
+    assert unscoped.status_code == 200, unscoped.text
+    ids = {i["listing_id"] for i in unscoped.json()["items"]}
+    assert mine in ids and foreign in ids
 
 
 def test_no_private_info_media_and_schema(client):

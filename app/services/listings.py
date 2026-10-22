@@ -2,9 +2,12 @@
 
 Visibility (VERIFIED + AVAILABLE) is enforced inside every builder here, never by callers.
 Reads use explicit column lists only (no SELECT *); cover media is fetched in ONE batched
-query (no N+1); private data (phones, identities, owners, payments, audits) is never selected.
+query (no N+1); private data (phones, identities, payments, audits) is never selected —
+detail responses carry only a phone-sanitized owner display name (or null).
 """
 from __future__ import annotations
+
+import re
 
 from sqlalchemy import asc, desc, func, or_
 from sqlalchemy.orm import Session
@@ -201,6 +204,41 @@ def search_listings(db: Session, page: int, page_size: int, **filters) -> tuple[
     return [_card_row(r) for r in rows], total
 
 
+def _safe_owner_name(db: Session, user_id: int) -> str | None:
+    """Public-safe owner display name, or None when there is no safe name.
+
+    The name source is users.display_name (set at OTP registration to the
+    phone number, later replaceable via PATCH /users/me). A display name is
+    safe only when it is neither phone-shaped nor equal to one of the
+    owner's own phone identities — otherwise returning it would leak the
+    phone number through a public response. No other user columns are read.
+    """
+    from ..models import AuthIdentity, User
+
+    user = db.get(User, user_id)
+    if user is None:
+        return None
+    name = (user.display_name or "").strip()
+    if not name:
+        return None
+    digits = re.sub(r"[\s\-()]", "", name)
+    if re.fullmatch(r"\+?[0-9]{6,15}", digits):
+        return None
+    # Reject phone numbers hidden inside a longer display name, not just
+    # names that consist entirely of a number.
+    if re.search(r"(?:\d[\s\-().]*){6,}", name):
+        return None
+    phone_ids = {
+        r[0]
+        for r in db.query(AuthIdentity.provider_identifier)
+        .filter(AuthIdentity.user_id == user_id, AuthIdentity.provider == "phone")
+        .all()
+    }
+    if name in phone_ids:
+        return None
+    return name
+
+
 def get_listing_detail(db: Session, listing_id: int) -> dict | None:
     """Full public detail + ordered gallery, or None when not publicly visible."""
     row = (
@@ -222,6 +260,18 @@ def get_listing_detail(db: Session, listing_id: int) -> dict | None:
     card["gallery"] = gallery
     card["verification_status"] = listing.verification_status
     card["listing_status"] = listing.listing_status
+    # Both ownership records must agree before exposing a public name. A
+    # mismatch means we cannot establish who the seller is.
+    physical_owner_id = (
+        db.query(PhysicalProperty.user_id)
+        .filter(PhysicalProperty.id == listing.physical_property_id)
+        .scalar()
+    )
+    card["owner_name"] = (
+        _safe_owner_name(db, listing.user_id)
+        if physical_owner_id == listing.user_id
+        else None
+    )
     return card
 
 

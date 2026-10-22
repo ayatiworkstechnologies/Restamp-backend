@@ -12,6 +12,7 @@ os.environ.setdefault(
 os.environ["RESTAMP_JWT_SECRET"] = "phase4-test-secret"
 os.environ["RESTAMP_OTP_DEBUG"] = "1"
 os.environ["RESTAMP_GOOGLE_DEV_MODE"] = "1"
+os.environ["RESTAMP_DISABLE_AUTO_VERIFY"] = "1"
 
 import pytest
 from fastapi.testclient import TestClient

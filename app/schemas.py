@@ -118,6 +118,9 @@ class ListingDetail(ListingCard):
     gallery: list[str]
     verification_status: str
     listing_status: str
+    # Phone-sanitized owner display name (null when the owner has no safe
+    # saved name — e.g. the phone-number default). Never a phone number.
+    owner_name: str | None = None
 
 
 class ContactRevealOut(BaseModel):
@@ -183,6 +186,87 @@ class OwnerLeadUpdate(BaseModel):
 
     status: Literal["NEW", "CONTACTED", "CLOSED"]
     closing_reason: str | None = Field(default=None, max_length=500)
+
+
+class ListingStatusUpdate(BaseModel):
+    """Explicit owner-driven listing-status transition.
+
+    AVAILABLE -> CLOSED (archive) | CLOSED -> AVAILABLE (publish, VERIFIED
+    only) | AVAILABLE -> SOLD/RENTED/LEASED (deal close, VERIFIED only,
+    terminal). Same-state repeats are idempotent. closed_reason is stored
+    when supplied (cleared on republish to AVAILABLE when omitted).
+    """
+
+    status: Literal["AVAILABLE", "CLOSED", "SOLD", "RENTED", "LEASED"]
+    closed_reason: str | None = Field(default=None, max_length=500)
+
+
+class VerificationRejectIn(BaseModel):
+    """Optional reason for an explicit PENDING -> REJECTED transition."""
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+# --- Property visits (buyer/owner scheduled viewings) --------------------------
+
+_VISIT_STATUSES = {"REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"}
+
+
+class VisitCreate(BaseModel):
+    """Buyer schedules a visit on a verified, available listing."""
+
+    property_listing_id: int
+    scheduled_at: datetime
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class OwnerVisitCreate(BaseModel):
+    """Owner proposes a visit to a buyer with an existing enquiry or contact
+    relationship on one of the owner's listings."""
+
+    property_listing_id: int
+    buyer_user_id: int
+    scheduled_at: datetime
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class VisitUpdate(BaseModel):
+    """Reschedule and/or status-transition a visit. At least one field is
+    required; actor permissions and the state machine are enforced in the
+    service (buyer confirms/proposes-side, owner confirms/completes)."""
+
+    scheduled_at: datetime | None = None
+    status: Literal["CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self):
+        if self.scheduled_at is None and self.status is None:
+            raise ValueError("scheduled_at or status is required")
+        return self
+
+
+class VisitOut(BaseModel):
+    """One scheduled viewing. Buyer identity is the stable user id only —
+    no names (phone-registered display names would leak) and no phones."""
+
+    id: int
+    property_listing_id: int
+    buyer_user_id: int
+    owner_user_id: int
+    scheduled_at: datetime
+    status: str
+    initiator: str
+    note: str | None
+    listing: EnquiryListingSnapshot
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class VisitsResponse(BaseModel):
+    items: list[VisitOut]
+    page: int
+    page_size: int
+    total: int
 
 
 # --- Owner V1 listing management (Phase 7) ------------------------------------

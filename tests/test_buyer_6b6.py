@@ -20,7 +20,16 @@ def test_save_list_unsave_flow(client):
     assert c.delete(f"/buyer/saved/{l1}", headers=h).status_code == 204
     assert [i["listing_id"] for i in c.get("/buyer/saved", headers=h).json()["items"]] == [l2]
     assert c.delete(f"/buyer/saved/{l1}", headers=h).status_code == 204  # idempotent
-    assert session.execute(text("SELECT COUNT(*) FROM saved_properties")).fetchone()[0] == 1
+    # Scoped to this test's own listings: the shared dev database may hold
+    # wishlist rows created outside pytest (real app usage).
+    assert session.execute(
+        text("SELECT COUNT(*) FROM saved_properties WHERE property_listing_id=:l"),
+        {"l": l1},
+    ).fetchone()[0] == 0
+    assert session.execute(
+        text("SELECT COUNT(*) FROM saved_properties WHERE property_listing_id=:l"),
+        {"l": l2},
+    ).fetchone()[0] == 1
 
 
 def test_save_gates_and_duplicates(client):
@@ -39,7 +48,12 @@ def test_save_gates_and_duplicates(client):
     r = c.post(f"/buyer/saved/{lid}", headers=hb)
     assert r.status_code == 201
     assert c.post(f"/buyer/saved/{lid}", headers=hb).status_code == 200  # idempotent dup
-    assert session.execute(text("SELECT COUNT(*) FROM saved_properties")).fetchone()[0] == 1
+    # Scoped to this test's own listing (the shared dev database may hold
+    # wishlist rows created outside pytest).
+    assert session.execute(
+        text("SELECT COUNT(*) FROM saved_properties WHERE property_listing_id=:l"),
+        {"l": lid},
+    ).fetchone()[0] == 1
 
 
 def test_saved_isolation_hidden_and_bounds(client):

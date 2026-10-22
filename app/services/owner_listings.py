@@ -10,20 +10,27 @@ Location strategy:
      never fails for a valid but unseen locality — the admin can clean/merge
      location data independently.
 
-New listings land in PENDING/AVAILABLE state; verification is done by admin.
+New listings land in PENDING/AVAILABLE state (submitted, not yet visible).
+Buyer visibility requires VERIFIED + AVAILABLE; the explicit lifecycle is:
 
-Automatic verification (backend-driven, no scheduler):
-  A newly owner-created listing (one with a recorded submitted_at) that is
-  still PENDING/AVAILABLE once AUTO_VERIFY_AFTER has elapsed since submission
-  is flipped to VERIFIED the next time the owner's listings are fetched
-  (list or detail read). The flip is committed to MySQL, so it survives app
-  restarts, and it is idempotent: a VERIFIED row never matches again.
-  Rows without submitted_at (seed data and listings created before the
-  submitted_at column existed) are never auto-verified.
+  verification: PENDING -> VERIFIED (verify) | PENDING -> REJECTED (reject)
+                REJECTED -> PENDING (resubmit for re-review)
+  listing:      AVAILABLE -> CLOSED (archive) | CLOSED -> AVAILABLE (publish,
+                VERIFIED only) | AVAILABLE -> SOLD/RENTED/LEASED (deal close,
+                VERIFIED only, terminal)
+
+Reads never write: GET endpoints perform no verification flips and no
+commits. All transitions are explicit POST operations with ownership checks
+and validation; same-state repeats are idempotent no-ops.
+
+Ownership authority: a listing belongs to an owner only when BOTH
+property_listings.user_id AND its physical_properties.user_id equal the
+caller (creation sets both; all reads/transitions require both via join).
+A diverged row matches neither party (fail-closed 404, never a leak).
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import re
 
 from sqlalchemy import func
@@ -41,10 +48,6 @@ from ..models.properties import (
 )
 from ..schemas import CHENNAI_PINCODE_ERROR, normalize_chennai_pincode
 from ..services.listings import format_price
-
-# Time a newly submitted owner listing spends in PENDING before the backend
-# marks it VERIFIED on the next owner-listings fetch.
-AUTO_VERIFY_AFTER = timedelta(minutes=2)
 
 
 def _utcnow_naive() -> datetime:
@@ -464,11 +467,7 @@ def add_listing_photo(
     order_index continues after existing media (0 when first → cover); an
     existing cover is never reset. Flushes; the caller commits.
     """
-    listing = (
-        db.query(PropertyListing)
-        .filter(PropertyListing.id == listing_id, PropertyListing.user_id == owner_id)
-        .first()
-    )
+    listing = _get_owned_listing_for_update(db, owner_id, listing_id)
     if listing is None:
         return None
     max_order = (
@@ -592,11 +591,7 @@ def delete_listing_photo(
     (cover = order_index 0) holds. Flushes; the caller commits, then destroys
     the Cloudinary asset best-effort (see router).
     """
-    listing = (
-        db.query(PropertyListing)
-        .filter(PropertyListing.id == listing_id, PropertyListing.user_id == owner_id)
-        .first()
-    )
+    listing = _get_owned_listing_for_update(db, owner_id, listing_id)
     if listing is None:
         return False, None
     media = (
@@ -643,14 +638,11 @@ def update_owner_listing(
     relationships are preserved: no new property_listings/physical_properties
     rows, amenity links are diffed (no duplicates, retry-idempotent), media
     is reconciled to the end-state when ``photos``/``images`` is supplied,
-    and verification/listing status plus submitted_at are never modified.
+    and verification/listing status plus submitted_at are never modified
+    here (use the explicit transition operations instead).
     Flushes; the caller commits (rolling back on ValueError first).
     """
-    listing = (
-        db.query(PropertyListing)
-        .filter(PropertyListing.id == listing_id, PropertyListing.user_id == owner_id)
-        .first()
-    )
+    listing = _get_owned_listing_for_update(db, owner_id, listing_id)
     if listing is None:
         return None, []
     phys = (
@@ -829,45 +821,262 @@ def _location_of(db: Session, listing_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Automatic verification (fetch-time, persisted, idempotent)
+# Ownership + explicit lifecycle transitions (no automatic verification)
 # ---------------------------------------------------------------------------
 
+# Owner-driven verification transitions. VERIFIED is terminal here (a
+# verified listing is unpublished/archived via listing_status, never by
+# flipping verification back). Same-state repeats are idempotent no-ops.
+_VERIFICATION_TRANSITIONS = {
+    "PENDING": {"PENDING", "VERIFIED", "REJECTED"},
+    "REJECTED": {"REJECTED", "PENDING"},
+    "VERIFIED": {"VERIFIED"},
+}
 
-def auto_verify_due_owner_listings(
+# Owner-driven listing-status transitions. Publishing (CLOSED -> AVAILABLE)
+# and deal closes (AVAILABLE -> SOLD/RENTED/LEASED) additionally require
+# verification_status == VERIFIED (enforced below, not just here).
+# Same-state repeats are idempotent no-ops.
+_LISTING_STATUS_TRANSITIONS = {
+    "AVAILABLE": {"AVAILABLE", "CLOSED", "SOLD", "RENTED", "LEASED"},
+    "CLOSED": {"CLOSED", "AVAILABLE"},
+    "SOLD": {"SOLD"},
+    "RENTED": {"RENTED"},
+    "LEASED": {"LEASED"},
+    "EXPIRED": {"EXPIRED"},
+}
+
+_VERIFICATION_RULESET = "owner-explicit-v1"
+
+# Automatic verification: after this many minutes a pending listing becomes
+# VERIFIED + AVAILABLE. The deadline is derived from submitted_at.
+_AUTO_VERIFY_MINUTES = 2
+
+
+def _owned_listing_query(db: Session, owner_id: int, listing_id: int):
+    """Dual-authority ownership query (no lock); the locked variant below
+    adds FOR UPDATE so racing transitions serialize on the row in InnoDB."""
+    return (
+        db.query(PropertyListing)
+        .join(PhysicalProperty, PhysicalProperty.id == PropertyListing.physical_property_id)
+        .filter(
+            PropertyListing.id == listing_id,
+            PropertyListing.user_id == owner_id,
+            PhysicalProperty.user_id == owner_id,
+        )
+    )
+
+
+def _get_owned_listing_for_update(
+    db: Session, owner_id: int, listing_id: int
+) -> PropertyListing | None:
+    """Fetch the listing row for a mutating operation, ownership-checked.
+
+    Requires BOTH property_listings.user_id AND its physical_properties
+    user_id to equal the caller (consistent dual-authority check with row
+    lock). Returns None when missing or not owned by the caller (router
+    maps to 404 — never a cross-owner leak, never an oracle beyond 404).
+    """
+    row = (
+        _owned_listing_query(db, owner_id, listing_id)
+        .with_for_update()
+        .first()
+    )
+    return row
+
+
+def owner_owns_listing(db: Session, owner_id: int, listing_id: int) -> bool:
+    """Read-only dual-authority ownership check (no lock, no write).
+
+    Used to authorize before external side effects (e.g. Cloudinary upload)
+    so foreign IDs fail with 404 before anything is spent or stored.
+    """
+    return (
+        db.query(PropertyListing.id)
+        .join(PhysicalProperty, PhysicalProperty.id == PropertyListing.physical_property_id)
+        .filter(
+            PropertyListing.id == listing_id,
+            PropertyListing.user_id == owner_id,
+            PhysicalProperty.user_id == owner_id,
+        )
+        .first()
+        is not None
+    )
+
+
+def transition_verification(
+    db: Session, owner_id: int, listing_id: int, to_status: str, reason: str | None = None
+) -> PropertyListing | None:
+    """Apply an explicit owner-driven verification transition.
+
+    Allowed: PENDING -> VERIFIED | PENDING -> REJECTED | REJECTED -> PENDING
+    (resubmit; refreshes submitted_at). Same-state repeats are idempotent
+    no-ops returning the row. Anything else raises ValueError (-> 422).
+    Records a verifications audit row (PASS for VERIFIED/PENDING-resubmit,
+    FAIL for REJECTED) with attempt_no incrementing per listing.
+    Returns None when the listing does not belong to the caller.
+    Flushes; the caller commits.
+    """
+    from ..models.properties import Verification
+
+    if to_status not in ("PENDING", "VERIFIED", "REJECTED"):
+        raise ValueError(f"verification_status must be one of PENDING, VERIFIED, REJECTED")
+    listing = _get_owned_listing_for_update(db, owner_id, listing_id)
+    if listing is None:
+        return None
+    allowed = _VERIFICATION_TRANSITIONS.get(listing.verification_status, set())
+    if to_status not in allowed:
+        raise ValueError(
+            f"Cannot move verification from {listing.verification_status} to {to_status}"
+        )
+    if listing.verification_status == to_status:
+        return listing  # idempotent repeat
+    listing.verification_status = to_status
+    if to_status == "PENDING":
+        listing.submitted_at = _utcnow_naive()  # resubmit refreshes the audit clock
+    last_attempt = (
+        db.query(func.max(Verification.attempt_no))
+        .filter(Verification.property_listing_id == listing_id)
+        .scalar()
+    )
+    checks = {"action": to_status.lower(), "actor": "owner"}
+    if reason:
+        checks["reason"] = reason[:500]
+    db.add(Verification(
+        property_listing_id=listing_id,
+        attempt_no=int(last_attempt or 0) + 1,
+        ruleset_version=_VERIFICATION_RULESET,
+        checks_json=checks,
+        result="PASS" if to_status in ("VERIFIED", "PENDING") else "FAIL",
+        triggered_at=_utcnow_naive(),
+        triggered_by=owner_id,
+    ))
+    db.flush()
+    return listing
+
+
+def transition_verification_automatic(
+    db: Session, listing_id: int
+) -> PropertyListing | None:
+    """Apply automatic verification for a pending listing that has passed the
+    2-minute deadline. This is called by a background worker, not by an owner.
+
+    Only transitions PENDING -> VERIFIED when the listing is still eligible:
+    - verification_status == PENDING
+    - listing_status == AVAILABLE (not archived/closed/sold/etc.)
+    - submitted_at is at least _AUTO_VERIFY_MINUTES in the past
+
+    Records a verifications audit row with actor="auto" and result="PASS".
+    Idempotent: returns the listing if already VERIFIED or if transitioned now.
+    Returns None when the listing doesn't exist or isn't eligible.
+    Flushes; the caller commits.
+    """
+    from ..models.properties import Verification
+    from datetime import timedelta
+
+    listing = (
+        db.query(PropertyListing)
+        .filter(PropertyListing.id == listing_id)
+        .with_for_update()
+        .first()
+    )
+    if listing is None:
+        return None
+
+    # Only auto-verify eligible pending listings
+    if listing.verification_status != "PENDING":
+        return None  # not pending (verified/rejected/etc.) - not eligible
+    if listing.listing_status != "AVAILABLE":
+        return None  # archived, sold, etc. - not eligible
+
+    # Check if 2 minutes have passed since submission
+    if listing.submitted_at is None:
+        return None
+    deadline = listing.submitted_at + timedelta(minutes=_AUTO_VERIFY_MINUTES)
+    if _utcnow_naive() < deadline:
+        return None  # not yet due
+
+    # Transition to VERIFIED
+    listing.verification_status = "VERIFIED"
+    # listing_status stays AVAILABLE (already verified + available = visible)
+
+    # Audit the automatic transition
+    last_attempt = (
+        db.query(func.max(Verification.attempt_no))
+        .filter(Verification.property_listing_id == listing_id)
+        .scalar()
+    )
+    checks = {"action": "verified", "actor": "auto"}
+    db.add(Verification(
+        property_listing_id=listing_id,
+        attempt_no=int(last_attempt or 0) + 1,
+        ruleset_version=_VERIFICATION_RULESET,
+        checks_json=checks,
+        result="PASS",
+        triggered_at=_utcnow_naive(),
+        triggered_by=None,  # system-triggered
+    ))
+    db.flush()
+    return listing
+
+
+def transition_listing_status(
     db: Session,
     owner_id: int,
-    listing_id: int | None = None,
-    now: datetime | None = None,
-) -> int:
-    """Flip due PENDING owner listings to VERIFIED and persist the change.
+    listing_id: int,
+    to_status: str,
+    closed_reason: str | None = None,
+) -> PropertyListing | None:
+    """Apply an explicit owner-driven listing-status transition.
 
-    A listing is due when it is PENDING + AVAILABLE, has a recorded
-    submitted_at, and submitted_at + AUTO_VERIFY_AFTER has elapsed. Only the
-    verification_status column changes (PENDING -> VERIFIED); listing_status
-    is already AVAILABLE, so the row becomes VERIFIED + AVAILABLE, which the
-    frontend maps to Active. VERIFIED/SOLD/RENTED/LEASED rows and rows
-    without submitted_at (seed data, pre-existing listings) never match, and
-    once flipped a row never matches again — repeated calls are no-ops.
-
-    Returns the number of listings transitioned (0 when nothing was due).
+    Allowed: AVAILABLE -> CLOSED/SOLD/RENTED/LEASED, CLOSED -> AVAILABLE.
+    SOLD/RENTED/LEASED/EXPIRED are terminal (no exits). Publishing
+    (CLOSED -> AVAILABLE) and deal closes require VERIFIED; anything else
+    raises ValueError (-> 422). Same-state repeats are idempotent no-ops
+    (closed_reason updated when supplied). Returns None when not owned.
+    Flushes; the caller commits.
     """
-    now = now or _utcnow_naive()
-    cutoff = now - AUTO_VERIFY_AFTER
-    q = db.query(PropertyListing).filter(
-        PropertyListing.user_id == owner_id,
-        PropertyListing.verification_status == "PENDING",
-        PropertyListing.listing_status == "AVAILABLE",
-        PropertyListing.submitted_at.isnot(None),
-        PropertyListing.submitted_at <= cutoff,
-    )
-    if listing_id is not None:
-        q = q.filter(PropertyListing.id == listing_id)
-    due = q.all()
-    for listing in due:
-        listing.verification_status = "VERIFIED"
-    if due:
-        db.commit()
-    return len(due)
+    if to_status not in ("AVAILABLE", "CLOSED", "SOLD", "RENTED", "LEASED"):
+        raise ValueError(
+            "listing_status must be one of AVAILABLE, CLOSED, SOLD, RENTED, LEASED"
+        )
+    if closed_reason is not None and len(closed_reason) > 500:
+        raise ValueError("closed_reason must be at most 500 characters")
+    listing = _get_owned_listing_for_update(db, owner_id, listing_id)
+    if listing is None:
+        return None
+    allowed = _LISTING_STATUS_TRANSITIONS.get(listing.listing_status, set())
+    if to_status not in allowed:
+        raise ValueError(
+            f"Cannot move listing from {listing.listing_status} to {to_status}"
+        )
+    if listing.listing_status == to_status:
+        # Idempotent repeat. A live listing carries no close note: repeats on
+        # AVAILABLE always clear it (a supplied reason is ignored, never
+        # stored on a live row); other states update it when supplied.
+        if to_status == "AVAILABLE":
+            if listing.closed_reason is not None:
+                listing.closed_reason = None
+                db.flush()
+        elif closed_reason is not None:
+            listing.closed_reason = closed_reason or None
+            db.flush()
+        return listing  # idempotent repeat
+    if to_status in ("AVAILABLE", "SOLD", "RENTED", "LEASED"):
+        # Publishing and deal closes expose the listing (or its outcome);
+        # only verified listings may take these paths.
+        if listing.verification_status != "VERIFIED":
+            raise ValueError(
+                f"Only VERIFIED listings can move to {to_status} "
+                f"(current verification: {listing.verification_status})"
+            )
+    listing.listing_status = to_status
+    if to_status == "AVAILABLE":
+        listing.closed_reason = None  # live listings carry no close note
+    elif closed_reason is not None:
+        listing.closed_reason = closed_reason or None
+    db.flush()
+    return listing
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +1128,10 @@ def _owner_listing_query(db: Session, owner_id: int):
         .join(Taluk, Village.taluk_id == Taluk.id)
         .join(District, Taluk.district_id == District.id)
         .join(City, District.city_id == City.id)
-        .filter(PropertyListing.user_id == owner_id)
+        .filter(
+            PropertyListing.user_id == owner_id,
+            PhysicalProperty.user_id == owner_id,
+        )
     )
 
 
@@ -1059,10 +1271,7 @@ def _media_map(db: Session, listing_ids: list[int]) -> dict:
 def list_owner_listings(
     db: Session, owner_id: int, page: int = 1, page_size: int = 20
 ) -> tuple[list[dict], int]:
-    # Fetch-time auto-verification: due PENDING rows become VERIFIED here and
-    # the change is committed, so the next read (even after an app restart)
-    # sees them as Active.
-    auto_verify_due_owner_listings(db, owner_id)
+    """List the caller's own listings (all statuses). Pure read: no writes."""
     q = _owner_listing_query(db, owner_id)
     total = q.count()
     rows = q.order_by(PropertyListing.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
@@ -1089,7 +1298,7 @@ def list_owner_listings(
 
 
 def get_owner_listing(db: Session, owner_id: int, listing_id: int) -> dict | None:
-    auto_verify_due_owner_listings(db, owner_id, listing_id=listing_id)
+    """Single owned detail, or None when missing/not owned. Pure read: no writes."""
     q = _owner_listing_query(db, owner_id).filter(PropertyListing.id == listing_id)
     row = q.first()
     if row is None:
