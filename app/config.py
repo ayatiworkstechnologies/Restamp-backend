@@ -5,7 +5,10 @@ Database passwords come from RESTAMP_DATABASE_URL; the JWT secret from RESTAMP_J
 """
 from __future__ import annotations
 
+import logging
 import os
+
+from sqlalchemy.engine import make_url as _sqlalchemy_make_url
 
 
 def _get(name: str, default: str = "") -> str:
@@ -64,6 +67,13 @@ class Settings:
     OTP_MAX_VERIFY_ATTEMPTS_PER_IP: int = _get_int(
         "RESTAMP_OTP_MAX_VERIFY_ATTEMPTS_PER_IP", 30
     )
+    # When "1", the OTP per-IP throttling in app/routers/auth.py derives the
+    # client IP from the rightmost X-Forwarded-For entry added by the platform
+    # proxy (e.g. Render), instead of treating every client as the proxy IP.
+    # Default "0" keeps today's socket-peer behavior (recommended wherever
+    # requests do NOT arrive through a trusted reverse proxy; clients could
+    # otherwise fake the header and evade per-IP caps).
+    TRUST_PROXY: bool = _get("RESTAMP_TRUST_PROXY", "0") == "1"
     # When "1", OTP responses include the code (LOCAL DEV + TESTS ONLY).
     OTP_DEBUG: bool = _get("RESTAMP_OTP_DEBUG", "0") == "1"
     OTP_DEMO_MODE: bool = _get("RESTAMP_OTP_DEMO_MODE", "0") == "1"
@@ -105,6 +115,8 @@ settings = Settings()
 
 
 # --- Phase 1: production hardening helpers (no secrets in messages/logs) ----
+_log = logging.getLogger("restamp.config")
+
 _PROD_ENVS = {"production", "prod", "staging"}
 _JWT_KNOWN_WEAK = {
     "",
@@ -121,14 +133,23 @@ _JWT_MIN_LENGTH = 32
 
 
 def _is_local_database_url(url: str) -> bool:
-    """True for local dev/test URLs (unix socket or loopback host)."""
-    low = (url or "").lower()
-    if "unix_socket" in low:
+    """True for local dev/test URLs (unix socket or loopback host).
+
+    The host is extracted with a real URL parser (SQLAlchemy make_url), so a
+    name that merely CONTAINS a loopback substring (e.g. `@localhost.attacker.tld`)
+    can never masquerade as local and skip production hardening. Fail-closed:
+    empty or unparseable URLs are reported NOT local, which is_production()
+    treats as production.
+    """
+    if not (url or "").strip():
+        return False
+    if "unix_socket" in (url or "").lower():
         return True
-    for host in ("localhost", "127.0.0.1", "::1"):
-        if f"@{host}" in low or f"://{host}" in low:
-            return True
-    return False
+    try:
+        host = (_sqlalchemy_make_url(str(url)).host or "").strip().lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
 
 
 def is_production() -> bool:
@@ -203,6 +224,19 @@ def validate_security_config() -> None:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_CORS_ORIGINS must not "
             "contain '*' when credentials are enabled."
+        )
+    # Photo-upload storage: NOT a hard failure (that would be a behavior
+    # change requiring an explicit product decision). When production has no
+    # Cloudinary cloud configured, uploads fall back to the local disk, which
+    # is ephemeral on Render and bakes request-base-URLs into property_media.
+    # Warn loudly at startup so the trade-off is visible, naming settings
+    # only (never values).
+    if not settings.CLOUDINARY_CLOUD_NAME:
+        _log.warning(
+            "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
+            "is empty; listing photo uploads will fall back to local-disk storage "
+            "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
+            "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
         )
     # Lazy imports: services import this module at load time.
     from .services import otp as otp_module

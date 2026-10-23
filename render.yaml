@@ -9,6 +9,24 @@ services:
     healthCheckPath: /health
 
     envVars:
+      # ── Runtime environment ────────────────────────────────────────────────
+      # Explicit production posture: enables the startup security gate (JWT
+      # secret strength, OTP debug/demo flags off, Google dev off, CORS
+      # without '*'). Behavior matches the automatic production detection;
+      # this only makes the intent explicit in the blueprint.
+      - key: RESTAMP_ENV
+        value: "production"
+
+      # ── Trusted reverse proxy ──────────────────────────────────────────────
+      # Render terminates HTTPS behind its proxy: the socket peer is always
+      # the proxy, so per-IP OTP throttling would see one shared IP.
+      # RESTAMP_TRUST_PROXY=1 makes the app derive the client IP from the
+      # rightmost X-Forwarded-For entry added by the trusted platform proxy.
+      # Only enable this where requests REALLY arrive via a trusted proxy;
+      # unset it when the service is directly exposed to the internet.
+      - key: RESTAMP_TRUST_PROXY
+        value: "1"
+
       # ── Database ────────────────────────────────────────────────────────────
       # Paste your Render PostgreSQL (or external MySQL) internal URL here.
       # Format (PostgreSQL): postgresql+psycopg2://USER:PASSWORD@HOST:PORT/DBNAME
@@ -17,6 +35,11 @@ services:
         sync: false           # Set this manually in the Render dashboard
 
       # ── JWT ─────────────────────────────────────────────────────────────────
+      # RESTAMP_JWT_SECRET
+      # generateValue allows Render to auto-generate a secure random string.
+      # VERIFY ONCE IN THE DASHBOARD: the startup security gate requires the
+      # generated secret to be at least 32 characters long — regenerate or
+      # replace it if Render's generated value turns out to be shorter.
       - key: RESTAMP_JWT_SECRET
         generateValue: true   # Render auto-generates a secure random string
 

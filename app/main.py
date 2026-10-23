@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import settings
+from .config import is_production, settings
 from .db import check_db
 from .routers import auth as auth_router
 from .routers import buyer as buyer_router
@@ -89,7 +89,20 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title=settings.APP_NAME, version="4.0.0", lifespan=lifespan)
+    # Phase 1 hardening: interactive API docs/openapi are never exposed in
+    # production (they enumerate the whole route surface publicly; audited
+    # live as HTTP 200 there). Local dev keeps the default doc URLs.
+    _doc_kwargs: dict = (
+        {"docs_url": None, "redoc_url": None, "openapi_url": None}
+        if is_production()
+        else {}
+    )
+    app = FastAPI(
+        title=settings.APP_NAME,
+        version="4.0.0",
+        lifespan=lifespan,
+        **_doc_kwargs,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins(),
@@ -112,6 +125,22 @@ def create_app() -> FastAPI:
     async def unhandled(_: Request, exc: Exception):  # noqa: BLE001
         log.exception("Unhandled error")
         return JSONResponse(status_code=500, content={"detail": "Internal error"})
+
+    # Uploaded images are served as-is (client-declared MIME): the nosniff
+    # header stops browsers from re-sniffing content types on the /media
+    # static mount (downloaded, JSON error, or otherwise).
+    @app.middleware("http")
+    async def _media_nosniff(request: Request, call_next):
+        response = await call_next(request)
+        try:
+            path = request.url.path
+            if path == settings.MEDIA_URL_PREFIX or path.startswith(
+                settings.MEDIA_URL_PREFIX + "/"
+            ):
+                response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        except Exception:
+            log.exception("media nosniff middleware error")
+        return response
 
     app.include_router(health_router.router)
     app.include_router(auth_router.router)

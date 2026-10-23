@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
+from ..config import settings
 from ..db import get_db
 from ..models import AuthIdentity
 from ..security import create_access_token, get_current_user
@@ -20,14 +21,40 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _client_ip(request: Request | None) -> str | None:
-    """Best-effort client IP for per-IP OTP throttling (never logged)."""
+    """Best-effort client IP for per-IP OTP throttling (never logged).
+
+    Default (RESTAMP_TRUST_PROXY unset or "0"): the socket peer host — the
+    same value this helper always returned. When RESTAMP_TRUST_PROXY=1
+    (deployed behind the platform's own reverse proxy, e.g. Render) and the
+    peer is NOT loopback, the peer is treated as a trusted proxy and the
+    RIGHTMOST X-Forwarded-For entry becomes the client IP: it is the only
+    value the trusted hop appended, while earlier entries are
+    client-controlled and deliberately ignored. A missing, empty, or
+    malformed header falls back to the peer, and the header is ignored
+    entirely for loopback peers so local dev behavior is unchanged. The
+    derived value is used only as an in-memory rate-limit comparison key;
+    it is never logged.
+    """
     try:
-        if request is not None and request.client is not None:
-            host = (request.client.host or "").strip()
-            return host or None
+        if request is None:
+            return None
+        peer = None
+        if request.client is not None:
+            peer = (request.client.host or "").strip() or None
+        if peer is None:
+            return None
+        if (
+            not settings.TRUST_PROXY
+            or peer in ("127.0.0.1", "::1", "localhost")
+        ):
+            return peer
+        forwarded = (request.headers.get("x-forwarded-for") or "").strip()
+        if not forwarded:
+            return peer
+        candidate = forwarded.split(",")[-1].strip()
+        return candidate or peer
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _token_for(db: Session, user_id: int) -> schemas.TokenOut:

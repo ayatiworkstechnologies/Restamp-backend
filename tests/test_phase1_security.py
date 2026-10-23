@@ -4,15 +4,17 @@ Unit tests (no DB) run first and never touch shared data. Client tests use
 the rollback-isolated `client` fixture on local restamp_dev only.
 """
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from sqlalchemy import text
 
 from app import config as config_module
 from app.config import (
+    _is_local_database_url,
     is_jwt_secret_strong,
     is_production,
     validate_security_config,
 )
+from app.routers.auth import _client_ip
 from app.services.otp import OTPService
 from tests.conftest import auth_header, register_phone
 
@@ -232,3 +234,152 @@ def test_lifespan_fails_when_db_unreachable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Database unreachable"):
         asyncio.run(_drain())
+
+
+# --- Phase 1 hardening batch: proxy client IP, env detection, docs, media ----
+
+def _client_ip_request(peer: str | None, xff: bytes | None = None) -> Request:
+    """Build a Request from a raw ASGI scope (no server, no DB)."""
+    headers = [(b"host", b"restamp-backend.onrender.com")]
+    if xff is not None:
+        headers.append((b"x-forwarded-for", xff))
+    scope: dict = {"type": "http", "headers": headers}
+    if peer is not None:
+        scope["client"] = (peer, 51234)
+    return Request(scope)
+
+
+# Unchanged default semantics: the socket peer is the per-IP key; the
+# header is ignored unless RESTAMP_TRUST_PROXY=1.
+def test_client_ip_default_mode_ignores_forwarded(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", False)
+    r = _client_ip_request("203.0.113.7", b"198.51.100.9, 10.0.0.5")
+    assert _client_ip(r) == "203.0.113.7"
+
+
+def test_client_ip_trusted_proxy_uses_rightmost_hop(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
+    r = _client_ip_request("203.0.113.1", b"198.51.100.9, 10.0.0.5")
+    # Rightmost = appended by the trusted platform proxy (unspoofable by
+    # the client itself); earlier entries are attacker-visible and ignored.
+    assert _client_ip(r) == "10.0.0.5"
+
+
+def test_client_ip_trusted_proxy_single_hop(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
+    r = _client_ip_request("203.0.113.1", b"198.51.100.9")
+    assert _client_ip(r) == "198.51.100.9"
+
+
+def test_client_ip_trusted_proxy_without_header_falls_back(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
+    assert _client_ip(_client_ip_request("203.0.113.1")) == "203.0.113.1"
+
+
+def test_client_ip_trusted_proxy_loopback_peer_ignores_header(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
+    r = _client_ip_request("127.0.0.1", b"8.8.8.8")
+    assert _client_ip(r) == "127.0.0.1"
+
+
+def test_client_ip_trusted_proxy_blank_forwarded_entries(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
+    assert _client_ip(_client_ip_request("203.0.113.1", b"   ")) == "203.0.113.1"
+    assert _client_ip(_client_ip_request("203.0.113.1", b"  , ")) == "203.0.113.1"
+
+
+def test_client_ip_missing_client_is_none(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", False)
+    assert _client_ip(_client_ip_request(None)) is None
+    assert _client_ip(None) is None
+
+
+# Strict URL parsing: a loopback SUBSTRING can no longer make a remote host
+# classify as local (which would skip production hardening entirely).
+def test_local_db_url_detection():
+    assert _is_local_database_url(
+        "mysql+pymysql://u:p@localhost/restamp_dev?unix_socket=/tmp/mysql.sock"
+    )
+    assert _is_local_database_url("mysql+pymysql://u:p@localhost/restamp")
+    assert _is_local_database_url("mysql+pymysql://u:p@127.0.0.1:3306/restamp")
+    assert _is_local_database_url("postgresql://u:p@[::1]:5432/db")
+    assert not _is_local_database_url(
+        "mysql+pymysql://u:p@localhost.attacker.tld/restamp_dev"
+    )
+    assert not _is_local_database_url("mysql+pymysql://u:p@db.example.com/restamp")
+    assert not _is_local_database_url("")
+    assert not _is_local_database_url("this is not a url")
+
+
+def test_is_production_not_fooled_by_substring_host(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ENV", "local")
+    monkeypatch.setattr(
+        config_module.settings,
+        "DATABASE_URL",
+        "mysql+pymysql://u:p@localhost.attacker.tld/restamp_dev",
+    )
+    assert is_production() is True
+
+
+# Interactive API docs enumerate the full public route surface: they must
+# not exist in production (locally unchanged).
+def test_prod_docs_disabled(monkeypatch):
+    import app.main as main_module
+    monkeypatch.setattr(config_module.settings, "ENV", "production")
+    ap = main_module.create_app()
+    assert ap.docs_url is None
+    assert ap.redoc_url is None
+    assert ap.openapi_url is None
+
+
+def test_local_docs_available():
+    import app.main as main_module
+    assert main_module.app.docs_url == "/docs"
+    assert main_module.app.openapi_url == "/openapi.json"
+
+
+# Missing Cloudinary in production warns loudly at startup but stays a
+# non-fatal decision (fail-fast would be a behavior change needing approval).
+def _prod_static_media_settings(monkeypatch, cloud_name: str) -> None:
+    from app.services import otp as otp_module
+    monkeypatch.setattr(config_module.settings, "ENV", "production")
+    monkeypatch.setattr(config_module.settings, "JWT_SECRET", "z" * 40)
+    monkeypatch.setattr(config_module.settings, "OTP_DEBUG", False)
+    monkeypatch.setattr(config_module.settings, "OTP_DEMO_MODE", False)
+    monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
+    monkeypatch.setattr(config_module.settings, "GOOGLE_ENABLED", False)
+    monkeypatch.setattr(config_module.settings, "SMS_PROVIDER", "fake-vendor")
+    monkeypatch.setitem(otp_module.PRODUCTION_SMS_PROVIDERS,
+                        "fake-vendor", otp_module.DevOTPProvider)
+    monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "https://app.example.com")
+    monkeypatch.setattr(config_module.settings, "CLOUDINARY_CLOUD_NAME", cloud_name)
+
+
+def test_prod_cloudinary_absence_warns_not_raises(monkeypatch, caplog):
+    _prod_static_media_settings(monkeypatch, "")
+    with caplog.at_level("WARNING", logger="restamp.config"):
+        validate_security_config()  # warning, never an exception
+    assert "CLOUDINARY_CLOUD_NAME" in caplog.text
+
+
+def test_prod_cloudinary_configured_silent(monkeypatch, caplog):
+    _prod_static_media_settings(monkeypatch, "restamp-cloud")
+    with caplog.at_level("WARNING", logger="restamp.config"):
+        validate_security_config()
+    assert "CLOUDINARY_CLOUD_NAME" not in caplog.text
+
+
+# /media serves client-declared content types: nosniff must ride on every
+# response from that prefix (including errors), and only on that prefix.
+def test_media_responses_carry_nosniff(client):
+    c, _ = client
+    r = c.get("/media/no-such-file.jpg")
+    assert r.status_code == 404
+    assert r.headers.get("x-content-type-options") == "nosniff"
+
+
+def test_non_media_responses_lack_nosniff(client):
+    c, _ = client
+    r = c.get("/health")
+    assert r.status_code == 200
+    assert "x-content-type-options" not in r.headers
