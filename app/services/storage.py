@@ -60,10 +60,18 @@ def validate_image_upload(content_type: str | None, client_filename: str | None)
     """
     mime = (content_type or "").split(";")[0].strip().lower()
     if mime not in ALLOWED_IMAGE_TYPES:
-        raise ValueError(f"Unsupported image type: {content_type or 'unknown'}")
+        # Static detail only: never echo the client-supplied type header
+        # back into the 422 body.
+        raise ValueError(
+            "Unsupported image type; allowed: " + ", ".join(sorted(ALLOWED_IMAGE_TYPES))
+        )
     client_ext = Path(client_filename or "").suffix.lower()
     if client_ext and client_ext not in _CLIENT_EXT_TO_MIME:
-        raise ValueError(f"Unsupported file extension: {client_ext}")
+        # Static detail only: never echo the client-supplied file name
+        # back into the 422 body.
+        raise ValueError(
+            "Unsupported file extension; allowed: " + ", ".join(sorted(_CLIENT_EXT_TO_MIME))
+        )
     if client_ext and _CLIENT_EXT_TO_MIME[client_ext] != mime:
         raise ValueError("File extension does not match image type")
     return ALLOWED_IMAGE_TYPES[mime]

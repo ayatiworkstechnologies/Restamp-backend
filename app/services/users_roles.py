@@ -90,15 +90,29 @@ def is_admin(db: Session, user_id: int) -> bool:
 
 
 def grant_admin(db: Session, user_id: int) -> None:
-    """Create the admin link. No public flow calls this — only the admin-only endpoint."""
+    """Create the admin link. No public flow calls this — only the admin-only endpoint.
+
+    A concurrent duplicate grant fails the flush with a duplicate-key
+    IntegrityError. Handle it with a savepoint, never a whole-transaction
+    ``db.rollback()``: only the one conflicting insert is reverted, so the
+    caller's transaction — and any earlier uncommitted work in it — survives.
+    """
     get_user(db, user_id)
     if db.get(AdminAccount, user_id) is None:
-        db.add(AdminAccount(user_id=user_id, admin_role="ADMIN"))
+        # Materialize caller work first: Session.begin_nested() itself
+        # performs an autoflush, and pending state must be flushed before
+        # savepoint entry so that the savepoint's rollback scope is exactly
+        # the one insert below.
+        db.flush()
+        link = AdminAccount(user_id=user_id, admin_role="ADMIN")
+        sp = db.begin_nested()
+        db.add(link)
         try:
             db.flush()
         except IntegrityError:
-            db.rollback()
+            sp.rollback()
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already admin")
+        sp.commit()
 
 
 def find_user_by_identity(db: Session, provider: str, identifier: str) -> User | None:
@@ -130,6 +144,11 @@ def link_identity(
                 status_code=status.HTTP_409_CONFLICT, detail="Identity belongs to another user"
             )
         return existing
+    # Savepoint BEFORE adding the row: Session.begin_nested() autoflushes
+    # whatever is pending, so it must open on a clean pending-set (the
+    # queries above already materialized the caller's work); the new row is
+    # then added and flushed strictly inside the savepoint.
+    sp = db.begin_nested()
     row = AuthIdentity(
         user_id=user_id,
         provider=provider,
@@ -140,8 +159,14 @@ def link_identity(
     try:
         db.flush()
     except IntegrityError:
-        db.rollback()
+        # Savepoint rollback only (never db.rollback()): the conflicting
+        # identity insert is reverted while the caller's transaction — and
+        # any earlier uncommitted work in it — is preserved. SQLAlchemy
+        # removes the row (added within the savepoint) from the session as
+        # part of the rollback, so later autoflushes never retry it.
+        sp.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Identity already linked"
         )
+    sp.commit()
     return row

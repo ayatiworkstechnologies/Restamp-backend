@@ -628,7 +628,9 @@ def test_amenity_unknown_rejected_and_duplicates_idempotent(client):
     token = _setup_owner_with_phone(c, "+919876543274")
     r = _post_listing(c, token, "Bad Amenity Flat", amenities=["Gym", "No Such Place"])
     assert r.status_code == 422, r.text
-    assert "No Such Place" in r.json()["detail"]
+    # 422 detail is static (422-hygiene batch): the client amenity name is
+    # never echoed back.
+    assert r.json()["detail"] == "Unknown amenity: name not in the master list"
     r = _post_listing(c, token, "Dup Amenity Flat",
                       amenities=["Gym", " gym ", "GYM", "Lift"])
     assert r.status_code == 201, r.text

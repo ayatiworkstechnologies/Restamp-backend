@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 import re
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models.locations import City, District, Locality, Postcode, Taluk, Village
@@ -49,6 +50,12 @@ from ..models.properties import (
 from ..schemas import CHENNAI_PINCODE_ERROR, normalize_chennai_pincode
 from ..services.listings import format_price
 
+# MySQL duplicate-key error code (ER_DUP_ENTRY), surfaced by the pymysql
+# driver as ``IntegrityError.orig.args[0]``. It is the only integrity error
+# the location-chain helper can recover from (via a re-lookup); every other
+# integrity error re-raises — see _get_or_create_chain_row.
+MYSQL_ERR_DUP_ENTRY = 1062
+
 
 def _utcnow_naive() -> datetime:
     """Current UTC as a naive datetime, matching MySQL DATETIME storage.
@@ -62,6 +69,74 @@ def _utcnow_naive() -> datetime:
 # ---------------------------------------------------------------------------
 # Location helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_or_create_chain_row(db: Session, lookup, build):
+    """Get-or-create one location-chain row, tolerant of a concurrent commit.
+
+    The unlocked check-then-flush pattern can race exactly with another
+    request's COMMIT: under REPEATABLE READ this transaction's snapshot
+    hides the winner's row, yet the INSERT itself still fails with a
+    duplicate-key IntegrityError (unique indexes are checked against the
+    live index, not the snapshot).
+
+    Recovery is savepoint-based and duplicate-key-specific: rollback to the
+    savepoint (only the one insert is reverted; the surrounding listing
+    transaction is untouched) and re-run the lookup as
+    ``SELECT ... FOR UPDATE`` — a locking read reads the newest committed
+    data, not the snapshot. Only a duplicate-key error (MySQL 1062) is
+    recoverable that way: any other IntegrityError (e.g. a foreign-key
+    violation) cannot succeed on any retry, so it re-raises the original
+    error immediately — no retry, no refetch (the same failure surface that
+    existed before this helper). If the winner rolled back instead, the
+    insert is retried, bounded at three attempts; exhausted attempts
+    re-raise the duplicate-key error. Postcode conflicts are
+    only adopted for the same (locality, pincode) pair, because the lookup
+    is keyed on exactly that pair; a pincode claimed by a *different*
+    locality re-raises — deliberate, per the reviewed plan.
+
+    Locality has no unique key, so an exact race can still leave a
+    duplicate locality row (documented residual; adding a unique index
+    would be a separately-reviewed migration).
+    """
+    last_error: IntegrityError | None = None
+    for _ in range(3):
+        row = lookup().first()
+        if row is not None:
+            return row
+        # Savepoint BEFORE adding: Session.begin_nested() autoflushes, so it
+        # must open on a clean pending-set; the one candidate it scopes is
+        # added afterward and flushed strictly inside the savepoint.
+        sp = db.begin_nested()
+        candidate = build()
+        db.add(candidate)
+        try:
+            db.flush()
+        except IntegrityError as e:
+            sp.rollback()
+            # Rollback-to-savepoint removes the candidate (added within the
+            # savepoint) from the session, so a later autoflush never
+            # retries the failed insert — even when re-raising below, this
+            # keeps the surrounding listing transaction consistent.
+            # Only a duplicate-key error can be recovered by the refetch
+            # below: pymysql exposes the MySQL code at e.orig.args[0]. An
+            # uninspectable driver error counts as non-duplicate (fail
+            # closed): re-raise the original error immediately — no retry,
+            # no refetch.
+            orig = getattr(e, "orig", None)
+            args = getattr(orig, "args", ()) or ()
+            orig_code = args[0] if args else None
+            if orig_code != MYSQL_ERR_DUP_ENTRY:
+                raise
+            last_error = e
+            # Locking read: sees rows committed after our snapshot was taken.
+            row = lookup().with_for_update().first()
+            if row is not None:
+                return row
+            continue  # the winner rolled back (or nothing was committed); retry
+        sp.commit()
+        return candidate
+    raise last_error
 
 
 def _find_or_create_postcode(
@@ -99,61 +174,51 @@ def _find_or_create_postcode(
     else:
         district_name = district.strip()
 
-    city_row = db.query(City).filter(func.lower(City.name) == city_name.lower()).first()
-    if not city_row:
-        city_row = City(name=city_name)
-        db.add(city_row)
-        db.flush()
-
-    dist_row = (
-        db.query(District)
-        .filter(District.city_id == city_row.id, func.lower(District.name) == district_name.lower())
-        .first()
+    city_row = _get_or_create_chain_row(
+        db,
+        lookup=lambda: db.query(City).filter(func.lower(City.name) == city_name.lower()),
+        build=lambda: City(name=city_name),
     )
-    if not dist_row:
-        dist_row = District(city_id=city_row.id, name=district_name)
-        db.add(dist_row)
-        db.flush()
 
-    taluk_row = (
-        db.query(Taluk)
-        .filter(Taluk.district_id == dist_row.id, func.lower(Taluk.name) == locality_name.lower())
-        .first()
+    dist_row = _get_or_create_chain_row(
+        db,
+        lookup=lambda: db.query(District).filter(
+            District.city_id == city_row.id, func.lower(District.name) == district_name.lower()
+        ),
+        build=lambda: District(city_id=city_row.id, name=district_name),
     )
-    if not taluk_row:
-        taluk_row = Taluk(district_id=dist_row.id, name=locality_name)
-        db.add(taluk_row)
-        db.flush()
 
-    village_row = (
-        db.query(Village)
-        .filter(Village.taluk_id == taluk_row.id, func.lower(Village.name) == locality_name.lower())
-        .first()
+    taluk_row = _get_or_create_chain_row(
+        db,
+        lookup=lambda: db.query(Taluk).filter(
+            Taluk.district_id == dist_row.id, func.lower(Taluk.name) == locality_name.lower()
+        ),
+        build=lambda: Taluk(district_id=dist_row.id, name=locality_name),
     )
-    if not village_row:
-        village_row = Village(taluk_id=taluk_row.id, name=locality_name)
-        db.add(village_row)
-        db.flush()
 
-    loc_row = (
-        db.query(Locality)
-        .filter(Locality.village_id == village_row.id, func.lower(Locality.name) == locality_name.lower())
-        .first()
+    village_row = _get_or_create_chain_row(
+        db,
+        lookup=lambda: db.query(Village).filter(
+            Village.taluk_id == taluk_row.id, func.lower(Village.name) == locality_name.lower()
+        ),
+        build=lambda: Village(taluk_id=taluk_row.id, name=locality_name),
     )
-    if not loc_row:
-        loc_row = Locality(village_id=village_row.id, name=locality_name)
-        db.add(loc_row)
-        db.flush()
 
-    pc_row = (
-        db.query(Postcode)
-        .filter(Postcode.locality_id == loc_row.id, Postcode.pincode == pincode_val)
-        .first()
+    loc_row = _get_or_create_chain_row(
+        db,
+        lookup=lambda: db.query(Locality).filter(
+            Locality.village_id == village_row.id, func.lower(Locality.name) == locality_name.lower()
+        ),
+        build=lambda: Locality(village_id=village_row.id, name=locality_name),
     )
-    if not pc_row:
-        pc_row = Postcode(locality_id=loc_row.id, pincode=pincode_val)
-        db.add(pc_row)
-        db.flush()
+
+    pc_row = _get_or_create_chain_row(
+        db,
+        lookup=lambda: db.query(Postcode).filter(
+            Postcode.locality_id == loc_row.id, Postcode.pincode == pincode_val
+        ),
+        build=lambda: Postcode(locality_id=loc_row.id, pincode=pincode_val),
+    )
 
     return pc_row.id
 
@@ -189,7 +254,9 @@ def _resolve_amenity_ids(db: Session, names: list[str] | None, kind: str) -> lis
     ids = []
     for name in cleaned:
         if name.lower() not in found:
-            raise ValueError(f"Unknown {kind.lower()}: {name!r}")
+            # Static detail only (422 hygiene): never echo the client-supplied
+            # name back into the response body.
+            raise ValueError(f"Unknown {kind.lower()}: name not in the master list")
         ids.append(found[name.lower()])
     return ids
 
