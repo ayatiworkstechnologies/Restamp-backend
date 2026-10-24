@@ -52,10 +52,20 @@ class Settings:
     OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 900)
     # Production SMS delivery selection. Names a key in the provider registry
     # (see app/services/otp.py PRODUCTION_SMS_PROVIDERS). Empty = unconfigured.
-    # No vendor is implemented yet; production requires a real registered
-    # provider (enforced at startup). Local dev/tests always use the dev
-    # provider regardless of this value.
+    # Registered production vendors: "msg91". Production requires a real
+    # registered provider (enforced at startup). Local dev/tests always use
+    # the dev provider regardless of this value.
     SMS_PROVIDER: str = _get("RESTAMP_SMS_PROVIDER", "")
+    # MSG91 credentials (used only when RESTAMP_SMS_PROVIDER=msg91). Secrets:
+    # set them in the host dashboard, never in the repo. Startup fails fast,
+    # naming only the missing setting names, when either one is empty.
+    #   AUTH_KEY    - MSG91 account auth key (sent as a request header).
+    #   TEMPLATE_ID - DLT-approved OTP template id from the MSG91 OTP section.
+    SMS_MSG91_AUTH_KEY: str = _get("RESTAMP_SMS_MSG91_AUTH_KEY", "")
+    SMS_MSG91_TEMPLATE_ID: str = _get("RESTAMP_SMS_MSG91_TEMPLATE_ID", "")
+    # Whole-request timeout (seconds) for one SMS vendor call. Kept short:
+    # OTPService holds its lock while sending.
+    SMS_TIMEOUT_SECONDS: int = _get_int("RESTAMP_SMS_TIMEOUT_SECONDS", 8)
     # Per-IP abuse protection (in-memory, per process — see otp.py).
     # These bound total OTP request/verify-failure volume from a single
     # client IP across all phones, so rotating phones does not bypass

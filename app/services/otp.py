@@ -20,11 +20,18 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+import httpx
 from fastapi import HTTPException, status
 
 from ..config import settings
 
 log = logging.getLogger("restamp.otp")
+
+# httpx logs every request URL at INFO. The MSG91 request carries the phone
+# number and the OTP in its query string, so keep the HTTP client loggers at
+# WARNING or above no matter how the host configures logging.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # LOCAL DEMO ONLY: fixed six-digit codes accepted by verify_code when
 # RESTAMP_OTP_DEMO_MODE=1 (and only then). Never returned, displayed, or
@@ -53,12 +60,88 @@ class DevOTPProvider(OTPProvider):
 
 
 # Production SMS provider registry: vendor name -> OTPProvider subclass.
-# EMPTY until a real vendor account + SDK is selected. Register a vendor by
-# implementing OTPProvider (raise only on transport failure; never log or
-# return the code) and adding {"vendor-name": VendorOTPProvider} here with
-# its RESTAMP_SMS_* credential settings in app/config.py. No vendor, sender
-# ID, or credential is invented here.
+# Register a vendor by implementing OTPProvider (raise only on transport or
+# vendor failure; never log or return the code) and calling
+# register_sms_provider() below. Selected via RESTAMP_SMS_PROVIDER.
 PRODUCTION_SMS_PROVIDERS: dict[str, type[OTPProvider]] = {}
+
+
+class Msg91OTPProvider(OTPProvider):
+    """MSG91 OTP API (v5) delivery for India (DLT-approved OTP template).
+
+    Our own code is generated and verified by OTPService; MSG91 is used only
+    to deliver it (the `otp` parameter), so verification never depends on the
+    vendor. Credentials come from settings (RESTAMP_SMS_MSG91_*): the auth key
+    travels in a header, never in the URL. Failures raise a generic
+    RuntimeError (OTPService turns it into a safe 503 and rolls the code
+    back); the phone, code, credentials and vendor response body are never
+    logged.
+    """
+
+    API_URL = "https://control.msg91.com/api/v5/otp"
+
+    def __init__(self) -> None:
+        required = (
+            ("RESTAMP_SMS_MSG91_AUTH_KEY", settings.SMS_MSG91_AUTH_KEY),
+            ("RESTAMP_SMS_MSG91_TEMPLATE_ID", settings.SMS_MSG91_TEMPLATE_ID),
+        )
+        missing = [name for name, value in required if not (value or "").strip()]
+        if missing:
+            # Names only, never values.
+            raise RuntimeError(
+                "Insecure production configuration: RESTAMP_SMS_PROVIDER=msg91 "
+                "requires " + ", ".join(missing) + " to be set."
+            )
+        self._auth_key = settings.SMS_MSG91_AUTH_KEY.strip()
+        self._template_id = settings.SMS_MSG91_TEMPLATE_ID.strip()
+        self._timeout = float(max(1, settings.SMS_TIMEOUT_SECONDS))
+
+    def send(self, phone: str, code: str) -> None:
+        # MSG91 wants the international number without the leading "+".
+        mobile = phone.lstrip("+")
+        if not mobile.isdigit():
+            raise RuntimeError("invalid phone for SMS delivery")
+        try:
+            response = httpx.post(
+                self.API_URL,
+                params={
+                    "template_id": self._template_id,
+                    "mobile": mobile,
+                    "otp": code,
+                },
+                headers={
+                    "authkey": self._auth_key,
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                json={},
+                timeout=httpx.Timeout(self._timeout, connect=min(3.0, self._timeout)),
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            log.warning("MSG91 delivery failed: transport error (%s)", type(exc).__name__)
+            raise RuntimeError("sms delivery failed") from None
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        kind = body.get("type") if isinstance(body, dict) else None
+        # MSG91 can answer HTTP 200 with {"type": "error"}; only an explicit
+        # success counts as delivered.
+        if response.status_code == 200 and kind == "success":
+            return
+        # Log only coarse, non-identifying facts: HTTP status, the vendor's
+        # `type`, and its short error `code` (never the message body).
+        vendor_code = body.get("code") if isinstance(body, dict) else None
+        if not (isinstance(vendor_code, (str, int)) and len(str(vendor_code)) <= 8):
+            vendor_code = None
+        log.warning(
+            "MSG91 delivery failed: http=%s type=%s code=%s",
+            response.status_code,
+            kind if isinstance(kind, str) and len(kind) <= 16 else None,
+            vendor_code,
+        )
+        raise RuntimeError("sms delivery failed")
 
 
 def register_sms_provider(name: str, cls: type[OTPProvider]) -> None:
@@ -68,6 +151,9 @@ def register_sms_provider(name: str, cls: type[OTPProvider]) -> None:
     settings); get_otp_provider() instantiates it with cls().
     """
     PRODUCTION_SMS_PROVIDERS[name.strip().lower()] = cls
+
+
+register_sms_provider("msg91", Msg91OTPProvider)
 
 
 def _configured_provider_name() -> str:
