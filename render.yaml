@@ -64,14 +64,26 @@ services:
       - key: RESTAMP_OTP_BLOCK_SECONDS
         value: "900"
 
-      # ── SMS delivery (MSG91) ────────────────────────────────────────────────
-      # Production startup FAILS unless a registered SMS provider is selected
-      # and its credentials are set. Enter the two secrets in the Render
-      # dashboard (sync: false = never stored in this file):
-      #   RESTAMP_SMS_MSG91_AUTH_KEY    - MSG91 account auth key
-      #   RESTAMP_SMS_MSG91_TEMPLATE_ID - DLT-approved OTP template id
+      # ── SMS delivery (MSG91 — TEMPORARILY DEFERRED) ─────────────────────────
+      # MSG91 activation is DEFERRED: the integration is complete and tested,
+      # but the business SMS prerequisites are still pending (Ayatiworks DLT
+      # registration, approved sender header, approved OTP template, account
+      # credentials). With RESTAMP_SMS_MODE=disabled the backend starts
+      # WITHOUT SMS: phone-OTP login is unavailable, OTP requests fail closed
+      # with a generic 503 (no code is generated, sent, or disclosed), and
+      # verification has no bypass. No dev/mock/demo SMS provider can ever be
+      # used in production in any mode.
+      - key: RESTAMP_SMS_MODE
+        value: "disabled"
+      # Inert while the mode above is "disabled" (required again for
+      # re-activation; the registered production provider is "msg91").
       - key: RESTAMP_SMS_PROVIDER
         value: "msg91"
+      # TO ENABLE MSG91 LATER (no code change): set RESTAMP_SMS_MODE above to
+      # "provider" and enter the two secrets in the Render dashboard
+      # (sync: false = never stored in this file):
+      #   RESTAMP_SMS_MSG91_AUTH_KEY    - MSG91 account auth key
+      #   RESTAMP_SMS_MSG91_TEMPLATE_ID - DLT-approved OTP template id
       - key: RESTAMP_SMS_MSG91_AUTH_KEY
         sync: false
       - key: RESTAMP_SMS_MSG91_TEMPLATE_ID

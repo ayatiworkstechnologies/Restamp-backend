@@ -59,10 +59,36 @@ class DevOTPProvider(OTPProvider):
         log.info("OTP dispatched (dev provider, code withheld from logs)")
 
 
+class DisabledOTPProvider(OTPProvider):
+    """Provider for the explicit SMS-deferred mode (RESTAMP_SMS_MODE=disabled).
+
+    Production-safe by construction: send() ALWAYS refuses (fail closed), so
+    in this mode no OTP can be generated for delivery —
+    OTPService._ensure_provider_allowed rejects this provider BEFORE rate
+    accounting and code generation, making the request fail with the same
+    generic 503 as any unconfigured production deployment. This class is NOT
+    in PRODUCTION_SMS_PROVIDERS, can never be selected via
+    RESTAMP_SMS_PROVIDER, and offers no demo/console/log delivery and no
+    verification bypass: OTP verification keeps every existing rule.
+
+    MSG91 ACTIVATION IS DEFERRED (see render.yaml): until the business SMS
+    prerequisites are ready (Ayatiworks DLT registration, approved sender
+    header, approved OTP template, credentials), production starts in this
+    mode and phone-OTP login is intentionally unavailable.
+    """
+
+    def send(self, phone: str, code: str) -> None:
+        raise RuntimeError("otp delivery is disabled (RESTAMP_SMS_MODE=disabled)")
+
+
 # Production SMS provider registry: vendor name -> OTPProvider subclass.
 # Register a vendor by implementing OTPProvider (raise only on transport or
 # vendor failure; never log or return the code) and calling
 # register_sms_provider() below. Selected via RESTAMP_SMS_PROVIDER.
+# NOTE — msg91 stays REGISTERED while its ACTIVATION is deferred: render.yaml
+# currently sets RESTAMP_SMS_MODE=disabled so production starts without SMS.
+# Re-activation needs no code change: set RESTAMP_SMS_MODE=provider (+ keep
+# RESTAMP_SMS_PROVIDER=msg91 and its dashboard secrets).
 PRODUCTION_SMS_PROVIDERS: dict[str, type[OTPProvider]] = {}
 
 
@@ -165,17 +191,67 @@ def is_sms_configured() -> bool:
     return _configured_provider_name() in PRODUCTION_SMS_PROVIDERS
 
 
+# RESTAMP_SMS_MODE values (see app/config.py). "provider" = the strict default
+# behavior (production requires a configured production provider).
+# "disabled" = the explicit TEMPORARY deferred mode chosen while the MSG91
+# business prerequisites (Ayatiworks DLT registration, approved sender header,
+# approved OTP template, credentials) are pending: production starts WITHOUT
+# SMS, OTP requests fail closed with a generic 503 BEFORE any code is
+# generated, and verification keeps every existing rule with no bypass.
+SMS_MODES = frozenset({"provider", "disabled"})
+
+_SMS_MODE_BAD = (
+    "RESTAMP_SMS_MODE must be one of the documented values: "
+    '"provider" (default, strict) or "disabled" (deferred).'
+)
+
+
+def _configured_sms_mode() -> str:
+    return (settings.SMS_MODE or "").strip().lower()
+
+
+def sms_mode_error() -> str | None:
+    """Production-only validation of RESTAMP_SMS_MODE: None when OK, else an
+    error for the startup gate (setting name and documented mode names only,
+    never secret values) so an unrecognized mode can never silently weaken or
+    disable the production SMS checks."""
+    from ..config import is_production
+
+    if not is_production():
+        return None
+    if _configured_sms_mode() in SMS_MODES:
+        return None
+    return _SMS_MODE_BAD
+
+
+def is_sms_disabled() -> bool:
+    """True only in the explicit deferred mode (RESTAMP_SMS_MODE=disabled).
+
+    Consulted by production startup to decide whether the configured-provider
+    requirement applies; in every other mode the strict requirement stands.
+    """
+    return _configured_sms_mode() == "disabled"
+
+
 def get_otp_provider() -> OTPProvider:
     """Resolve the OTP provider for the current environment.
 
-    Local/dev/test always get DevOTPProvider. Production gets the configured
-    registered provider, else RuntimeError naming only the setting (never
-    values). Called at startup (fail fast) and available to request paths.
+    Local/dev/test always get DevOTPProvider (the disabled mode is a
+    production concern — it never changes local development). Production
+    gets the deferred DisabledOTPProvider in the explicit disabled mode, else
+    the configured registered provider, else RuntimeError naming only the
+    setting (never values). Called at startup (fail fast) and available to
+    request paths.
     """
     from ..config import is_production
 
     if not is_production():
         return DevOTPProvider()
+    if _configured_sms_mode() not in SMS_MODES:
+        # Defense in depth behind the startup gate (config.sms_mode_error).
+        raise RuntimeError(_SMS_MODE_BAD)
+    if is_sms_disabled():
+        return DisabledOTPProvider()
     name = _configured_provider_name()
     cls = PRODUCTION_SMS_PROVIDERS.get(name)
     if cls is None:
@@ -295,10 +371,16 @@ class OTPService:
             return code if settings.OTP_DEBUG else None
 
     def _ensure_provider_allowed(self) -> None:
-        """Reject dev delivery in production (defense in depth behind startup)."""
+        """Reject delivery that must never run in production (defense in
+        depth behind startup): the dev provider, and the provider installed in
+        the explicit SMS-disabled/deferred mode. Checked BEFORE rate-limit
+        accounting and code generation, so a disabled deployment fails closed
+        instantly and burns no retry budget (and no OTP state is created)."""
         from ..config import is_production
 
-        if is_production() and isinstance(self.provider, DevOTPProvider):
+        if is_production() and isinstance(
+            self.provider, (DevOTPProvider, DisabledOTPProvider)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="OTP delivery is not configured. Try again later.",

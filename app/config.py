@@ -50,11 +50,22 @@ class Settings:
     OTP_MAX_REQUESTS_PER_HOUR: int = _get_int("RESTAMP_OTP_MAX_REQUESTS_PER_HOUR", 5)
     OTP_MAX_VERIFY_ATTEMPTS: int = _get_int("RESTAMP_OTP_MAX_VERIFY_ATTEMPTS", 5)
     OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 900)
+    # SMS delivery mode for production. "provider" (default) = strict behavior:
+    # startup requires RESTAMP_SMS_PROVIDER to name a configured registered
+    # production provider with its credentials. "disabled" = explicit DEFERRED
+    # mode: production starts without SMS — phone-OTP login is unavailable,
+    # OTP requests fail closed (generic 503) BEFORE any code is generated, and
+    # verification has no bypass. MSG91 ACTIVATION IS DEFERRED until the
+    # business SMS prerequisites are complete (Ayatiworks DLT registration,
+    # approved sender header, approved OTP template, credentials) — see
+    # render.yaml. Unknown values fail production startup. Local dev/tests
+    # always use the dev provider regardless of this value.
+    SMS_MODE: str = _get("RESTAMP_SMS_MODE", "provider")
     # Production SMS delivery selection. Names a key in the provider registry
     # (see app/services/otp.py PRODUCTION_SMS_PROVIDERS). Empty = unconfigured.
     # Registered production vendors: "msg91". Production requires a real
-    # registered provider (enforced at startup). Local dev/tests always use
-    # the dev provider regardless of this value.
+    # registered provider (enforced at startup) unless SMS_MODE="disabled".
+    # Local dev/tests always use the dev provider regardless of this value.
     SMS_PROVIDER: str = _get("RESTAMP_SMS_PROVIDER", "")
     # MSG91 credentials (used only when RESTAMP_SMS_PROVIDER=msg91). Secrets:
     # set them in the host dashboard, never in the repo. Startup fails fast,
@@ -251,7 +262,23 @@ def validate_security_config() -> None:
     # Lazy imports: services import this module at load time.
     from .services import otp as otp_module
 
-    if not otp_module.is_sms_configured():
+    mode_error = otp_module.sms_mode_error()
+    if mode_error:
+        raise RuntimeError(f"Insecure production configuration: {mode_error}")
+    if otp_module.is_sms_disabled():
+        # Explicit DEFERRED mode (RESTAMP_SMS_MODE=disabled): production starts
+        # WITHOUT SMS/OTP delivery by design. Nothing above is weakened: OTP
+        # requests fail closed at request time (generic 503, before any code
+        # exists), verification has no bypass, and all dev flags stay forbidden
+        # (the checks above run in every mode). Loud warning — not an error —
+        # so the trade-off stays visible in the deploy log.
+        _log.warning(
+            "Production SMS delivery is DISABLED (RESTAMP_SMS_MODE=disabled): "
+            "phone-OTP login is unavailable and OTP requests fail closed (503); "
+            "no OTP is generated, sent, or disclosed. To enable SMS, set "
+            "RESTAMP_SMS_MODE=provider with a configured production provider."
+        )
+    elif not otp_module.is_sms_configured():
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_SMS_PROVIDER must name "
             "a configured production SMS provider (no dev fallback in production)."
