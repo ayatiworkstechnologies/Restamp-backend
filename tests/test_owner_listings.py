@@ -306,7 +306,7 @@ def test_seed_listings_unchanged_by_auto_verify(client):
     c, session = client
     # Self-contained replica of the dev-seed trio (same titles/statuses,
     # submitted_at NULL) under a fresh isolated owner. The test must not
-    # depend on externally seeded rows for '+16501110002' (scripts/
+    # depend on externally seeded rows for '+916501110002' (scripts/
     # seed_dev_data.py), which exist in restamp_dev but not in a clean
     # isolated database such as restamp_test.
     phone = "+919876543237"

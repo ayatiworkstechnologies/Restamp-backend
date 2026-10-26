@@ -14,7 +14,7 @@ _SEQ = {"n": 0}
 
 def _owner(c, phone=None):
     _SEQ["n"] += 1
-    phone = phone or f"+1910000{_SEQ['n']:04d}"
+    phone = phone or f"+91910000{_SEQ['n']:04d}"
     out = register_phone(c, phone)
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
@@ -207,7 +207,7 @@ def test_lifecycle_authorization(client):
     c, session = client
     token_a = _owner(c)
     token_b = _owner(c)
-    buyer = register_phone(c, "+19100999901")["access_token"]
+    buyer = register_phone(c, "+919100999901")["access_token"]
     lid = _create(c, token_a)["listing_id"]
     paths = [
         ("post", f"/owner/listings/{lid}/submit", None),
@@ -274,7 +274,7 @@ def test_diverged_enquiry_repeat_is_404_no_snapshot(client):
     """H1: the consistency gate runs before the active-enquiry shortcut."""
     c, session = client
     token = _owner(c)
-    buyer = register_phone(c, "+19100999902")["access_token"]
+    buyer = register_phone(c, "+919100999902")["access_token"]
     lid = _create(c, token)["listing_id"]
     assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
@@ -283,7 +283,7 @@ def test_diverged_enquiry_repeat_is_404_no_snapshot(client):
     # Diverge the ownership columns directly (unreachable via the API, which
     # always writes both identically): point the listing row at another
     # existing user while the physical row stays with the owner.
-    other = register_phone(c, "+19100999903")["user_id"]
+    other = register_phone(c, "+919100999903")["user_id"]
     session.execute(
         text("UPDATE property_listings SET user_id=:u WHERE id=:i"), {"u": other, "i": lid})
     session.commit()
@@ -299,7 +299,7 @@ def test_leads_filter_matches_owner_read_boundary(client):
     token_a = _owner(c)
     token_b = _owner(c)
     lid = _create(c, token_a)["listing_id"]
-    other_id = register_phone(c, "+19100999904")["user_id"]
+    other_id = register_phone(c, "+919100999904")["user_id"]
     session.execute(
         text("UPDATE property_listings SET user_id=:u WHERE id=:i"), {"u": other_id, "i": lid})
     session.commit()

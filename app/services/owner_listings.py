@@ -1483,3 +1483,50 @@ def delete_draft(db: Session, owner_id: int, draft_id: int) -> bool:
     db.delete(row)
     db.flush()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Listing hard deletion
+# ---------------------------------------------------------------------------
+
+
+def delete_owner_listing(
+    db: Session, owner_id: int, listing_id: int
+) -> tuple[bool, list[str]]:
+    """Permanently delete an owned listing and its cascade-related records.
+
+    Enforces dual-authority: both PropertyListing.user_id AND its
+    physical_properties.user_id must equal the caller. Uses FOR UPDATE to
+    serialize racing deletions on the same row.
+
+    Returns (True, public_ids) when deleted; (False, []) when not found or
+    not owned by the caller (router maps to 404 — no cross-owner leak).
+
+    public_ids are Cloudinary public IDs from property_media rows, collected
+    before deletion so the router can destroy the assets best-effort after
+    the DB commit.
+
+    Cascade behavior (existing FK constraints on property_listings.id):
+      CASCADE deleted: enquiries, active_enquiries, verifications,
+        property_media, property_documents, rent_terms, listing_amenities,
+        saved_properties, property_visits
+      SET NULL: contact_reveal_audits.listing_id (audit row preserved,
+        listing reference cleared)
+
+    Flushes; the caller commits.
+    """
+    listing = _get_owned_listing_for_update(db, owner_id, listing_id)
+    if listing is None:
+        return False, []
+
+    # Collect Cloudinary public_ids before the row (and its media) is gone.
+    media_rows = (
+        db.query(PropertyMedia.public_id)
+        .filter(PropertyMedia.property_listing_id == listing_id)
+        .all()
+    )
+    public_ids = [row[0] for row in media_rows if row[0]]
+
+    db.delete(listing)
+    db.flush()
+    return True, public_ids

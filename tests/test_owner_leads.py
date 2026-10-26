@@ -10,7 +10,7 @@ _buyer_n = {"i": 200}
 def seed_owner_listing(session, verification="VERIFIED", status="AVAILABLE"):
     """Owner (with phone identity) + AVAILABLE listing. Returns (lid, owner_id, phone)."""
     _owner_n["i"] += 1
-    owner_phone = f"+1610010{_owner_n['i']:04d}"
+    owner_phone = f"+91610010{_owner_n['i']:04d}"
     pc = make_postcode(session, f"-ol-{_owner_n['i']}")
     session.execute(text("INSERT INTO users (display_name) VALUES ('Owner')"))
     owner = session.execute(text("SELECT LAST_INSERT_ID()")).fetchone()[0]
@@ -39,7 +39,7 @@ def seed_owner_listing(session, verification="VERIFIED", status="AVAILABLE"):
 
 def fresh_buyer(c):
     _buyer_n["i"] += 1
-    return register_phone(c, f"+1620010{_buyer_n['i']:04d}")
+    return register_phone(c, f"+91620010{_buyer_n['i']:04d}")
 
 
 def owner_header(c, phone):

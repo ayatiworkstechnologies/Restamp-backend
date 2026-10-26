@@ -25,8 +25,8 @@ def test_user_create_and_retrieve(client):
     after = session.execute(text("SELECT COUNT(*) FROM users")).fetchone()[0]
     assert before == after
     # Legitimate registration is OTP verify (auto-creates), then self-read guard:
-    owner = register_phone(c, "+10000000001")
-    other = register_phone(c, "+10000000015")
+    owner = register_phone(c, "+916000000001")
+    other = register_phone(c, "+916000000015")
     r = c.get(f"/users/{owner['user_id']}", headers=auth_header(other["access_token"]))
     # other belongs to a different user -> 403 proves the read guard works
     assert r.status_code == 403
@@ -36,7 +36,7 @@ def test_user_create_and_retrieve(client):
 
 def test_role_assignment_and_history(client):
     c, _ = client
-    tok = register_phone(c, "+10000000002")
+    tok = register_phone(c, "+916000000002")
     h = auth_header(tok["access_token"])
     assert c.get("/users/me/role", headers=h).json()["role"] == "BUYER"
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=h).json()["role"] == "OWNER"
@@ -48,7 +48,7 @@ def test_role_assignment_and_history(client):
 
 def test_owner_broker_exclusivity(client):
     c, _ = client
-    tok = register_phone(c, "+10000000003")
+    tok = register_phone(c, "+916000000003")
     h = auth_header(tok["access_token"])
     assert c.get("/buyer/welcome", headers=h).status_code == 200
     assert c.get("/owner/vault", headers=h).status_code == 403
@@ -65,7 +65,7 @@ def test_owner_broker_exclusivity(client):
 
 def test_owner_switch_preserves_property_history(client):
     c, session = client
-    tok = register_phone(c, "+10000000004")
+    tok = register_phone(c, "+916000000004")
     h = auth_header(tok["access_token"])
     uid = tok["user_id"]
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
@@ -88,8 +88,8 @@ def test_owner_switch_preserves_property_history(client):
 
 def test_ownership_enforcement(client):
     c, session = client
-    a = register_phone(c, "+10000000005")
-    b = register_phone(c, "+10000000006")
+    a = register_phone(c, "+916000000005")
+    b = register_phone(c, "+916000000006")
     ha, hb = auth_header(a["access_token"]), auth_header(b["access_token"])
     c.post("/users/me/role", json={"role": "OWNER"}, headers=ha)
     c.post("/users/me/role", json={"role": "OWNER"}, headers=hb)
@@ -107,7 +107,7 @@ def test_ownership_enforcement(client):
 
 def test_auth_success_and_me(client):
     c, _ = client
-    tok = register_phone(c, "+10000000007")
+    tok = register_phone(c, "+916000000007")
     me = c.get("/auth/me", headers=auth_header(tok["access_token"]))
     assert me.status_code == 200
     body = me.json()
@@ -117,8 +117,8 @@ def test_auth_success_and_me(client):
 
 def test_auth_failure_wrong_code(client):
     c, _ = client
-    c.post("/auth/otp/request", json={"phone": "+10000000008"})
-    r = c.post("/auth/otp/verify", json={"phone": "+10000000008", "code": "000000"})
+    c.post("/auth/otp/request", json={"phone": "+916000000008"})
+    r = c.post("/auth/otp/verify", json={"phone": "+916000000008", "code": "000000"})
     assert r.status_code == 401
 
 
@@ -133,7 +133,7 @@ def test_invalid_and_expired_tokens(client):
     assert c.get("/auth/me", headers=auth_header("not.a.token")).status_code == 401
     import jwt as pyjwt
 
-    tok = register_phone(c, "+10000000009")
+    tok = register_phone(c, "+916000000009")
     expired = pyjwt.encode(
         {"sub": str(tok["user_id"]), "role": "BUYER", "type": "access", "exp": 1},
         "phase4-test-secret",
@@ -151,12 +151,12 @@ def test_invalid_and_expired_tokens(client):
 
 def test_otp_rate_limit_foundation(client):
     c, _ = client
-    phone = "+10000000010"
+    phone = "+916000000010"
     for _ in range(5):
         assert c.post("/auth/otp/request", json={"phone": phone}).status_code == 200
     assert c.post("/auth/otp/request", json={"phone": phone}).status_code == 429
     # Wrong-code attempts also trip protection.
-    phone2 = "+10000000011"
+    phone2 = "+916000000011"
     c.post("/auth/otp/request", json={"phone": phone2})
     for _ in range(5):
         c.post("/auth/otp/verify", json={"phone": phone2, "code": "000000"})
@@ -176,7 +176,7 @@ def test_google_unknown_has_no_autocreate(client):
 
 def test_google_known_identity_authenticates(client):
     c, session = client
-    tok = register_phone(c, "+10000000012")
+    tok = register_phone(c, "+916000000012")
     uid = tok["user_id"]
     session.execute(
         text("INSERT INTO auth_identities (user_id, provider, provider_identifier) "
@@ -194,7 +194,7 @@ def test_google_known_identity_authenticates(client):
 
 def test_admin_flow_no_public_registration(client):
     c, session = client
-    tok = register_phone(c, "+10000000013")
+    tok = register_phone(c, "+916000000013")
     h = auth_header(tok["access_token"])
     assert c.get("/admin/ping", headers=h).status_code == 403
     assert c.post("/admin/grants", json={"user_id": tok["user_id"]}, headers=h).status_code == 403
@@ -204,7 +204,7 @@ def test_admin_flow_no_public_registration(client):
     )
     session.flush()
     assert c.get("/admin/ping", headers=h).status_code == 200
-    other = register_phone(c, "+10000000014")
+    other = register_phone(c, "+916000000014")
     r = c.post("/admin/grants", json={"user_id": other["user_id"]}, headers=h)
     assert r.status_code == 201
     assert (
@@ -214,7 +214,7 @@ def test_admin_flow_no_public_registration(client):
 
 def test_patch_users_me_profile_update(client):
     c, session = client
-    phone = "+10000000099"
+    phone = "+916000000099"
     tok = register_phone(c, phone)
     h = auth_header(tok["access_token"])
 

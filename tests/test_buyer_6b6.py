@@ -11,7 +11,7 @@ def buyer(c, phone):
 
 def test_save_list_unsave_flow(client):
     c, session = client
-    h = buyer(c, "+16400000001")
+    h = buyer(c, "+916400000001")
     l1, l2 = seed_listing(session, title="S1"), seed_listing(session, title="S2")
     assert c.post(f"/buyer/saved/{l1}", headers=h).status_code == 201
     assert c.post(f"/buyer/saved/{l2}", headers=h).status_code == 201
@@ -36,11 +36,11 @@ def test_save_gates_and_duplicates(client):
     c, session = client
     lid = seed_listing(session)
     assert c.post(f"/buyer/saved/{lid}").status_code == 401
-    tok = register_phone(c, "+16400000002")
+    tok = register_phone(c, "+916400000002")
     h = auth_header(tok["access_token"])
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
     assert c.post(f"/buyer/saved/{lid}", headers=h).status_code == 403
-    hb = buyer(c, "+16400000003")
+    hb = buyer(c, "+916400000003")
     for kwargs in ({"verification": "PENDING"}, {"status": "SOLD"}):
         bad = seed_listing(session, **kwargs)
         assert c.post(f"/buyer/saved/{bad}", headers=hb).status_code == 404
@@ -58,7 +58,7 @@ def test_save_gates_and_duplicates(client):
 
 def test_saved_isolation_hidden_and_bounds(client):
     c, session = client
-    ha, hb = buyer(c, "+16400000004"), buyer(c, "+16400000005")
+    ha, hb = buyer(c, "+916400000004"), buyer(c, "+916400000005")
     mine = seed_listing(session)
     theirs = seed_listing(session)
     assert c.post(f"/buyer/saved/{mine}", headers=ha).status_code == 201

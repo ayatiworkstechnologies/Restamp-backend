@@ -86,7 +86,7 @@ def test_detail_owner_name_real_vs_phone_default(client):
     assert all("owner_name" not in item for item in feed["items"])
 
     # Phone-default display names stay hidden, with no digits anywhere.
-    for name, identity in (("+19998887771", "+19998887771"), ("19998887772", "+19998887772")):
+    for name, identity in (("+919998887771", "+919998887771"), ("19998887772", "+919998887772")):
         lid = _seed(name, identity)
         body = c.get(f"/buyer/listings/{lid}").json()
         assert body["owner_name"] is None
@@ -94,7 +94,7 @@ def test_detail_owner_name_real_vs_phone_default(client):
         assert identity not in blob and identity.lstrip("+") not in blob
 
     # Embedded phone numbers are rejected too, not only all-digit names.
-    embedded = _seed("Call 98765 43210", "+19998887773")
+    embedded = _seed("Call 98765 43210", "+919998887773")
     body = c.get(f"/buyer/listings/{embedded}").json()
     assert body["owner_name"] is None
     assert "98765" not in json.dumps(body) and "43210" not in json.dumps(body)

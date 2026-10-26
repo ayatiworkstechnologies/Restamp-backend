@@ -1,17 +1,18 @@
 """Verification policy: a new listing stays PENDING until an EXPLICIT action.
 
-There is NO automatic verification in this codebase: no scheduler, no worker,
-no background task, and no timer-based promotion. A listing is created as
-PENDING / AVAILABLE and only advances when an explicit, audited transition is
-requested:
+Automatic verification exists in this codebase (app/worker.py, started in
+app/main.py lifespan): a PENDING + AVAILABLE listing older than two minutes
+is promoted to VERIFIED by the background worker (actor="auto"). Tests in
+this file run with RESTAMP_DISABLE_AUTO_VERIFY=1 (see tests/conftest.py:14)
+so the worker is disabled and these assertions test only the explicit,
+audited owner-driven transitions:
 
     PENDING --verify-->  VERIFIED   (visible to buyers)
     PENDING --reject-->  REJECTED   (owner edits and resubmits)
     REJECTED --submit--> PENDING    (resubmit, refreshes submitted_at)
 
-Time alone never changes the state: these tests assert that repeated reads
-(and an explicit wait) leave a fresh listing PENDING, so "two minutes later"
-can never flip a listing to VERIFIED.
+Without the worker (or with it disabled), time alone never changes the state:
+these tests assert that repeated reads leave a fresh listing PENDING.
 
 All client tests use the rollback-isolated `client` fixture on the local
 restamp_dev database.
@@ -27,7 +28,7 @@ _SEQ = {"n": 0}
 
 def _owner(c):
     _SEQ["n"] += 1
-    out = register_phone(c, f"+9198{_SEQ['n']:07d}")
+    out = register_phone(c, f"+9198{_SEQ['n']:08d}")
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
     assert r.status_code == 200, r.text

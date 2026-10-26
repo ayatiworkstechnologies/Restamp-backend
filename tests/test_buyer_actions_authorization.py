@@ -40,7 +40,7 @@ PAST = lambda days=1: (datetime.now(timezone.utc) - timedelta(days=days)).isofor
 
 def _register(c, phone=None):
     _SEQ["n"] += 1
-    return register_phone(c, phone or f"+1940000{_SEQ['n']:04d}")
+    return register_phone(c, phone or f"+91940000{_SEQ['n']:04d}")
 
 
 def _owner(c, phone=None):

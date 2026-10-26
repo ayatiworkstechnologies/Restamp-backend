@@ -11,9 +11,9 @@ services:
     envVars:
       # ── Runtime environment ────────────────────────────────────────────────
       # Explicit production posture: enables the startup security gate (JWT
-      # secret strength, OTP debug/demo flags off, Google dev off, CORS
-      # without '*'). Behavior matches the automatic production detection;
-      # this only makes the intent explicit in the blueprint.
+      # secret strength, Google dev off, CORS without '*'). Behavior matches
+      # the automatic production detection; this only makes the intent
+      # explicit in the blueprint.
       - key: RESTAMP_ENV
         value: "production"
 
@@ -47,13 +47,18 @@ services:
         value: "30"
 
       # ── OTP ─────────────────────────────────────────────────────────────────
-      # OTP codes are NEVER returned in API responses (debug_code appears only
-      # when RESTAMP_OTP_DEBUG=1, which must stay "0" in production).
-      # RESTAMP_OTP_DEMO_MODE enables fixed demo codes for local demos only;
-      # it MUST stay "0" in production.
-      - key: RESTAMP_OTP_DEBUG
-        value: "0"
-      - key: RESTAMP_OTP_DEMO_MODE
+      # OTP codes are NEVER returned in API responses. OTP DELIVERY IS NOT
+      # CONNECTED YET: the codebase contains no SMS vendor and there are no
+      # SMS env vars to configure. Until delivery is connected in code (see
+      # app/services/otp.py — a code change is required, no dashboard-only
+      # toggle exists), OTP requests fail closed with a generic 503 and
+      # phone-OTP login stays unavailable.
+      # The ONLY response-disclosure seam is the temporary internal-testing
+      # display mode below — it MUST stay "0" on this production service:
+      # production startup refuses the flag (validate_security_config) and
+      # the OTP service independently re-checks the production
+      # classification on every request.
+      - key: RESTAMP_OTP_DISPLAY_MODE
         value: "0"
       - key: RESTAMP_OTP_TTL_SECONDS
         value: "300"
@@ -63,31 +68,6 @@ services:
         value: "5"
       - key: RESTAMP_OTP_BLOCK_SECONDS
         value: "900"
-
-      # ── SMS delivery (MSG91 — TEMPORARILY DEFERRED) ─────────────────────────
-      # MSG91 activation is DEFERRED: the integration is complete and tested,
-      # but the business SMS prerequisites are still pending (Ayatiworks DLT
-      # registration, approved sender header, approved OTP template, account
-      # credentials). With RESTAMP_SMS_MODE=disabled the backend starts
-      # WITHOUT SMS: phone-OTP login is unavailable, OTP requests fail closed
-      # with a generic 503 (no code is generated, sent, or disclosed), and
-      # verification has no bypass. No dev/mock/demo SMS provider can ever be
-      # used in production in any mode.
-      - key: RESTAMP_SMS_MODE
-        value: "disabled"
-      # Inert while the mode above is "disabled" (required again for
-      # re-activation; the registered production provider is "msg91").
-      - key: RESTAMP_SMS_PROVIDER
-        value: "msg91"
-      # TO ENABLE MSG91 LATER (no code change): set RESTAMP_SMS_MODE above to
-      # "provider" and enter the two secrets in the Render dashboard
-      # (sync: false = never stored in this file):
-      #   RESTAMP_SMS_MSG91_AUTH_KEY    - MSG91 account auth key
-      #   RESTAMP_SMS_MSG91_TEMPLATE_ID - DLT-approved OTP template id
-      - key: RESTAMP_SMS_MSG91_AUTH_KEY
-        sync: false
-      - key: RESTAMP_SMS_MSG91_TEMPLATE_ID
-        sync: false
 
       # ── CORS ────────────────────────────────────────────────────────────────
       # Exact production frontend origin(s) only. Never "*" with credentials.
@@ -98,89 +78,4 @@ services:
       - key: RESTAMP_GOOGLE_CLIENT_ID
         value: ""
       - key: RESTAMP_GOOGLE_DEV_MODE
-        value: "0"
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # SEPARATE DEMO/STAGING SERVICE — safe temporary demo OTP login.
-  # ══════════════════════════════════════════════════════════════════════════
-  # A dedicated deployment (RESTAMP_ENV=demo + RESTAMP_OTP_DEMO_MODE=1):
-  # each OTP request SELECTS one predefined code (DEMO_OTPS in
-  # app/services/otp.py) and returns it as debug_code for display — the
-  # backend verifies ONLY that selected code (normal expiry, attempt caps,
-  # consumed-once, rate limits; no other predefined code is accepted). No
-  # SMS is sent and no MSG91 configuration is needed here.
-  #
-  # Hard boundaries (enforced by validate_security_config + otp.py):
-  #   - the PUBLIC production service above keeps
-  #     RESTAMP_ENV=production + RESTAMP_OTP_DEMO_MODE=0 + SMS disabled:
-  #     it can never accept predefined demo codes;
-  #   - RESTAMP_ENV=demo still enforces a strong dedicated JWT secret, no
-  #     RESTAMP_OTP_DEBUG, no RESTAMP_CORS_ORIGINS='*', no Google dev mode;
-  #   - the demo database MUST be a separate one — never the production DB,
-  #     and never real customer data.
-  # NOTE: if Render blueprint Auto-Sync is enabled, applying this blueprint
-  # CREATES the demo service (free plan, sync:false placeholders unset until
-  # you fill them in the dashboard). The service is otherwise inert.
-  - type: web
-    name: restamp-backend-demo
-    runtime: python
-    region: oregon
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
-
-    envVars:
-      # Dedicated demo environment class — NOT "staging" (staging is treated
-      # as production by design). Required for the demo OTP login.
-      - key: RESTAMP_ENV
-        value: "demo"
-      # Two-part demo switch: RESTAMP_ENV=demo AND this flag together
-      # activate the predefined-code login; either one alone stays fail-closed.
-      - key: RESTAMP_OTP_DEMO_MODE
-        value: "1"
-      # Private test phones ONLY (comma-separated, normalize to exact E.164;
-      # set privately in the dashboard — never in this file). On a
-      # production-classified demo the startup gate refuses demo mode
-      # without this allowlist. NEVER a real user's number. (Local demo
-      # without it keeps the any-phone behavior.)
-      - key: RESTAMP_OTP_DEMO_PHONES
-        sync: false
-      # Debug codes stay forbidden even on demo (the selected predefined
-      # code is returned by the demo flow itself, never by OTP_DEBUG).
-      - key: RESTAMP_OTP_DEBUG
-        value: "0"
-      # Same protections and limits as production.
-      - key: RESTAMP_OTP_TTL_SECONDS
-        value: "300"
-      - key: RESTAMP_OTP_MAX_REQUESTS_PER_HOUR
-        value: "5"
-      - key: RESTAMP_OTP_MAX_VERIFY_ATTEMPTS
-        value: "5"
-      - key: RESTAMP_OTP_BLOCK_SECONDS
-        value: "900"
-      - key: RESTAMP_TRUST_PROXY
-        value: "1"
-      # Separate demo database (Set in the dashboard; NEVER reuse the
-      # production database and never real customer data).
-      - key: RESTAMP_DATABASE_URL
-        sync: false
-      # Dedicated JWT secret, generated independently (verify >= 32 chars).
-      - key: RESTAMP_JWT_SECRET
-        generateValue: true
-      - key: RESTAMP_JWT_EXPIRE_MINUTES
-        value: "30"
-      # SMS unused in demo: the disabled mode keeps any accidental non-demo
-      # request path failing closed (generic 503) exactly like production.
-      - key: RESTAMP_SMS_MODE
-        value: "disabled"
-      # Demo web origin(s) of the demo frontend build (Set in the dashboard
-      # if you use the web app there; never '*' with credentials).
-      - key: RESTAMP_CORS_ORIGINS
-        sync: false
-      - key: RESTAMP_GOOGLE_CLIENT_ID
-        value: ""
-      - key: RESTAMP_GOOGLE_DEV_MODE
-        value: "0"
-      - key: RESTAMP_GOOGLE_ENABLED
         value: "0"

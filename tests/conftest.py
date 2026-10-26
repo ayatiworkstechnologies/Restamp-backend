@@ -1,6 +1,6 @@
 """Phase 4 test isolation: every test runs inside a rolled-back transaction on the
 LOCAL restamp_dev database, so no test rows ever persist. Requires env:
-RESTAMP_DATABASE_URL (unix-socket URL), RESTAMP_JWT_SECRET, RESTAMP_OTP_DEBUG=1,
+RESTAMP_DATABASE_URL (unix-socket URL), RESTAMP_JWT_SECRET,
 RESTAMP_GOOGLE_DEV_MODE=1.
 """
 import os
@@ -10,7 +10,6 @@ os.environ.setdefault(
     "mysql+pymysql://restamp_dev:Restamp%40123@localhost/restamp_dev?unix_socket=/tmp/mysql.sock",
 )
 os.environ["RESTAMP_JWT_SECRET"] = "phase4-test-secret"
-os.environ["RESTAMP_OTP_DEBUG"] = "1"
 os.environ["RESTAMP_GOOGLE_DEV_MODE"] = "1"
 os.environ["RESTAMP_DISABLE_AUTO_VERIFY"] = "1"
 
@@ -186,11 +185,46 @@ def client():
     app = create_app()
     app.dependency_overrides[db_module.get_db] = _override
     with TestClient(app) as c:
+        # Production code ships with NO OTP delivery connected (requests fail
+        # closed). Install the TEST-ONLY recording stand-in for the phone's
+        # SMS inbox as the delivery seam, so tests can read the delivered
+        # code the way a real phone would — at the delivery boundary, never
+        # from an API response.
+        otp_service.delivery = TestSMSInbox()
         yield c, session
     session.close()
     trans.rollback()
     conn.close()
+    otp_service.delivery = None
     otp_service.reset()
+
+
+class TestSMSInbox:
+    """TEST-ONLY delivery stand-in for the phone's SMS inbox (never app code).
+
+    Production has no delivery connected; tests install this callable as
+    `otp_service.delivery` to emulate a delivered SMS. Codes leave the server
+    exclusively through the delivery boundary — API responses never contain
+    them. Tests read the delivered code via captured_otp_code(), emulating
+    the user reading their SMS.
+    """
+
+    def __init__(self) -> None:
+        self.codes: dict[str, str] = {}
+
+    def __call__(self, phone: str, code: str) -> None:
+        self.codes[phone] = code
+
+
+def captured_otp_code(phone: str) -> str:
+    """The OTP most recently delivered to `phone` by the test SMS inbox."""
+    delivery = otp_service.delivery
+    code = getattr(delivery, "codes", {}).get(phone)
+    assert code, (
+        f"no captured OTP code for {phone}: the client fixture must have "
+        "installed the TestSMSInbox delivery before the OTP request"
+    )
+    return code
 
 
 def auth_header(token: str) -> dict:
@@ -198,10 +232,14 @@ def auth_header(token: str) -> dict:
 
 
 def register_phone(client, phone: str) -> dict:
-    """Full OTP request+verify cycle; returns the TokenOut body."""
+    """Full OTP request+verify cycle; returns the TokenOut body.
+
+    The request response discloses no code ({message} only); the code comes
+    from the test SMS inbox installed by the client fixture.
+    """
     r = client.post("/auth/otp/request", json={"phone": phone})
     assert r.status_code == 200, r.text
-    code = r.json()["debug_code"]
+    code = captured_otp_code(phone)
     r = client.post("/auth/otp/verify", json={"phone": phone, "code": code})
     assert r.status_code == 200, r.text
     return r.json()

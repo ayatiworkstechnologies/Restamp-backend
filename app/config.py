@@ -50,33 +50,21 @@ class Settings:
     OTP_MAX_REQUESTS_PER_HOUR: int = _get_int("RESTAMP_OTP_MAX_REQUESTS_PER_HOUR", 5)
     OTP_MAX_VERIFY_ATTEMPTS: int = _get_int("RESTAMP_OTP_MAX_VERIFY_ATTEMPTS", 5)
     OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 900)
-    # SMS delivery mode for production. "provider" (default) = strict behavior:
-    # startup requires RESTAMP_SMS_PROVIDER to name a configured registered
-    # production provider with its credentials. "disabled" = explicit DEFERRED
-    # mode: production starts without SMS — phone-OTP login is unavailable,
-    # OTP requests fail closed (generic 503) BEFORE any code is generated, and
-    # verification has no bypass. MSG91 ACTIVATION IS DEFERRED until the
-    # business SMS prerequisites are complete (Ayatiworks DLT registration,
-    # approved sender header, approved OTP template, credentials) — see
-    # render.yaml. Unknown values fail production startup. Local dev/tests
-    # always use the dev provider regardless of this value.
-    SMS_MODE: str = _get("RESTAMP_SMS_MODE", "provider")
-    # Production SMS delivery selection. Names a key in the provider registry
-    # (see app/services/otp.py PRODUCTION_SMS_PROVIDERS). Empty = unconfigured.
-    # Registered production vendors: "msg91". Production requires a real
-    # registered provider (enforced at startup) unless SMS_MODE="disabled".
-    # Local dev/tests always use the dev provider regardless of this value.
-    SMS_PROVIDER: str = _get("RESTAMP_SMS_PROVIDER", "")
-    # MSG91 credentials (used only when RESTAMP_SMS_PROVIDER=msg91). Secrets:
-    # set them in the host dashboard, never in the repo. Startup fails fast,
-    # naming only the missing setting names, when either one is empty.
-    #   AUTH_KEY    - MSG91 account auth key (sent as a request header).
-    #   TEMPLATE_ID - DLT-approved OTP template id from the MSG91 OTP section.
-    SMS_MSG91_AUTH_KEY: str = _get("RESTAMP_SMS_MSG91_AUTH_KEY", "")
-    SMS_MSG91_TEMPLATE_ID: str = _get("RESTAMP_SMS_MSG91_TEMPLATE_ID", "")
-    # Whole-request timeout (seconds) for one SMS vendor call. Kept short:
-    # OTPService holds its lock while sending.
-    SMS_TIMEOUT_SECONDS: int = _get_int("RESTAMP_SMS_TIMEOUT_SECONDS", 8)
+    # NOTE — SMS delivery: the OTP service has NO provider and NO vendor
+    # configuration by design (see app/services/otp.py). Until real SMS
+    # delivery is connected in code, OTP requests fail closed (generic 503)
+    # and phone-OTP login is unavailable. There is nothing to configure via
+    # environment variables.
+    # TEMPORARY INTERNAL-TESTING DISPLAY (explicitly restricted). When this
+    # is "1" in a NON-production-classified process, the OTP request
+    # response INCLUDES the backend-selected code ("debug_code") so
+    # internal testers can log in without SMS delivery; the delivery seam
+    # is bypassed while the mode is active and no SMS is sent. In
+    # production this MUST be "0": validate_security_config() refuses
+    # production startup with it enabled, and the OTP service re-checks
+    # is_production() at request time — so production API responses and
+    # logs can never contain a code. There is no SMS vendor behind it.
+    OTP_DISPLAY_MODE: bool = _get("RESTAMP_OTP_DISPLAY_MODE", "0") == "1"
     # Per-IP abuse protection (in-memory, per process — see otp.py).
     # These bound total OTP request/verify-failure volume from a single
     # client IP across all phones, so rotating phones does not bypass
@@ -95,20 +83,6 @@ class Settings:
     # requests do NOT arrive through a trusted reverse proxy; clients could
     # otherwise fake the header and evade per-IP caps).
     TRUST_PROXY: bool = _get("RESTAMP_TRUST_PROXY", "0") == "1"
-    # When "1", OTP responses include the code (LOCAL DEV + TESTS ONLY).
-    OTP_DEBUG: bool = _get("RESTAMP_OTP_DEBUG", "0") == "1"
-    OTP_DEMO_MODE: bool = _get("RESTAMP_OTP_DEMO_MODE", "0") == "1"
-    # LOCAL DEMO ONLY: when "1", a fixed set of demo OTPs is accepted by
-    # verify_code (a prior OTP request must still exist). Absent/disabled:
-    # no effect whatsoever (production behavior unchanged).
-    # Private TEST phone numbers allowed to receive the demo code in the
-    # demo OTP login. Entries tolerate spacing/separators but are normalized
-    # to exact E.164 (one leading "+", digits only — see
-    # demo_phone_allowlist()). Local non-production demo without it keeps
-    # the any-phone behavior; a production-classified demo deployment MUST
-    # configure it — startup refuses demo mode with an empty allowlist.
-    # Never list real user numbers; set it privately in the host dashboard.
-    OTP_DEMO_PHONES: str = _get("RESTAMP_OTP_DEMO_PHONES", "")
 
     # Google verification. Real verification needs GOOGLE_CLIENT_ID and a real
     # verifier; dev mode accepts only synthetic "dev:<subject>" tokens.
@@ -198,46 +172,6 @@ def is_production() -> bool:
         return True
 
 
-def _norm_demo_phone(raw: str) -> str:
-    """Normalize one phone/allowlist entry to exact E.164: digits only with a
-    single leading "+". Spacing, separators and stray pluses are tolerated in
-    entries; anything without digits normalizes to "" and never matches.
-
-    Normalization is exact-by-construction: it cannot invent or widen a
-    number, only drop non-digits and collapse separators.
-    """
-    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
-    return "+" + digits if digits else ""
-
-
-def demo_phone_allowlist() -> frozenset[str]:
-    """The normalized RESTAMP_OTP_DEMO_PHONES allowlist (empty when unset).
-
-    Matching is EXACT against the normalized values; a malformed entry can
-    never widen the list (fail closed). Normalization runs when the list is
-    built AND when a phone is compared, so configuration noise never creates
-    a mismatched bypass.
-    """
-    raw = settings.OTP_DEMO_PHONES or ""
-    return frozenset(
-        norm for norm in (_norm_demo_phone(part) for part in raw.split(",")) if norm
-    )
-
-
-def demo_phone_allowed(phone: str) -> bool:
-    """Whether this phone may receive a demo OTP.
-
-    Empty allowlist: True — LOCAL non-production demo only (the startup gate
-    refuses demo mode without an allowlist whenever the deployment is
-    production-classified). Configured allowlist: exact normalized
-    membership only; nobody else is demo-issued anything.
-    """
-    allowed = demo_phone_allowlist()
-    if not allowed:
-        return True
-    return _norm_demo_phone(phone) in allowed
-
-
 def is_jwt_secret_strong(secret: str | None) -> bool:
     """Check length + blocklist without ever logging the value."""
     if not secret or not isinstance(secret, str):
@@ -257,18 +191,35 @@ def is_jwt_secret_strong(secret: str | None) -> bool:
 def validate_security_config() -> None:
     """Fail fast with non-sensitive errors when production config is unsafe.
 
-    Safe in local/dev/test (no-op). Raises RuntimeError in production when:
+    Raises RuntimeError naming RESTAMP_ENV=demo FIRST, unconditionally
+    (regardless of environment classification): the demo OTP login was
+    removed from the codebase, so that legacy value must never boot as
+    anything else.
+
+    Safe in local/dev/test beyond that (no-op). Raises RuntimeError in
+    production when:
     - JWT secret is missing, weak (<32 chars), or a known placeholder;
-    - RESTAMP_OTP_DEBUG / GOOGLE_DEV_MODE are enabled;
-    - RESTAMP_OTP_DEMO_MODE is enabled anywhere except RESTAMP_ENV=demo (
-      the dedicated demo/staging deployment; production never accepts the
-      fixed demo codes);
+    - RESTAMP_OTP_DISPLAY_MODE is enabled (it must be '0' in production:
+      OTP codes must never be returned in API responses; the temporary
+      display mode exists for local/internal testing only);
+    - RESTAMP_GOOGLE_DEV_MODE is enabled;
     - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
-    - no production SMS provider is configured (RESTAMP_SMS_PROVIDER must
-      name a registered production provider);
     - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
+    (SMS/OTP delivery is not configurable and not validated here: real SMS
+    delivery must be connected in code per app/services/otp.py; until then
+    OTP requests fail closed at request time.)
     Messages name only the setting, never its value.
     """
+    if (settings.ENV or "").strip().lower() == "demo":
+        # The dedicated demo mode (predefined codes shown for login) was
+        # removed: RESTAMP_ENV=demo must fail fast instead of silently
+        # behaving like local/production anywhere it is left configured.
+        raise RuntimeError(
+            "Insecure configuration: RESTAMP_ENV=demo is no longer a "
+            "supported environment (the demo OTP login was removed); use "
+            "local/development locally or production/prod/staging for "
+            "deployments."
+        )
     if not is_production():
         return
     if not is_jwt_secret_strong(settings.JWT_SECRET):
@@ -276,59 +227,15 @@ def validate_security_config() -> None:
             "Insecure production configuration: RESTAMP_JWT_SECRET must be "
             "set to a strong random value at least 32 characters long."
         )
-    if settings.OTP_DEBUG:
+    if settings.OTP_DISPLAY_MODE:
+        # The temporary internal-testing display mode must NEVER be enabled
+        # on a production-classified deployment: OTP codes must never be
+        # returned in API responses (or logs). The service also enforces
+        # this at request time (see app/services/otp.py _display_active).
         raise RuntimeError(
-            "Insecure production configuration: RESTAMP_OTP_DEBUG must be '0' "
-            "in production (OTP codes must never be returned in API responses)."
-        )
-    # RESTAMP_OTP_DEMO_MODE=1 is allowed ONLY with RESTAMP_ENV=demo: a
-    # dedicated, explicitly named demo/staging deployment. In every other
-    # configuration — production/prod/staging, or any service whose
-    # DATABASE_URL makes is_production() treat it as production — fixed demo
-    # codes are refused at startup exactly as before. The demo OTP flow
-    # itself (selection/return/verify of one predefined code per request)
-    # lives in app/services/otp.py on demo_login_active().
-    if (settings.ENV or "").strip().lower() == "demo":
-        if not settings.OTP_DEMO_MODE:
-            _log.warning(
-                "RESTAMP_ENV=demo without RESTAMP_OTP_DEMO_MODE=1: the demo "
-                "OTP login is INACTIVE. Enable RESTAMP_OTP_DEMO_MODE=1 to use "
-                "the predefined demo codes."
-            )
-        else:
-            _log.warning(
-                "Demo login ACTIVE (RESTAMP_ENV=demo + RESTAMP_OTP_DEMO_MODE=1): "
-                "OTP requests return a selected predefined demo code and no "
-                "SMS is sent. This must never be combined with a real "
-                "production service configuration."
-            )
-        _log.warning(
-            "Demo configuration hardening: on a deployed demo service "
-            "(production-classified via its DATABASE_URL) the JWT/CORS/Google "
-            "checks below still run exactly as in production."
-        )
-        if settings.OTP_DEMO_MODE:
-            allowlist = demo_phone_allowlist()
-            if not allowlist and is_production():
-                # A deployed demo on a production-classified DATABASE_URL is
-                # permitted ONLY with an explicit private test-phone
-                # allowlist — otherwise any caller could read a returned code
-                # and log in as any phone number on that database.
-                raise RuntimeError(
-                    "Insecure production configuration: RESTAMP_OTP_DEMO_MODE=1 "
-                    "on a production-classified deployment requires a non-empty "
-                    "RESTAMP_OTP_DEMO_PHONES allowlist of private test phones."
-                )
-            if not allowlist:
-                _log.warning(
-                    "Demo login without RESTAMP_OTP_DEMO_PHONES: ANY phone "
-                    "receives the demo code (acceptable only outside "
-                    "production classification)."
-                )
-    elif settings.OTP_DEMO_MODE:
-        raise RuntimeError(
-            "Insecure production configuration: RESTAMP_OTP_DEMO_MODE must be '0' "
-            "in production (fixed demo codes require RESTAMP_ENV=demo)."
+            "Insecure production configuration: RESTAMP_OTP_DISPLAY_MODE must "
+            "be '0' in production (OTP codes must never be returned in API "
+            "responses)."
         )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
@@ -353,30 +260,6 @@ def validate_security_config() -> None:
             "is empty; listing photo uploads will fall back to local-disk storage "
             "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
             "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
-        )
-    # Lazy imports: services import this module at load time.
-    from .services import otp as otp_module
-
-    mode_error = otp_module.sms_mode_error()
-    if mode_error:
-        raise RuntimeError(f"Insecure production configuration: {mode_error}")
-    if otp_module.is_sms_disabled():
-        # Explicit DEFERRED mode (RESTAMP_SMS_MODE=disabled): production starts
-        # WITHOUT SMS/OTP delivery by design. Nothing above is weakened: OTP
-        # requests fail closed at request time (generic 503, before any code
-        # exists), verification has no bypass, and all dev flags stay forbidden
-        # (the checks above run in every mode). Loud warning — not an error —
-        # so the trade-off stays visible in the deploy log.
-        _log.warning(
-            "Production SMS delivery is DISABLED (RESTAMP_SMS_MODE=disabled): "
-            "phone-OTP login is unavailable and OTP requests fail closed (503); "
-            "no OTP is generated, sent, or disclosed. To enable SMS, set "
-            "RESTAMP_SMS_MODE=provider with a configured production provider."
-        )
-    elif not otp_module.is_sms_configured():
-        raise RuntimeError(
-            "Insecure production configuration: RESTAMP_SMS_PROVIDER must name "
-            "a configured production SMS provider (no dev fallback in production)."
         )
     if settings.GOOGLE_ENABLED and not settings.GOOGLE_CLIENT_ID.strip():
         raise RuntimeError(

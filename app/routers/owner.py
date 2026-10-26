@@ -14,6 +14,7 @@ Endpoints:
   POST /owner/listings/{id}/status  — validated AVAILABLE/CLOSED/SOLD/RENTED/LEASED
   POST /owner/listings/{id}/photos — upload a photo for own listing (multipart)
   DELETE /owner/listings/{id}/photos/{media_id} — remove one photo (OWNER)
+  DELETE /owner/listings/{id}         — permanently delete own listing (OWNER)
 
 No admin endpoints here; see users.py for admin grants.
 No schema changes; all writes use existing property_listings / physical_properties tables.
@@ -528,6 +529,51 @@ def delete_listing_photo(
         sp.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Delete failed")
     if public_id:
+        try:
+            photo_storage.delete_uploaded_image(public_id)
+        except Exception:
+            pass
+    return None
+
+
+@router.delete("/listings/{listing_id}", status_code=204)
+def delete_listing(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Permanently delete the caller's own listing.
+
+    Enforces dual-authority ownership (PropertyListing.user_id AND
+    PhysicalProperty.user_id both equal the caller). Returns 404 when the
+    listing does not belong to the caller or does not exist — never a
+    cross-owner leak.
+
+    Deletes the listing row and its cascade-related records per the existing
+    FK constraints (enquiries, visits, verifications, media, documents,
+    rent terms, amenities, saved properties are cascade-deleted;
+    contact_reveal_audits.listing_id is set to NULL, preserving the audit
+    row). Cloudinary media assets are destroyed best-effort after the DB
+    commit; a storage failure never fails the request.
+
+    Returns 204 No Content on success.
+    """
+    sp = db.begin_nested()
+    try:
+        deleted, public_ids = owner_svc.delete_owner_listing(db, owner_id, listing_id)
+        if not deleted:
+            sp.rollback()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        sp.commit()
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        sp.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Delete failed")
+    # Best-effort Cloudinary cleanup after the DB commit succeeded. A storage
+    # failure leaves orphaned assets but never fails the deletion request.
+    for public_id in public_ids:
         try:
             photo_storage.delete_uploaded_image(public_id)
         except Exception:

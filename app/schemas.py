@@ -8,6 +8,12 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 PHONE_PATTERN = r"^\+[1-9]\d{7,14}$"
+# Restamp accepts INDIAN MOBILE NUMBERS ONLY for phone-OTP login (request
+# and verify): E.164 "+91" followed by exactly 10 digits starting 6-9
+# (e.g. +919876543210). This is the sole acceptance gate for both OTP
+# endpoints — non-Indian numbers are rejected with 422 before any
+# rate-limit accounting or code generation.
+INDIAN_MOBILE_PATTERN = r"^\+91[6-9]\d{9}$"
 
 
 class UserCreate(BaseModel):
@@ -46,11 +52,13 @@ class RoleOut(BaseModel):
 
 
 class OTPRequest(BaseModel):
-    phone: str = Field(pattern=PHONE_PATTERN)
+    """Indian mobile only (Restamp is India-only): +91 + 10 digits (6-9)."""
+
+    phone: str = Field(pattern=INDIAN_MOBILE_PATTERN)
 
 
 class OTPVerify(BaseModel):
-    phone: str = Field(pattern=PHONE_PATTERN)
+    phone: str = Field(pattern=INDIAN_MOBILE_PATTERN)
     code: str = Field(pattern=r"^\d{6}$")
 
 

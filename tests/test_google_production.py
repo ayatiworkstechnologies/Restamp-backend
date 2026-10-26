@@ -135,7 +135,7 @@ def _phone_user(c, session, tag: str) -> str:
     ).lastrowid
     session.execute(_sa_text(
         "INSERT INTO auth_identities (user_id, provider, provider_identifier) "
-        "VALUES (:u, 'phone', :p)"), {"u": uid, "p": f"+100000009{tag}"})
+        "VALUES (:u, 'phone', :p)"), {"u": uid, "p": f"+9191000000{tag}"})
     session.execute(_sa_text(
         "INSERT INTO user_current_role (user_id, role) VALUES (:u, 'BUYER')"),
         {"u": uid})

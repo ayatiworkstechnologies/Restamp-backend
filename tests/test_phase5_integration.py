@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import text
 
 from app.db import engine
-from tests.conftest import auth_header, make_postcode, register_phone
+from tests.conftest import auth_header, captured_otp_code, make_postcode, register_phone
 from tests.frontend_client import ApiError, FrontendClient, map_error
 
 
@@ -34,8 +34,9 @@ def test_api_base_url_env_config(fx):
 def test_frontend_login_state_and_logout(fx):
     fc, _ = fx
     assert fc.token is None
-    code = fc.request_otp("+15000000001")["debug_code"]
-    body = fc.login_phone("+15000000001", code)
+    fc.request_otp("+917000000001")
+    code = captured_otp_code("+917000000001")
+    body = fc.login_phone("+917000000001", code)
     assert fc.token == body["access_token"]  # token stored
     me = fc.get_me()  # authenticated request works
     assert me["id"] == body["user_id"]
@@ -50,7 +51,7 @@ def test_frontend_login_state_and_logout(fx):
 def test_frontend_auth_failure_handling(fx):
     fc, _ = fx
     with pytest.raises(ApiError) as e:
-        fc.login_phone("+15000000002", "000000")
+        fc.login_phone("+917000000002", "000000")
     assert e.value.kind == "login"  # 401 -> login screen
 
 
@@ -69,19 +70,21 @@ def test_frontend_http_error_mapping(fx):
 
 def test_e2e_otp_full_path_with_expiry_and_limits(fx):
     fc, session = fx
-    phone = "+15000000003"
-    code = fc.request_otp(phone)["debug_code"]
+    phone = "+917000000003"
+    fc.request_otp(phone)
+    code = captured_otp_code(phone)
     assert fc.login_phone(phone, code)["role"] == "BUYER"
     # Expired OTP is rejected (white-box expiry, local test only).
     from app.services.otp import otp_service
 
-    code2 = fc.request_otp("+15000000004")["debug_code"]
-    otp_service._codes["+15000000004"].expires_at = 0.0
+    fc.request_otp("+917000000004")
+    code2 = captured_otp_code("+917000000004")
+    otp_service._codes["+917000000004"].expires_at = 0.0
     with pytest.raises(ApiError) as e:
-        fc.login_phone("+15000000004", code2)
+        fc.login_phone("+917000000004", code2)
     assert e.value.kind == "login"
     # Abuse path: request flood is throttled.
-    flood = "+15000000005"
+    flood = "+917000000005"
     for _ in range(5):
         fc.request_otp(flood)
     with pytest.raises(ApiError) as e:
@@ -91,8 +94,9 @@ def test_e2e_otp_full_path_with_expiry_and_limits(fx):
 
 def test_e2e_tampered_token_rejected(fx):
     fc, _ = fx
-    code = fc.request_otp("+15000000006")["debug_code"]
-    tok = fc.login_phone("+15000000006", code)["access_token"]
+    fc.request_otp("+917000000006")
+    code = captured_otp_code("+917000000006")
+    tok = fc.login_phone("+917000000006", code)["access_token"]
     fc.token = tok[:-2] + ("ab" if not tok.endswith("ab") else "cd")
     with pytest.raises(ApiError) as e:
         fc.get_me()
@@ -106,8 +110,9 @@ def test_e2e_google_rules(fx):
         fc.login_google("dev:g5-unknown")
     assert e.value.status == 404  # unknown Google identity: no silent creation
     assert session.execute(text("SELECT COUNT(*) FROM users")).fetchone()[0] == before
-    code = fc.request_otp("+15000000007")["debug_code"]
-    uid = fc.login_phone("+15000000007", code)["user_id"]
+    fc.request_otp("+917000000007")
+    code = captured_otp_code("+917000000007")
+    uid = fc.login_phone("+917000000007", code)["user_id"]
     session.execute(
         text("INSERT INTO auth_identities (user_id, provider, provider_identifier) "
              "VALUES (:u, 'google', 'g5-known')"),
@@ -124,8 +129,8 @@ def test_e2e_google_rules(fx):
 
 
 def _login_as(fc, phone, role=None):
-    code = fc.request_otp(phone)["debug_code"]
-    body = fc.login_phone(phone, code)
+    fc.request_otp(phone)
+    body = fc.login_phone(phone, captured_otp_code(phone))
     if role:
         fc.set_role(role)
     return body
@@ -133,7 +138,7 @@ def _login_as(fc, phone, role=None):
 
 def test_e2e_roles_buyer_owner_broker(fx):
     fc, _ = fx
-    _login_as(fc, "+15000000008")  # BUYER
+    _login_as(fc, "+917000000008")  # BUYER
     assert fc.get("/buyer/welcome")["message"] == "buyer ok"
     for denied in ("/owner/vault", "/broker/scope", "/admin/ping"):
         with pytest.raises(ApiError) as e:
@@ -153,7 +158,7 @@ def test_e2e_roles_buyer_owner_broker(fx):
 
 def test_e2e_admin(fx):
     fc, session = fx
-    body = _login_as(fc, "+15000000009")
+    body = _login_as(fc, "+917000000009")
     with pytest.raises(ApiError) as e:
         fc.get("/admin/ping")
     assert e.value.status == 403
@@ -167,7 +172,7 @@ def test_e2e_admin(fx):
 
 def test_e2e_ownership_across_users(fx):
     fc, session = fx
-    a = _login_as(fc, "+15000000010", role="OWNER")
+    a = _login_as(fc, "+917000000010", role="OWNER")
     pc = make_postcode(session)
     session.execute(
         text("INSERT INTO physical_properties (postcode_id, user_id) VALUES (:p, :u)"),
@@ -177,7 +182,7 @@ def test_e2e_ownership_across_users(fx):
     pp = session.execute(text("SELECT LAST_INSERT_ID()")).fetchone()[0]
     assert fc.get(f"/owner/check-ownership/{pp}")["message"] == "ownership confirmed"
     fc.logout()
-    _login_as(fc, "+15000000011", role="OWNER")  # different user
+    _login_as(fc, "+917000000011", role="OWNER")  # different user
     with pytest.raises(ApiError) as e:
         fc.get(f"/owner/check-ownership/{pp}")
     assert e.value.status == 403  # backend-enforced, not a frontend check
@@ -192,17 +197,17 @@ def test_e2e_ownership_across_users(fx):
 
 def test_e2e_persistence_through_api(fx):
     fc, session = fx
-    body = _login_as(fc, "+15000000012")
+    body = _login_as(fc, "+917000000012")
     uid = body["user_id"]
     row = session.execute(
         text("SELECT display_name, status FROM users WHERE id=:u"), {"u": uid}
     ).fetchone()
-    assert row[0] == "+15000000012" and row[1] == "active"
+    assert row[0] == "+917000000012" and row[1] == "active"
     ident = session.execute(
         text("SELECT provider, provider_identifier FROM auth_identities WHERE user_id=:u"),
         {"u": uid},
     ).fetchall()
-    assert ("phone", "+15000000012") in [(r[0], r[1]) for r in ident]
+    assert ("phone", "+917000000012") in [(r[0], r[1]) for r in ident]
     assert session.execute(
         text("SELECT role FROM user_current_role WHERE user_id=:u"), {"u": uid}
     ).fetchone()[0] == "BUYER"
@@ -220,7 +225,7 @@ def test_error_shapes_and_no_leakage(client):
     c, _ = client
     probes = [
         ("post", "/auth/otp/request", {"phone": "not-a-phone"}),
-        ("post", "/auth/otp/verify", {"phone": "+15000000013", "code": "12"}),
+        ("post", "/auth/otp/verify", {"phone": "+917000000013", "code": "12"}),
         ("post", "/users/me/role", {"role": "ADMIN"}),
         ("get", "/users/999999999", None),
         ("get", "/auth/me", None),
@@ -228,7 +233,7 @@ def test_error_shapes_and_no_leakage(client):
     for method, path, payload in probes:
         kwargs = {"json": payload} if payload is not None else {}
         if path in ("/users/me/role", "/users/999999999"):
-            tok = register_phone(c, "+15000000099")
+            tok = register_phone(c, "+917000000099")
             kwargs["headers"] = auth_header(tok["access_token"])
         r = getattr(c, method)(path, **kwargs)
         assert r.status_code in (400, 401, 403, 404, 422), (path, r.status_code)
@@ -255,8 +260,8 @@ def test_auth_lookup_paths_are_indexed_and_fast(fx):
     assert "uk_auth_provider_identifier_scoped" in idx
     assert "uk_auth_identities_provider_user" in idx
     t0 = time.perf_counter()
-    code = fc.request_otp("+15000000014")["debug_code"]
-    fc.login_phone("+15000000014", code)
+    fc.request_otp("+917000000014")
+    fc.login_phone("+917000000014", captured_otp_code("+917000000014"))
     fc.get_me()
     assert time.perf_counter() - t0 < 5.0
     from app.db import engine as _engine
@@ -322,14 +327,13 @@ def test_phase7_e2e_buyer_profile_owner_flow(client):
     5. Switch role to OWNER, access owner endpoint, switch back to BUYER
     """
     c, session = client
-    phone = "+16000000001"
+    phone = "+918000000001"
 
-    # 1. New user registration via OTP
+    # 1. New user registration via OTP (response is message-only: no code)
     code_req = c.post("/auth/otp/request", json={"phone": phone}).json()
-    debug_code = code_req.get("debug_code")
-    assert debug_code is not None
+    assert code_req == {"message": "If the number is valid, an OTP was sent."}
 
-    tok = c.post("/auth/otp/verify", json={"phone": phone, "code": debug_code}).json()
+    tok = c.post("/auth/otp/verify", json={"phone": phone, "code": captured_otp_code(phone)}).json()
     token = tok["access_token"]
     h = auth_header(token)
 
@@ -347,8 +351,8 @@ def test_phase7_e2e_buyer_profile_owner_flow(client):
     assert me2["display_name"] == "Restamp Tester"
 
     # 3. Returning user login with same phone
-    code_req2 = c.post("/auth/otp/request", json={"phone": phone}).json()
-    tok2 = c.post("/auth/otp/verify", json={"phone": phone, "code": code_req2["debug_code"]}).json()
+    c.post("/auth/otp/request", json={"phone": phone}).json()
+    tok2 = c.post("/auth/otp/verify", json={"phone": phone, "code": captured_otp_code(phone)}).json()
     h2 = auth_header(tok2["access_token"])
     me_returning = c.get("/auth/me", headers=h2).json()
     assert me_returning["display_name"] == "Restamp Tester"  # name preserved!

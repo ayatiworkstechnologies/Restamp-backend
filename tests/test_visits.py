@@ -16,7 +16,7 @@ PAST = lambda days=1: (datetime.now(timezone.utc) - timedelta(days=days)).isofor
 
 def _owner(c, phone=None):
     _SEQ["n"] += 1
-    out = register_phone(c, phone or f"+1920000{_SEQ['n']:04d}")
+    out = register_phone(c, phone or f"+91920000{_SEQ['n']:04d}")
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
     assert r.status_code == 200, r.text
@@ -25,7 +25,7 @@ def _owner(c, phone=None):
 
 def _buyer(c, phone=None):
     _SEQ["n"] += 1
-    return register_phone(c, phone or f"+1930000{_SEQ['n']:04d}")
+    return register_phone(c, phone or f"+91930000{_SEQ['n']:04d}")
 
 
 def _listing(c, token, title=None):
@@ -147,8 +147,8 @@ def test_visit_auth_and_roles(client):
 def test_owner_propose_requires_relationship(client):
     c, _ = client
     _, otoken = _owner(c)
-    buyer = _buyer(c, "+19300999011")
-    stranger = _buyer(c, "+19300999012")
+    buyer = _buyer(c, "+919300999011")
+    stranger = _buyer(c, "+919300999012")
     lid = _listing(c, otoken)
     h = auth_header(otoken)
     # No relationship yet -> 422 (buyer id is real, just unrelated).
@@ -309,14 +309,14 @@ def test_cross_user_isolation_and_filters(client):
 
 def test_visit_privacy_no_phones(client):
     c, _ = client
-    owner_out, otoken = _owner(c, "+19200888001")
-    buyer = _buyer(c, "+19300888002")
+    owner_out, otoken = _owner(c, "+919200888001")
+    buyer = _buyer(c, "+919300888002")
     lid = _listing(c, otoken)
     bh = auth_header(buyer["access_token"])
     c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=bh)
     vid = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": FUTURE()},
                  headers=bh).json()["id"]
-    phones = ("+19200888001", "+19300888002")
+    phones = ("+919200888001", "+919300888002")
     for r in (
         c.get("/buyer/visits", headers=bh),
         c.get(f"/buyer/visits/{vid}", headers=bh),

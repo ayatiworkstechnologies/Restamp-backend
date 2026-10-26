@@ -53,19 +53,10 @@ async def lifespan(app: FastAPI):
     except RuntimeError as exc:
         log.error("Insecure production configuration: %s", exc)
         raise
-    # Resolve the OTP delivery provider at startup so a missing or broken
-    # production SMS configuration fails fast here, never as a silent
-    # "sent" response at request time.
-    from .services import otp as otp_module
-
-    try:
-        provider = otp_module.get_otp_provider()
-    except RuntimeError as exc:
-        log.error("Insecure production configuration: %s", exc)
-        raise
-    # The request handlers use the module-level singleton, so startup must
-    # install the validated provider there, not merely construct it.
-    otp_module.otp_service.provider = provider
+    # OTP delivery is intentionally NOT configured by startup: there is no
+    # SMS provider in the codebase (see app/services/otp.py). OTP requests
+    # fail closed at request time with a generic 503 until real SMS delivery
+    # is connected behind OTPService.delivery.
     if not is_production() and not settings.JWT_SECRET:
         log.warning("JWT secret is empty in local development.")
     elif settings.JWT_SECRET == "restamp-local-dev-secret-change-me":

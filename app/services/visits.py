@@ -102,6 +102,8 @@ def create_buyer_visit(
     if buyer_id == owner_id:
         raise ValueError("cannot schedule a visit on your own listing")
     moment = _normalize_scheduled_at(scheduled_at)
+    if _has_active_visit_for_buyer_listing(db, listing_id, buyer_id, initiator="BUYER"):
+        raise ValueError("A visit is already active for this buyer on this listing")
     visit = PropertyVisit(
         property_listing_id=listing_id,
         buyer_user_id=buyer_id,
@@ -143,6 +145,39 @@ def _buyer_has_relationship(db: Session, listing_id: int, buyer_id: int) -> bool
     )
 
 
+def _has_active_visit_for_buyer_listing(
+    db: Session,
+    listing_id: int,
+    buyer_id: int,
+    initiator: str | None = None,
+    exclude_visit_id: int | None = None,
+) -> bool:
+    """True when a visit already exists for the same listing + buyer pair in
+    a pending state (PROPOSED or REQUESTED), excluding an optional visit
+    being rescheduled. When `initiator` is given, only visits started by the
+    same initiator are considered, so an owner-proposed visit does not block
+    a buyer-requested visit (and vice versa) for the same buyer+listing.
+
+    Narrowest conflict rule: one pending visit per buyer per listing per
+    initiator at a time. CONFIRMED visits are scheduled and do not block a
+    new proposal; CANCELLED, DECLINED, and COMPLETED visits are terminal
+    and allow legitimate repeat visits.
+    """
+    q = (
+        db.query(PropertyVisit.id)
+        .filter(
+            PropertyVisit.property_listing_id == listing_id,
+            PropertyVisit.buyer_user_id == buyer_id,
+            PropertyVisit.status.in_(("PROPOSED", "REQUESTED")),
+        )
+    )
+    if initiator is not None:
+        q = q.filter(PropertyVisit.initiator == initiator)
+    if exclude_visit_id is not None:
+        q = q.filter(PropertyVisit.id != exclude_visit_id)
+    return q.first() is not None
+
+
 def create_owner_visit(
     db: Session,
     owner_id: int,
@@ -164,6 +199,10 @@ def create_owner_visit(
     if not _buyer_has_relationship(db, listing_id, buyer_user_id):
         raise ValueError("buyer has no enquiry or contact relationship on this listing")
     moment = _normalize_scheduled_at(scheduled_at)
+    if _has_active_visit_for_buyer_listing(
+        db, listing_id, buyer_user_id, initiator="OWNER"
+    ):
+        raise ValueError("A visit is already active for this buyer on this listing")
     visit = PropertyVisit(
         property_listing_id=listing_id,
         buyer_user_id=buyer_user_id,
@@ -329,6 +368,16 @@ def transition_visit(
                 f"Only {editors[0]} may reschedule a {original_status} visit"
             )
         next_moment = _normalize_scheduled_at(scheduled_at)
+        if _has_active_visit_for_buyer_listing(
+            db,
+            visit.property_listing_id,
+            visit.buyer_user_id,
+            initiator=visit.initiator,
+            exclude_visit_id=visit.id,
+        ):
+            raise ValueError(
+                "A conflicting visit already exists for this buyer on this listing"
+            )
 
     if to_status is not None:
         visit.status = to_status

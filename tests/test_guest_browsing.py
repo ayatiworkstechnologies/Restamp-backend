@@ -156,7 +156,7 @@ def test_authenticated_flows_preserved_without_leaks(client):
     c, _ = client
     _, lids = _seed_all_deals(c)
     lid = lids["LEASE"]
-    buyer = register_phone(c, "+19100888801")["access_token"]
+    buyer = register_phone(c, "+919100888801")["access_token"]
     h = auth_header(buyer)
     # Phone is revealed ONLY through the contact endpoint ...
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
@@ -183,7 +183,7 @@ def test_authenticated_flows_preserved_without_leaks(client):
 def test_owner_leads_never_carry_phones(client):
     c, _ = client
     token, lids = _seed_all_deals(c)
-    buyer = register_phone(c, "+19100888802")["access_token"]
+    buyer = register_phone(c, "+919100888802")["access_token"]
     c.post(f"/buyer/listings/{lids['BUY']}/contact", headers=auth_header(buyer))
     r = c.get("/owner/leads", headers=auth_header(token))
     assert r.status_code == 200, r.text
@@ -211,7 +211,7 @@ def test_enquiry_403_means_wrong_role(client):
     assert r.status_code == 403, r.text
     assert "phone" not in r.json()
     # BROKER role likewise refused.
-    broker = register_phone(c, "+19100888803")["access_token"]
+    broker = register_phone(c, "+919100888803")["access_token"]
     c.post("/users/me/role", json={"role": "BROKER"}, headers=auth_header(broker))
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
                headers=auth_header(broker))

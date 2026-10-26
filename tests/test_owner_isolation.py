@@ -25,8 +25,10 @@ _SEQ = {"n": 0}
 
 
 def _phone(tag: str) -> str:
+    """Unused so far; kept Indian-valid: +91 + exactly 10 digits (6-9 start)."""
     _SEQ["n"] += 1
-    return f"+9198{tag}{_SEQ['n']:06d}"
+    tail = tag[-6:]  # keep at most 6 chars; the padded counter fills the rest
+    return f"+9198{tail}{_SEQ['n']:0{8 - len(tail)}d}"
 
 
 def _owner(c, phone: str | None = None) -> dict:

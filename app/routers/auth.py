@@ -67,8 +67,17 @@ def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
 
 @router.post("/otp/request")
 def otp_request(body: schemas.OTPRequest, request: Request):
+    """Request an OTP. Indian mobiles only schemas gate; never logged.
+
+    Normal mode: no code leaves the server — delivery happens only through
+    the (currently unconnected) delivery seam, and the response shape is
+    constant ({message}). Explicitly restricted internal-testing display
+    mode (see app/services/otp.py _display_active: env flag + never
+    production-classified, also refused at production startup): the
+    backend-selected code is added to the response so the frontend can
+    display it. Production can never reach the display branch.
+    """
     code = otp_service.request_code(body.phone, ip=_client_ip(request))
-    # The code leaves the server ONLY in OTP_DEBUG (local dev/tests).
     resp = {"message": "If the number is valid, an OTP was sent."}
     if code is not None:
         resp["debug_code"] = code

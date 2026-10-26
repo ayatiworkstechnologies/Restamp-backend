@@ -36,7 +36,7 @@ def buyer_token(c, phone):
 def test_create_enquiry_new_and_active_row(client):
     c, session = client
     lid = seed_listing(session)
-    h = auth_header(buyer_token(c, "+16300000001"))
+    h = auth_header(buyer_token(c, "+916300000001"))
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid, "message": "Hi"}, headers=h)
     assert r.status_code == 201, r.text
     body = r.json()
@@ -60,11 +60,11 @@ def test_create_gates(client):
     c, session = client
     lid = seed_listing(session)
     assert c.post("/buyer/enquiries", json={"property_listing_id": lid}).status_code == 401
-    tok = buyer_token(c, "+16300000002")
+    tok = buyer_token(c, "+916300000002")
     h = auth_header(tok)
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
     assert c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=h).status_code == 403
-    buyer = buyer_token(c, "+16300000003")
+    buyer = buyer_token(c, "+916300000003")
     hb = auth_header(buyer)
     bad_ids = []
     for kwargs in ({"verification": "PENDING"}, {"status": "SOLD"}):
@@ -84,7 +84,7 @@ def test_create_gates(client):
 def test_duplicate_prevented_and_closed_allows_new(client):
     c, session = client
     lid = seed_listing(session)
-    h = auth_header(buyer_token(c, "+16300000004"))
+    h = auth_header(buyer_token(c, "+916300000004"))
     first = c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=h).json()
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=h)
     assert r.status_code == 200  # idempotent duplicate, not a second row
@@ -106,8 +106,8 @@ def test_duplicate_prevented_and_closed_allows_new(client):
 
 def test_list_and_detail_scoping(client):
     c, session = client
-    ha = auth_header(buyer_token(c, "+16300000005"))
-    hb = auth_header(buyer_token(c, "+16300000006"))
+    ha = auth_header(buyer_token(c, "+916300000005"))
+    hb = auth_header(buyer_token(c, "+916300000006"))
     l1, l2 = seed_listing(session), seed_listing(session)
     a1 = c.post("/buyer/enquiries", json={"property_listing_id": l1}, headers=ha).json()["id"]
     b1 = c.post("/buyer/enquiries", json={"property_listing_id": l2}, headers=hb).json()["id"]

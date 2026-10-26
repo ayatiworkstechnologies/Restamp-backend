@@ -16,7 +16,7 @@ from app.config import (
 )
 from app.routers.auth import _client_ip
 from app.services.otp import OTPService
-from tests.conftest import auth_header, register_phone
+from tests.conftest import TestSMSInbox, auth_header, register_phone
 
 
 # --- Unit: production detection (no DB) -------------------------------------
@@ -62,8 +62,6 @@ def test_jwt_strong_secret_accepted():
 def test_validate_passes_local_with_dev_flags(monkeypatch):
     monkeypatch.setattr(config_module.settings, "ENV", "local")
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "short")
-    monkeypatch.setattr(config_module.settings, "OTP_DEBUG", True)
-    monkeypatch.setattr(config_module.settings, "OTP_DEMO_MODE", True)
     monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", True)
     validate_security_config()  # no-op locally
 
@@ -71,8 +69,6 @@ def test_validate_passes_local_with_dev_flags(monkeypatch):
 def test_validate_fails_prod_weak_jwt(monkeypatch):
     monkeypatch.setattr(config_module.settings, "ENV", "production")
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "short")
-    monkeypatch.setattr(config_module.settings, "OTP_DEBUG", False)
-    monkeypatch.setattr(config_module.settings, "OTP_DEMO_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
     with pytest.raises(RuntimeError, match="RESTAMP_JWT_SECRET"):
         validate_security_config()
@@ -81,13 +77,9 @@ def test_validate_fails_prod_weak_jwt(monkeypatch):
 def test_validate_fails_prod_dev_flags(monkeypatch):
     monkeypatch.setattr(config_module.settings, "ENV", "production")
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "z" * 40)
-    for flag in ("OTP_DEBUG", "OTP_DEMO_MODE", "GOOGLE_DEV_MODE"):
-        monkeypatch.setattr(config_module.settings, "OTP_DEBUG", False)
-        monkeypatch.setattr(config_module.settings, "OTP_DEMO_MODE", False)
-        monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
-        monkeypatch.setattr(config_module.settings, flag, True)
-        with pytest.raises(RuntimeError, match="RESTAMP_" + flag.split("_")[0]):
-            validate_security_config()
+    monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", True)
+    with pytest.raises(RuntimeError, match="RESTAMP_GOOGLE"):
+        validate_security_config()
 
 
 def test_validate_errors_never_contain_secret(monkeypatch):
@@ -103,7 +95,8 @@ def test_validate_errors_never_contain_secret(monkeypatch):
 
 def test_otp_per_phone_cap_preserved():
     svc = OTPService()
-    phone = "+15900000101"
+    svc.delivery = TestSMSInbox()
+    phone = "+916900000101"
     for _ in range(5):
         svc.request_code(phone)
     with pytest.raises(HTTPException) as e:
@@ -113,23 +106,25 @@ def test_otp_per_phone_cap_preserved():
 
 def test_otp_per_ip_request_cap_across_phones():
     svc = OTPService()
+    svc.delivery = TestSMSInbox()
     ip = "10.9.9.1"
     for i in range(30):
-        svc.request_code(f"+1590010{i:04d}", ip=ip)
+        svc.request_code(f"+91690010{i:04d}", ip=ip)
     with pytest.raises(HTTPException) as e:
-        svc.request_code("+15900999999", ip=ip)
+        svc.request_code("+916900999999", ip=ip)
     assert e.value.status_code == 429
     # Different IP unaffected.
-    svc.request_code("+15900999998", ip="10.9.9.2")
+    svc.request_code("+916900999998", ip="10.9.9.2")
 
 
 def test_otp_phone_rotation_still_bounded_by_ip(monkeypatch):
     svc = OTPService()
+    svc.delivery = TestSMSInbox()
     monkeypatch.setattr(config_module.settings, "OTP_MAX_VERIFY_ATTEMPTS_PER_IP", 5)
     ip = "10.9.9.3"
     tripped = False
     for i in range(6):
-        phone = f"+1590020{i:04d}"
+        phone = f"+91690020{i:04d}"
         svc.request_code(phone, ip=ip)
         try:
             svc.verify_code(phone, "000000", ip=ip)
@@ -142,18 +137,21 @@ def test_otp_phone_rotation_still_bounded_by_ip(monkeypatch):
 
 def test_otp_reset_clears_ip_state():
     svc = OTPService()
+    svc.delivery = TestSMSInbox()
     ip = "10.9.9.4"
     for i in range(30):
-        svc.request_code(f"+1590030{i:04d}", ip=ip)
+        svc.request_code(f"+91690030{i:04d}", ip=ip)
     svc.reset()
-    svc.request_code("+15900999997", ip=ip)  # no longer blocked
+    svc.request_code("+916900999997", ip=ip)  # no longer blocked
 
 
 def test_otp_backward_compat_no_ip():
     svc = OTPService()
-    code = svc.request_code("+15900000102")
-    assert code is not None  # OTP_DEBUG=1 in test env
-    assert svc.verify_code("+15900000102", code) is True
+    inbox = TestSMSInbox()
+    svc.delivery = inbox
+    assert svc.request_code("+916900000102") is None  # codes are never returned
+    code = inbox.codes["+916900000102"]  # read the SMS via the test inbox
+    assert svc.verify_code("+916900000102", code) is True
 
 
 # --- Integration: POST /users disabled, OTP + profile preserved (restamp_dev rollback) ---
@@ -170,7 +168,7 @@ def test_post_users_disabled_no_creation(client):
 
 def test_otp_registration_and_profile_setup_still_work(client):
     c, _ = client
-    phone = "+10000000301"
+    phone = "+916000000301"
     tok = register_phone(c, phone)
     h = auth_header(tok["access_token"])
     me = c.get("/auth/me", headers=h).json()
@@ -182,7 +180,7 @@ def test_otp_registration_and_profile_setup_still_work(client):
 
 def test_owner_broker_self_serve_preserved(client):
     c, _ = client
-    tok = register_phone(c, "+10000000302")
+    tok = register_phone(c, "+916000000302")
     h = auth_header(tok["access_token"])
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=h).status_code == 200
     assert c.post("/users/me/role", json={"role": "BROKER"}, headers=h).status_code == 200
@@ -191,11 +189,11 @@ def test_owner_broker_self_serve_preserved(client):
 
 def test_otp_request_verify_contract_preserved(client):
     c, _ = client
-    r = c.post("/auth/otp/request", json={"phone": "+10000000303"})
+    r = c.post("/auth/otp/request", json={"phone": "+916000000303"})
     assert r.status_code == 200
-    assert r.json()["message"] == "If the number is valid, an OTP was sent."
-    assert "debug_code" in r.json()  # test env OTP_DEBUG=1
-    bad = c.post("/auth/otp/verify", json={"phone": "+10000000303", "code": "000000"})
+    # Constant body, zero disclosure: no debug_code can exist in responses.
+    assert r.json() == {"message": "If the number is valid, an OTP was sent."}
+    bad = c.post("/auth/otp/verify", json={"phone": "+916000000303", "code": "000000"})
     assert bad.status_code == 401
 
 
@@ -203,16 +201,10 @@ def test_otp_request_verify_contract_preserved(client):
 
 def test_cors_wildcard_rejected_in_production(monkeypatch):
     from app import config as config_module
-    from app.services import otp as otp_module
     monkeypatch.setattr(config_module.settings, "ENV", "production")
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "z" * 40)
-    monkeypatch.setattr(config_module.settings, "OTP_DEBUG", False)
-    monkeypatch.setattr(config_module.settings, "OTP_DEMO_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_ENABLED", False)
-    monkeypatch.setattr(config_module.settings, "SMS_PROVIDER", "fake-vendor")
-    monkeypatch.setitem(otp_module.PRODUCTION_SMS_PROVIDERS,
-                        "fake-vendor", otp_module.DevOTPProvider)
     monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "https://app.example.com, *")
     with pytest.raises(RuntimeError, match="CORS_ORIGINS"):
         validate_security_config()
@@ -341,16 +333,10 @@ def test_local_docs_available():
 # Missing Cloudinary in production warns loudly at startup but stays a
 # non-fatal decision (fail-fast would be a behavior change needing approval).
 def _prod_static_media_settings(monkeypatch, cloud_name: str) -> None:
-    from app.services import otp as otp_module
     monkeypatch.setattr(config_module.settings, "ENV", "production")
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "z" * 40)
-    monkeypatch.setattr(config_module.settings, "OTP_DEBUG", False)
-    monkeypatch.setattr(config_module.settings, "OTP_DEMO_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_ENABLED", False)
-    monkeypatch.setattr(config_module.settings, "SMS_PROVIDER", "fake-vendor")
-    monkeypatch.setitem(otp_module.PRODUCTION_SMS_PROVIDERS,
-                        "fake-vendor", otp_module.DevOTPProvider)
     monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "https://app.example.com")
     monkeypatch.setattr(config_module.settings, "CLOUDINARY_CLOUD_NAME", cloud_name)
 
