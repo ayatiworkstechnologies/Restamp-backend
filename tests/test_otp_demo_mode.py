@@ -11,7 +11,11 @@ Boundaries tested here:
   demo-code path exists in verification;
 - a deployed demo service (RESTAMP_ENV=demo + remote DATABASE_URL, which
   is_production() classifies as production BY DESIGN) still enforces the full
-  production hardening (strong JWT, no OTP_DEBUG, no CORS '*').
+  production hardening (strong JWT, no OTP_DEBUG, no CORS '*');
+- a production-classified demo REFUSES startup without a non-empty
+  RESTAMP_OTP_DEMO_PHONES allowlist (private test phones); with one, demo
+  issuance is exact-match only and every other phone fails closed with no
+  OTP state and no rate-limit budget consumed.
 
 No SMS is sent anywhere; the provider is never involved in the demo path.
 """
@@ -246,8 +250,8 @@ def test_demo_env_gets_refusing_provider(monkeypatch):
 def test_deployed_demo_service_keeps_full_production_hardening(monkeypatch):
     """A production-classified demo deployment must still fail on weak JWT,
     OTP_DEBUG, CORS '*' or Google dev mode — demo is not a weaker prod."""
-    _deployed(monkeypatch, "demo", OTP_DEMO_MODE=True)
-    validate_security_config()  # demo + flag passes with a strong JWT
+    _deployed(monkeypatch, "demo", OTP_DEMO_MODE=True, OTP_DEMO_PHONES="+15550000001")
+    validate_security_config()  # demo + flag + allowlist passes with a strong JWT
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "short")
     with pytest.raises(RuntimeError, match="RESTAMP_JWT_SECRET"):
         validate_security_config()
@@ -269,3 +273,107 @@ def test_production_and_staging_refuse_demo_flag(monkeypatch):
     _deployed(monkeypatch, "staging", OTP_DEMO_MODE=True)
     with pytest.raises(RuntimeError, match="RESTAMP_OTP_DEMO_MODE"):
         validate_security_config()
+
+
+# --- demo-phone allowlist (RESTAMP_OTP_DEMO_PHONES) ---------------------------
+
+def test_local_demo_without_allowlist_keeps_any_phone(monkeypatch):
+    """Empty allowlist (default) outside production classification: demo
+    issuance is unchanged for ANY phone and demo_phone_allowed is True."""
+    _demo_on(monkeypatch)  # no OTP_DEMO_PHONES configured
+    assert config_module.demo_phone_allowed("+15550006001") is True
+    svc = OTPService(provider=DisabledOTPProvider())
+    assert svc.request_code("+15550006001") in DEMO_OTPS
+
+
+def test_demo_allowlist_restricts_local_demo_issuance(monkeypatch):
+    """Configured allowlist: ONLY listed phones take the demo path. An
+    unlisted phone fails closed (503), leaves NO OTP state and consumes NO
+    rate-limit budget (six consecutive 503s never trip the 5/hour cap)."""
+    _demo_on(monkeypatch, OTP_DEMO_PHONES="+15550003001, +1 555 000 3002")
+    svc = OTPService(provider=DisabledOTPProvider())
+    code1 = svc.request_code("+15550003001")
+    assert code1 in DEMO_OTPS
+    assert svc.verify_code("+15550003001", code1) is True  # single use intact
+    assert svc.request_code("+15550003002") in DEMO_OTPS  # spaced entry matches
+    for _ in range(6):
+        with pytest.raises(HTTPException) as info:
+            svc.request_code("+15550003003")
+        assert info.value.status_code == 503
+        assert info.value.detail == "Failed to send code. Try again later."
+    assert "+15550003003" not in svc._codes  # no OTP state was left behind
+    assert "+15550003003" not in svc._requests  # no rate budget was consumed
+    assert svc.request_code("+15550003001") in DEMO_OTPS  # listed unaffected
+
+
+def test_demo_allowlist_entries_are_normalized(monkeypatch):
+    """Entries normalize to exact E.164 (spaces/commas/stray pluses
+    tolerated, digits-less entries dropped). Malformed entries can never
+    widen or wildcard the list, and a production-classified demo with an
+    effectively-empty allowlist cannot boot (previous tests cover the
+    local any-phone behavior for an empty allowlist)."""
+    _demo_on(monkeypatch, OTP_DEMO_PHONES=" +1 555 000 7001 , 15550007002, x ")
+    svc = OTPService(provider=DisabledOTPProvider())
+    assert svc.request_code("+15550007001") in DEMO_OTPS
+    assert svc.request_code("+15550007002") in DEMO_OTPS
+    for junk in ("not-a-phone", "  ", "x"):
+        _demo_on(monkeypatch, OTP_DEMO_PHONES=junk)
+        # Malformed entries are DROPPED, never normalized into a match-all.
+        assert config_module.demo_phone_allowlist() == frozenset()
+    # ...and where it matters (production-classified demo), an effectively
+    # empty allowlist refuses startup instead of opening the demo up:
+    _deployed(monkeypatch, "demo", OTP_DEMO_MODE=True, OTP_DEMO_PHONES="x, ")
+    with pytest.raises(RuntimeError, match="RESTAMP_OTP_DEMO_PHONES"):
+        validate_security_config()
+
+
+def test_deployed_demo_requires_non_empty_allowlist(monkeypatch):
+    """Production-classified demo without the allowlist REFUSES startup."""
+    _deployed(monkeypatch, "demo", OTP_DEMO_MODE=True)
+    with pytest.raises(RuntimeError, match="RESTAMP_OTP_DEMO_PHONES"):
+        validate_security_config()
+
+
+def test_non_allowlisted_phone_fails_closed_on_deployed_demo(client, monkeypatch):
+    """Deployed demo with the allowlist: the listed phone completes the full
+    e2e demo login; EVERY unlisted request is a pre-accounting 503 (no OTP
+    state, no rate budget) and verification itself never succeeds for it."""
+    _deployed(monkeypatch, "demo", OTP_DEMO_MODE=True, OTP_DEMO_PHONES="+15550004001")
+    validate_security_config()  # allowlist present: boots cleanly
+    c, _ = client
+    listed = "+15550004001"
+    r = c.post("/auth/otp/request", json={"phone": listed})
+    assert r.status_code == 200, r.text
+    selected = r.json().get("debug_code")
+    assert selected in DEMO_OTPS
+    wrong = next(x for x in ALL_DEMO if x != selected)
+    r_wrong = c.post("/auth/otp/verify", json={"phone": listed, "code": wrong})
+    assert r_wrong.status_code == 401, r_wrong.text
+    r_ok = c.post("/auth/otp/verify", json={"phone": listed, "code": selected})
+    assert r_ok.status_code == 200, r_ok.text
+    assert "access_token" in r_ok.json()
+    unlisted = "+15550004002"
+    for _ in range(6):
+        ru = c.post("/auth/otp/request", json={"phone": unlisted})
+        assert ru.status_code == 503, ru.text
+        assert ru.json() == {
+            "detail": "OTP delivery is not configured. Try again later."
+        }
+    assert otp_module.otp_service._codes.get(unlisted) is None  # no OTP state
+    rv = c.post("/auth/otp/verify", json={"phone": unlisted, "code": "999999"})
+    assert rv.status_code == 401, rv.text
+
+
+def test_demo_disabled_with_allowlist_changes_nothing(monkeypatch):
+    """The allowlist alone NEVER enables demo: with the flag off the phone
+    walks the ordinary (dev/debug) path — no predefined-code issuance."""
+    _demo_on(monkeypatch, OTP_DEMO_MODE=False, OTP_DEMO_PHONES="+15550005001")
+    assert otp_module.demo_login_active() is False
+    monkeypatch.setattr(config_module.settings, "OTP_LENGTH", 4)
+    svc = OTPService()
+    real = svc.request_code("+15550005001")  # ordinary 4-digit code (debug tests)
+    assert real is not None and len(real) == 4
+    # A 4-digit ordinary code can never equal a 6-digit predefined code; the
+    # cap is raised (suite precedent) so the whole candidate list is swept.
+    monkeypatch.setattr(config_module.settings, "OTP_MAX_VERIFY_ATTEMPTS", 20)
+    assert all(svc.verify_code("+15550005001", x) is False for x in ALL_DEMO)

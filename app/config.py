@@ -101,6 +101,14 @@ class Settings:
     # LOCAL DEMO ONLY: when "1", a fixed set of demo OTPs is accepted by
     # verify_code (a prior OTP request must still exist). Absent/disabled:
     # no effect whatsoever (production behavior unchanged).
+    # Private TEST phone numbers allowed to receive the demo code in the
+    # demo OTP login. Entries tolerate spacing/separators but are normalized
+    # to exact E.164 (one leading "+", digits only — see
+    # demo_phone_allowlist()). Local non-production demo without it keeps
+    # the any-phone behavior; a production-classified demo deployment MUST
+    # configure it — startup refuses demo mode with an empty allowlist.
+    # Never list real user numbers; set it privately in the host dashboard.
+    OTP_DEMO_PHONES: str = _get("RESTAMP_OTP_DEMO_PHONES", "")
 
     # Google verification. Real verification needs GOOGLE_CLIENT_ID and a real
     # verifier; dev mode accepts only synthetic "dev:<subject>" tokens.
@@ -190,6 +198,46 @@ def is_production() -> bool:
         return True
 
 
+def _norm_demo_phone(raw: str) -> str:
+    """Normalize one phone/allowlist entry to exact E.164: digits only with a
+    single leading "+". Spacing, separators and stray pluses are tolerated in
+    entries; anything without digits normalizes to "" and never matches.
+
+    Normalization is exact-by-construction: it cannot invent or widen a
+    number, only drop non-digits and collapse separators.
+    """
+    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
+    return "+" + digits if digits else ""
+
+
+def demo_phone_allowlist() -> frozenset[str]:
+    """The normalized RESTAMP_OTP_DEMO_PHONES allowlist (empty when unset).
+
+    Matching is EXACT against the normalized values; a malformed entry can
+    never widen the list (fail closed). Normalization runs when the list is
+    built AND when a phone is compared, so configuration noise never creates
+    a mismatched bypass.
+    """
+    raw = settings.OTP_DEMO_PHONES or ""
+    return frozenset(
+        norm for norm in (_norm_demo_phone(part) for part in raw.split(",")) if norm
+    )
+
+
+def demo_phone_allowed(phone: str) -> bool:
+    """Whether this phone may receive a demo OTP.
+
+    Empty allowlist: True — LOCAL non-production demo only (the startup gate
+    refuses demo mode without an allowlist whenever the deployment is
+    production-classified). Configured allowlist: exact normalized
+    membership only; nobody else is demo-issued anything.
+    """
+    allowed = demo_phone_allowlist()
+    if not allowed:
+        return True
+    return _norm_demo_phone(phone) in allowed
+
+
 def is_jwt_secret_strong(secret: str | None) -> bool:
     """Check length + blocklist without ever logging the value."""
     if not secret or not isinstance(secret, str):
@@ -259,6 +307,24 @@ def validate_security_config() -> None:
             "(production-classified via its DATABASE_URL) the JWT/CORS/Google "
             "checks below still run exactly as in production."
         )
+        if settings.OTP_DEMO_MODE:
+            allowlist = demo_phone_allowlist()
+            if not allowlist and is_production():
+                # A deployed demo on a production-classified DATABASE_URL is
+                # permitted ONLY with an explicit private test-phone
+                # allowlist — otherwise any caller could read a returned code
+                # and log in as any phone number on that database.
+                raise RuntimeError(
+                    "Insecure production configuration: RESTAMP_OTP_DEMO_MODE=1 "
+                    "on a production-classified deployment requires a non-empty "
+                    "RESTAMP_OTP_DEMO_PHONES allowlist of private test phones."
+                )
+            if not allowlist:
+                _log.warning(
+                    "Demo login without RESTAMP_OTP_DEMO_PHONES: ANY phone "
+                    "receives the demo code (acceptable only outside "
+                    "production classification)."
+                )
     elif settings.OTP_DEMO_MODE:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_OTP_DEMO_MODE must be '0' "

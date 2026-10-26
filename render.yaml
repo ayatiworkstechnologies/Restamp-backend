@@ -139,6 +139,13 @@ services:
       # activate the predefined-code login; either one alone stays fail-closed.
       - key: RESTAMP_OTP_DEMO_MODE
         value: "1"
+      # Private test phones ONLY (comma-separated, normalize to exact E.164;
+      # set privately in the dashboard — never in this file). On a
+      # production-classified demo the startup gate refuses demo mode
+      # without this allowlist. NEVER a real user's number. (Local demo
+      # without it keeps the any-phone behavior.)
+      - key: RESTAMP_OTP_DEMO_PHONES
+        sync: false
       # Debug codes stay forbidden even on demo (the selected predefined
       # code is returned by the demo flow itself, never by OTP_DEBUG).
       - key: RESTAMP_OTP_DEBUG

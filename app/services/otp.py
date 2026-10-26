@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 import httpx
 from fastapi import HTTPException, status
 
-from ..config import settings
+from ..config import demo_phone_allowed, settings
 
 log = logging.getLogger("restamp.otp")
 
@@ -359,12 +359,16 @@ class OTPService:
         selects one PREDEFINED code (DEMO_OTPS), stores it with the normal
         expiry/limits and returns it for display; no SMS provider is involved
         and verification later accepts exactly that stored code. Public
-        production never reaches this path (see demo_login_active()).
+        production never reaches this path (see demo_login_active()), and on
+        a production-classified demo only explicitly allowlisted private
+        test phones (RESTAMP_OTP_DEMO_PHONES) do — every other phone fails
+        closed at the provider guard BEFORE any rate accounting or code
+        generation.
         """
         with self._lock:
             self._ensure_not_blocked(phone)
             self._ensure_ip_not_blocked(ip)
-            demo = demo_login_active()
+            demo = demo_login_active() and demo_phone_allowed(phone)
             if not demo:
                 self._ensure_provider_allowed()
             now = time.time()
