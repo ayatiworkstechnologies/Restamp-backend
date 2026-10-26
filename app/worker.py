@@ -60,6 +60,7 @@ async def _process_due_listings() -> int:
             .filter(
                 PropertyListing.verification_status == "PENDING",
                 PropertyListing.listing_status == "AVAILABLE",
+                PropertyListing.deleted_at.is_(None),
                 PropertyListing.submitted_at.is_not(None),
                 PropertyListing.submitted_at <= cutoff,
             )

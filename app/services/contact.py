@@ -23,6 +23,7 @@ def reveal_contact(db: Session, buyer_id: int, listing_id: int) -> tuple[str, ob
             PropertyListing.id == listing_id,
             PropertyListing.verification_status == "VERIFIED",
             PropertyListing.listing_status == "AVAILABLE",
+            PropertyListing.deleted_at.is_(None),
         )
         .first()
     )

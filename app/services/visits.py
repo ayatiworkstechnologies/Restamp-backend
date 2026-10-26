@@ -46,13 +46,20 @@ def _normalize_scheduled_at(value: datetime) -> datetime:
 
 
 def _visible_listing(db: Session, listing_id: int) -> PropertyListing:
+    """Fetch a publicly visible listing and lock its row for the duration of
+    the transaction. The row lock serializes competing visit-creation and
+    reschedule requests for the same listing, preventing duplicate active
+    visits under concurrency.
+    """
     listing = (
         db.query(PropertyListing)
         .filter(
             PropertyListing.id == listing_id,
             PropertyListing.verification_status == "VERIFIED",
             PropertyListing.listing_status == "AVAILABLE",
+            PropertyListing.deleted_at.is_(None),
         )
+        .with_for_update()
         .first()
     )
     if listing is None:
@@ -368,6 +375,11 @@ def transition_visit(
                 f"Only {editors[0]} may reschedule a {original_status} visit"
             )
         next_moment = _normalize_scheduled_at(scheduled_at)
+        # Lock the parent listing row to serialize competing reschedule
+        # requests for the same buyer+listing pair.
+        db.query(PropertyListing.id).filter(
+            PropertyListing.id == visit.property_listing_id
+        ).with_for_update().first()
         if _has_active_visit_for_buyer_listing(
             db,
             visit.property_listing_id,

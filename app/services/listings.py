@@ -55,6 +55,7 @@ def _visible(q):
     return q.filter(
         PropertyListing.verification_status == "VERIFIED",
         PropertyListing.listing_status == "AVAILABLE",
+        PropertyListing.deleted_at.is_(None),
     )
 
 

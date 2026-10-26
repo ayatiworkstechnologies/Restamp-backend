@@ -21,6 +21,7 @@ def _visible_listing(db: Session, listing_id: int) -> PropertyListing:
             PropertyListing.id == listing_id,
             PropertyListing.verification_status == "VERIFIED",
             PropertyListing.listing_status == "AVAILABLE",
+            PropertyListing.deleted_at.is_(None),
         )
         .first()
     )

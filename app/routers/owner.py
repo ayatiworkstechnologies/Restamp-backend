@@ -542,25 +542,24 @@ def delete_listing(
     db: Session = Depends(get_db),
     owner_id: int = Depends(require_owner),
 ):
-    """Permanently delete the caller's own listing.
+    """Soft-delete (remove) the caller's own listing.
+
+    Sets deleted_at = now() instead of hard-deleting: the listing row and all
+    historical relationships (enquiries, visits, verifications, saved
+    properties, audits) are preserved. Media rows are retained for history
+    and possible restoration — no Cloudinary assets are destroyed.
 
     Enforces dual-authority ownership (PropertyListing.user_id AND
     PhysicalProperty.user_id both equal the caller). Returns 404 when the
     listing does not belong to the caller or does not exist — never a
-    cross-owner leak.
-
-    Deletes the listing row and its cascade-related records per the existing
-    FK constraints (enquiries, visits, verifications, media, documents,
-    rent terms, amenities, saved properties are cascade-deleted;
-    contact_reveal_audits.listing_id is set to NULL, preserving the audit
-    row). Cloudinary media assets are destroyed best-effort after the DB
-    commit; a storage failure never fails the request.
+    cross-owner leak. Idempotent: removing an already-removed listing
+    returns 204 without error.
 
     Returns 204 No Content on success.
     """
     sp = db.begin_nested()
     try:
-        deleted, public_ids = owner_svc.delete_owner_listing(db, owner_id, listing_id)
+        deleted, _public_ids = owner_svc.delete_owner_listing(db, owner_id, listing_id)
         if not deleted:
             sp.rollback()
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
@@ -570,14 +569,7 @@ def delete_listing(
         raise
     except Exception:
         sp.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Delete failed")
-    # Best-effort Cloudinary cleanup after the DB commit succeeded. A storage
-    # failure leaves orphaned assets but never fails the deletion request.
-    for public_id in public_ids:
-        try:
-            photo_storage.delete_uploaded_image(public_id)
-        except Exception:
-            pass
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Remove failed")
     return None
 
 
