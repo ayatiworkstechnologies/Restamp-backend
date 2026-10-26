@@ -211,7 +211,10 @@ def validate_security_config() -> None:
 
     Safe in local/dev/test (no-op). Raises RuntimeError in production when:
     - JWT secret is missing, weak (<32 chars), or a known placeholder;
-    - RESTAMP_OTP_DEBUG / OTP_DEMO_MODE / GOOGLE_DEV_MODE are enabled;
+    - RESTAMP_OTP_DEBUG / GOOGLE_DEV_MODE are enabled;
+    - RESTAMP_OTP_DEMO_MODE is enabled anywhere except RESTAMP_ENV=demo (
+      the dedicated demo/staging deployment; production never accepts the
+      fixed demo codes);
     - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
     - no production SMS provider is configured (RESTAMP_SMS_PROVIDER must
       name a registered production provider);
@@ -230,10 +233,36 @@ def validate_security_config() -> None:
             "Insecure production configuration: RESTAMP_OTP_DEBUG must be '0' "
             "in production (OTP codes must never be returned in API responses)."
         )
-    if settings.OTP_DEMO_MODE:
+    # RESTAMP_OTP_DEMO_MODE=1 is allowed ONLY with RESTAMP_ENV=demo: a
+    # dedicated, explicitly named demo/staging deployment. In every other
+    # configuration — production/prod/staging, or any service whose
+    # DATABASE_URL makes is_production() treat it as production — fixed demo
+    # codes are refused at startup exactly as before. The demo OTP flow
+    # itself (selection/return/verify of one predefined code per request)
+    # lives in app/services/otp.py on demo_login_active().
+    if (settings.ENV or "").strip().lower() == "demo":
+        if not settings.OTP_DEMO_MODE:
+            _log.warning(
+                "RESTAMP_ENV=demo without RESTAMP_OTP_DEMO_MODE=1: the demo "
+                "OTP login is INACTIVE. Enable RESTAMP_OTP_DEMO_MODE=1 to use "
+                "the predefined demo codes."
+            )
+        else:
+            _log.warning(
+                "Demo login ACTIVE (RESTAMP_ENV=demo + RESTAMP_OTP_DEMO_MODE=1): "
+                "OTP requests return a selected predefined demo code and no "
+                "SMS is sent. This must never be combined with a real "
+                "production service configuration."
+            )
+        _log.warning(
+            "Demo configuration hardening: on a deployed demo service "
+            "(production-classified via its DATABASE_URL) the JWT/CORS/Google "
+            "checks below still run exactly as in production."
+        )
+    elif settings.OTP_DEMO_MODE:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_OTP_DEMO_MODE must be '0' "
-            "in production (fixed demo codes must never be accepted)."
+            "in production (fixed demo codes require RESTAMP_ENV=demo)."
         )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(

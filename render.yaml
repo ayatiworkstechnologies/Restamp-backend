@@ -99,3 +99,81 @@ services:
         value: ""
       - key: RESTAMP_GOOGLE_DEV_MODE
         value: "0"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # SEPARATE DEMO/STAGING SERVICE — safe temporary demo OTP login.
+  # ══════════════════════════════════════════════════════════════════════════
+  # A dedicated deployment (RESTAMP_ENV=demo + RESTAMP_OTP_DEMO_MODE=1):
+  # each OTP request SELECTS one predefined code (DEMO_OTPS in
+  # app/services/otp.py) and returns it as debug_code for display — the
+  # backend verifies ONLY that selected code (normal expiry, attempt caps,
+  # consumed-once, rate limits; no other predefined code is accepted). No
+  # SMS is sent and no MSG91 configuration is needed here.
+  #
+  # Hard boundaries (enforced by validate_security_config + otp.py):
+  #   - the PUBLIC production service above keeps
+  #     RESTAMP_ENV=production + RESTAMP_OTP_DEMO_MODE=0 + SMS disabled:
+  #     it can never accept predefined demo codes;
+  #   - RESTAMP_ENV=demo still enforces a strong dedicated JWT secret, no
+  #     RESTAMP_OTP_DEBUG, no RESTAMP_CORS_ORIGINS='*', no Google dev mode;
+  #   - the demo database MUST be a separate one — never the production DB,
+  #     and never real customer data.
+  # NOTE: if Render blueprint Auto-Sync is enabled, applying this blueprint
+  # CREATES the demo service (free plan, sync:false placeholders unset until
+  # you fill them in the dashboard). The service is otherwise inert.
+  - type: web
+    name: restamp-backend-demo
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    envVars:
+      # Dedicated demo environment class — NOT "staging" (staging is treated
+      # as production by design). Required for the demo OTP login.
+      - key: RESTAMP_ENV
+        value: "demo"
+      # Two-part demo switch: RESTAMP_ENV=demo AND this flag together
+      # activate the predefined-code login; either one alone stays fail-closed.
+      - key: RESTAMP_OTP_DEMO_MODE
+        value: "1"
+      # Debug codes stay forbidden even on demo (the selected predefined
+      # code is returned by the demo flow itself, never by OTP_DEBUG).
+      - key: RESTAMP_OTP_DEBUG
+        value: "0"
+      # Same protections and limits as production.
+      - key: RESTAMP_OTP_TTL_SECONDS
+        value: "300"
+      - key: RESTAMP_OTP_MAX_REQUESTS_PER_HOUR
+        value: "5"
+      - key: RESTAMP_OTP_MAX_VERIFY_ATTEMPTS
+        value: "5"
+      - key: RESTAMP_OTP_BLOCK_SECONDS
+        value: "900"
+      - key: RESTAMP_TRUST_PROXY
+        value: "1"
+      # Separate demo database (Set in the dashboard; NEVER reuse the
+      # production database and never real customer data).
+      - key: RESTAMP_DATABASE_URL
+        sync: false
+      # Dedicated JWT secret, generated independently (verify >= 32 chars).
+      - key: RESTAMP_JWT_SECRET
+        generateValue: true
+      - key: RESTAMP_JWT_EXPIRE_MINUTES
+        value: "30"
+      # SMS unused in demo: the disabled mode keeps any accidental non-demo
+      # request path failing closed (generic 503) exactly like production.
+      - key: RESTAMP_SMS_MODE
+        value: "disabled"
+      # Demo web origin(s) of the demo frontend build (Set in the dashboard
+      # if you use the web app there; never '*' with credentials).
+      - key: RESTAMP_CORS_ORIGINS
+        sync: false
+      - key: RESTAMP_GOOGLE_CLIENT_ID
+        value: ""
+      - key: RESTAMP_GOOGLE_DEV_MODE
+        value: "0"
+      - key: RESTAMP_GOOGLE_ENABLED
+        value: "0"

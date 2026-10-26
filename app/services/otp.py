@@ -33,9 +33,13 @@ log = logging.getLogger("restamp.otp")
 for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-# LOCAL DEMO ONLY: fixed six-digit codes accepted by verify_code when
-# RESTAMP_OTP_DEMO_MODE=1 (and only then). Never returned, displayed, or
-# logged anywhere; a prior unexpired OTP request is still required.
+# LOCAL DEMO ONLY: the fixed six-digit codes used by the demo OTP login
+# (RESTAMP_ENV=demo + RESTAMP_OTP_DEMO_MODE=1). Each OTP request SELECTS one
+# of these codes, stores it against the requested phone (normal lifecycle /
+# expiry / limits) and returns it for display; verification then follows the
+# ordinary strict path, so ONLY the selected code works. In every other
+# configuration these are ordinary unpredictable codes: never returned,
+# displayed, or logged, and production startup refuses the demo flags.
 DEMO_OTPS = frozenset({
     "297569", "109745", "583214", "741806", "426391",
     "835027", "614958", "372640", "958163", "205874",
@@ -233,18 +237,44 @@ def is_sms_disabled() -> bool:
     return _configured_sms_mode() == "disabled"
 
 
+def demo_login_active() -> bool:
+    """True ONLY for the dedicated demo environment: RESTAMP_ENV=demo AND
+    RESTAMP_OTP_DEMO_MODE=1.
+
+    Two-part explicit switch behind the temporary demo OTP login: an OTP
+    request then SELECTS one predefined code (DEMO_OTPS), stores it with the
+    normal lifecycle/expiry/limits, and returns it for display; verification
+    follows the ordinary strict path, so exactly that selected code works for
+    that phone — the other predefined codes stand rejected. The public
+    production service cannot activate this: the startup gate refuses
+    RESTAMP_OTP_DEMO_MODE=1 anywhere except RESTAMP_ENV=demo, and no other
+    demo-code path exists in this file.
+    """
+    return (
+        (settings.ENV or "").strip().lower() == "demo"
+        and bool(settings.OTP_DEMO_MODE)
+    )
+
+
 def get_otp_provider() -> OTPProvider:
     """Resolve the OTP provider for the current environment.
 
-    Local/dev/test always get DevOTPProvider (the disabled mode is a
-    production concern — it never changes local development). Production
-    gets the deferred DisabledOTPProvider in the explicit disabled mode, else
-    the configured registered provider, else RuntimeError naming only the
-    setting (never values). Called at startup (fail fast) and available to
-    request paths.
+    The dedicated demo environment gets DisabledOTPProvider (demo login
+    selects and returns a predefined code; nothing is ever sent there — an
+    accidental non-demo request still fails closed). Local/dev/test always
+    get DevOTPProvider (the disabled mode is a production concern — it never
+    changes local development). Production gets the deferred
+    DisabledOTPProvider in the explicit disabled mode, else the configured
+    registered provider, else RuntimeError naming only the setting (never
+    values). Called at startup (fail fast) and available to request paths.
     """
     from ..config import is_production
 
+    if demo_login_active():
+        # The demo login never sends anything: the selected predefined code
+        # is returned directly in the response. Install the refusing
+        # provider so an accidental non-demo request would still fail closed.
+        return DisabledOTPProvider()
     if not is_production():
         return DevOTPProvider()
     if _configured_sms_mode() not in SMS_MODES:
@@ -324,11 +354,19 @@ class OTPService:
         rolls back this request's OTP state before raising a generic 503, so
         a failed delivery never leaves a live-but-undelivered code behind.
         API contract unchanged on success: same return, same 429 shapes.
+
+        Dedicated demo environment (RESTAMP_ENV=demo + RESTAMP_OTP_DEMO_MODE=1):
+        selects one PREDEFINED code (DEMO_OTPS), stores it with the normal
+        expiry/limits and returns it for display; no SMS provider is involved
+        and verification later accepts exactly that stored code. Public
+        production never reaches this path (see demo_login_active()).
         """
         with self._lock:
             self._ensure_not_blocked(phone)
             self._ensure_ip_not_blocked(ip)
-            self._ensure_provider_allowed()
+            demo = demo_login_active()
+            if not demo:
+                self._ensure_provider_allowed()
             now = time.time()
             window = [t for t in self._requests.get(phone, []) if now - t < 3600]
             if len(window) >= settings.OTP_MAX_REQUESTS_PER_HOUR:
@@ -349,6 +387,18 @@ class OTPService:
                 self._ip_requests[ip] = ip_window
             window.append(now)
             self._requests[phone] = window
+            if demo:
+                # Demo login: select one predefined code, store it with the
+                # NORMAL lifecycle (hash, expiry, attempt/consumption rules
+                # unchanged), and return it for display. No provider/send —
+                # no SMS can happen here, and only this selected code will
+                # verify for this phone.
+                code = secrets.choice(tuple(DEMO_OTPS))
+                self._codes[phone] = _Entry(
+                    code_hash=self._hash(phone, code),
+                    expires_at=now + settings.OTP_TTL_SECONDS,
+                )
+                return code
             code = f"{secrets.randbelow(10**settings.OTP_LENGTH):0{settings.OTP_LENGTH}d}"
             entry = _Entry(
                 code_hash=self._hash(phone, code), expires_at=now + settings.OTP_TTL_SECONDS
@@ -415,6 +465,11 @@ class OTPService:
 
         Wrong attempts count against both the phone and (when provided) the
         client IP, so phone rotation does not bypass attempt caps.
+
+        There is NO demo shortcut here: in the dedicated demo environment the
+        request stored the selected predefined code, so this ordinary strict
+        path verifies exactly that code and rejects every other predefined
+        code for that phone (with the normal attempt counting on failures).
         """
         with self._lock:
             self._ensure_not_blocked(phone)
@@ -423,13 +478,6 @@ class OTPService:
             if entry is None or time.time() > entry.expires_at:
                 self._codes.pop(phone, None)
                 return False
-            # LOCAL DEMO ONLY: accept a fixed demo code in place of the
-            # issued code, provided demo mode is enabled and a live OTP
-            # request exists. Consumes the entry like a normal success and
-            # never counts as a wrong attempt. No effect when disabled.
-            if settings.OTP_DEMO_MODE and code in DEMO_OTPS:
-                self._codes.pop(phone, None)
-                return True
             if not secrets.compare_digest(entry.code_hash, self._hash(phone, code)):
                 entry.attempts += 1
                 now = time.time()
