@@ -97,6 +97,10 @@ services:
         value: ""             # comma-separated +91 numbers; empty = all rejected
       - key: RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION
         value: "0"            # "1" also lets allowlisted UNKNOWN phones register
+      - key: RESTAMP_TEST_LOGIN_MODE
+        value: "allowlist"    # or "existing": any +91 with an EXISTING Restamp
+                              # account may log in (no allowlist; no registration;
+                              # unknown phones → 404 "No account found...")
       - key: RESTAMP_TEST_LOGIN_MAX_PER_HOUR_PER_IP
         value: "10"
       - key: RESTAMP_TEST_LOGIN_MAX_PER_HOUR_PER_PHONE

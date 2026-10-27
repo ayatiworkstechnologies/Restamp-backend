@@ -107,7 +107,17 @@ Explicitly supported production testing window — restricted test-only login:
   - production startup REFUSES to boot if enabled with a missing/weak
     key (< 32 chars) or with malformed allowlist entries;
   - attempts are rate limited per IP (10/hr) and per phone (20/hr)
-    before the key check.
+    before the key check;
+  - authorization MODE (`RESTAMP_TEST_LOGIN_MODE`, default `"allowlist"`):
+    in **`"existing"` mode** the allowlist is ignored and ANY valid Indian
+    mobile may log in ONLY when a Restamp account already exists for it —
+    an unknown phone gets the explicit 404 "No account found for this
+    phone number." (key-gated: checked after the key, so it is never an
+    open account-existence oracle), ZERO rows are written, and
+    registration is impossible (`RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION`
+    must stay `"0"` — production refuses otherwise). Production refuses
+    boot for an unknown mode value; at request time an unknown mode keeps
+    the endpoint disabled (exact 404).
   Enable only for bounded test windows, then set the flag back to `"0"`
   and/or rotate the key. Separate from the display mode: enabling one
   never affects the other.

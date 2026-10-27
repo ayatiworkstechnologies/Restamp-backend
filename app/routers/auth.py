@@ -158,6 +158,15 @@ async def test_login(
       generic 403 EVEN WITH a valid key — the empty list rejects every
       phone (fail closed), and no account is ever created or touched for
       a phone outside the list.
+    - Authorization MODE (RESTAMP_TEST_LOGIN_MODE): "allowlist" (default)
+      behaves exactly as above; "existing" permits ONLY phones that
+      ALREADY have a Restamp account — ANY valid Indian mobile with an
+      existing account logs in (allowlist not consulted), an unknown
+      phone gets the explicit 404 "No account found for this phone
+      number." with ZERO rows written, and registration is impossible
+      (production refuses "existing" + registration). The mode check
+      runs strictly AFTER the key verification, so the account-existence
+      message is never an unauthenticated oracle.
     - Attempts are rate limited per IP and per phone AFTER body parsing
       and BEFORE the key check (wrong-key attempts consume budget;
       malformed bodies never do).
@@ -174,6 +183,16 @@ async def test_login(
     ip = _client_ip(request)
     test_login_service.record_attempt(ip=ip, phone=phone)
     test_login_service.require_key(x_test_login_key)
+    if test_login_service.mode() == "existing":
+        # Existing-accounts-only demo login: the allowlist is not consulted
+        # and registration is structurally impossible (the config gate
+        # refuses "existing" + registration at production boot). The
+        # identity is reused exactly as stored — NO rows are created and
+        # verified_by is never rewritten.
+        user = users_roles.find_user_by_identity(db, "phone", phone)
+        test_login_service.require_existing_user(user)
+        db.commit()
+        return _token_for(db, user.id)
     test_login_service.require_phone_allowed(phone)
     user = users_roles.find_user_by_identity(db, "phone", phone)
     # Registration is feature-gated SEPARATELY from the key and allowlist

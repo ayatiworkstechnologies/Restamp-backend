@@ -10,8 +10,16 @@ logging an OTP code:
 - `POST /auth/test-login` issues the same TokenOut as `/auth/otp/verify`,
   but ONLY when ALL guards hold: RESTAMP_TEST_LOGIN_ENABLED=1, the
   request carries the RESTAMP_TEST_LOGIN_KEY value (compared in constant
-  time via `secrets.compare_digest`), AND the phone is on the explicit
-  RESTAMP_TEST_LOGIN_ALLOWED_PHONES allowlist.
+  time via `secrets.compare_digest`), AND the configured authorization
+  mode (RESTAMP_TEST_LOGIN_MODE) holds:
+  * "allowlist" (default): the phone must be on the explicit
+    RESTAMP_TEST_LOGIN_ALLOWED_PHONES allowlist;
+  * "existing": ANY valid Indian mobile may log in ONLY when a Restamp
+    account for that phone identity ALREADY exists — unknown phones get a
+    clear 404 ("No account found for this phone number.") with ZERO rows
+    written, registration is impossible, and the allowlist is not
+    consulted. Mode checks run strictly AFTER the key verification, so
+    the account-existence distinction is never an unauthenticated oracle.
 - Disabled by default, twice over: the flag defaults to "0", and the
   feature is also inactive when RESTAMP_TEST_LOGIN_KEY is empty. An
   inactive deployment answers 404 {"detail": "Not Found"} — the SAME
@@ -73,6 +81,11 @@ from ..config import settings
 _UNAUTHORIZED_401 = "Unauthorized"
 _FORBIDDEN_403 = "Forbidden"
 _TOO_MANY_429 = "Too many attempts. Try again later."
+# Existing-accounts-only mode ("existing"): the explicit 404 shown for a
+# valid phone with NO Restamp account. Never reachable without a valid key
+# (the mode check runs after require_key), so it is a key-gated convenience
+# message, not an open account-existence oracle.
+_NO_ACCOUNT_404 = "No account found for this phone number."
 
 
 @dataclass
@@ -93,14 +106,49 @@ class TestLoginService:
             self._blocked_until.clear()
 
     def is_active(self) -> bool:
-        """True only when BOTH the flag is on AND a non-empty key is set.
+        """True only when flag on AND strong-key-shaped non-empty key AND
+        a valid RESTAMP_TEST_LOGIN_MODE.
 
-        Fail-closed: an enabled-but-misconfigured deployment (no key) stays
-        inactive; callers must treat inactive as "endpoint does not exist".
+        Fail-closed three ways: an enabled-but-misconfigured deployment
+        (no key, or an unknown mode value) stays inactive; callers must
+        treat inactive as "endpoint does not exist".
         """
         if not settings.TEST_LOGIN_ENABLED:
             return False
-        return bool((settings.TEST_LOGIN_KEY or "").strip())
+        if not (settings.TEST_LOGIN_KEY or "").strip():
+            return False
+        return self.mode() != "invalid"
+
+    # Authorization modes (config: RESTAMP_TEST_LOGIN_MODE) — "allowlist"
+    # keeps the original restricted behavior (explicit allowlist is the
+    # ONLY permission; registration separately gated); "existing" permits
+    # ONLY phones that already have a Restamp account (no allowlist, no
+    # registration, zero writes for unknown phones). Both share the key,
+    # the rate limits, and the never-rewritten-identity rule.
+    _MODES = ("allowlist", "existing")
+    # Class attribute so the router (which binds the service INSTANCE) can
+    # reference the explicit no-account message without a second import.
+    NO_ACCOUNT_404 = _NO_ACCOUNT_404
+
+    def mode(self) -> str:
+        """Configured authorization mode: 'allowlist', 'existing', or
+        'invalid' (any unrecognized env value — treated as disabled)."""
+        m = str(settings.TEST_LOGIN_MODE or "allowlist").strip().lower()
+        return m if m in self._MODES else "invalid"
+
+    def require_existing_user(self, user) -> None:
+        """Existing-accounts-only mode: raise the explicit 404 when the
+        phone has NO Restamp account.
+
+        NEVER creates or modifies rows; the check runs strictly AFTER the
+        key verification, so the message distinguishes accounts only for
+        key holders and is never an unauthenticated oracle.
+        """
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=self.NO_ACCOUNT_404,
+            )
 
     def require_active(self) -> None:
         """Refuse with 404 when the mechanism is inactive.

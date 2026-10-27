@@ -143,6 +143,24 @@ class Settings:
     TEST_LOGIN_ALLOWED_PHONES: tuple[str, ...] = _split_test_login_phones(
         _get("RESTAMP_TEST_LOGIN_ALLOWED_PHONES", "")
     )
+    # Authorization MODE of the restricted test login (see
+    # app/services/test_login.py):
+    # - "allowlist" (default): unchanged restricted behavior — the phone
+    #   allowlist above is the ONLY permission to use the login, and with
+    #   RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION="1" an allowlisted UNKNOWN
+    #   phone may also register.
+    # - "existing": accounts-only demo login — ANY valid Indian mobile may
+    #   log in ONLY when a Restamp account for that phone identity ALREADY
+    #   exists; unknown phones get a clear 404 with ZERO rows written and
+    #   registration is impossible (the registration flag must stay "0":
+    #   production boot is refused for the combination). The allowlist is
+    #   completely IGNORED in this mode (including its validation; if the
+    #   mode is later switched back to "allowlist", the boot gate
+    #   revalidates it there).
+    # An unknown value disables the feature entirely (fail closed at
+    # request time: exact 404 unknown-route body) and refuses production
+    # boot while enabled.
+    TEST_LOGIN_MODE: str = _get("RESTAMP_TEST_LOGIN_MODE", "allowlist")
     # Account CREATION is gated SEPARATELY from the key + allowlist
     # authorization (see app/services/test_login.py): existing allowlisted
     # identities always log in, but an allowlisted UNKNOWN phone creates a
@@ -283,8 +301,11 @@ def validate_security_config() -> None:
       a separate mechanism from the display mode with its own key);
     - RESTAMP_TEST_LOGIN_ALLOWED_PHONES contains entries that could never
       match a login (not valid Indian mobile numbers) while test login is
-      enabled (fail fast; an EMPTY allowlist is bootable but rejects every
-      attempt at request time);
+      enabled IN 'allowlist' MODE (fail fast; an EMPTY allowlist is
+      bootable but rejects every attempt at request time);
+    - RESTAMP_TEST_LOGIN_MODE is set while enabled to a value other than
+      'allowlist'/'existing', or 'existing' is combined with registration
+      enabled (existing-mode login never creates users);
     - RESTAMP_GOOGLE_DEV_MODE is enabled;
     - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
     - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
@@ -309,6 +330,16 @@ def validate_security_config() -> None:
                 "RESTAMP_TEST_LOGIN_ENABLED is '1' but RESTAMP_TEST_LOGIN_KEY is "
                 "empty: /auth/test-login stays INACTIVE (404) until a strong "
                 "key is configured."
+            )
+        if (
+            settings.TEST_LOGIN_ENABLED
+            and str(settings.TEST_LOGIN_MODE or "").strip().lower()
+            not in ("allowlist", "existing")
+        ):
+            _log.warning(
+                "RESTAMP_TEST_LOGIN_MODE is not 'allowlist' or 'existing': "
+                "/auth/test-login stays INACTIVE (404) until a valid mode is "
+                "configured."
             )
         return
     if not is_jwt_secret_strong(settings.JWT_SECRET):
@@ -339,31 +370,54 @@ def validate_security_config() -> None:
             "when RESTAMP_TEST_LOGIN_ENABLED is '1'."
         )
     if settings.TEST_LOGIN_ENABLED:
-        # The allowlist is the ONLY permission for a phone to use the
-        # restricted test login (and registration additionally requires
-        # TEST_LOGIN_ALLOW_REGISTRATION=1). Entries that could
-        # never match a login silently disable the number instead — refuse
-        # production boot so misconfiguration cannot slip through (setting
-        # name only, never entry values). An EMPTY list is intentionally
-        # bootable but fails closed at request time (every attempt → 403);
-        # warn so the state is visible in logs.
-        bad_entries = invalid_test_login_phones(
-            settings.TEST_LOGIN_ALLOWED_PHONES
-        )
-        if bad_entries:
+        test_login_mode = str(settings.TEST_LOGIN_MODE or "").strip().lower()
+        if test_login_mode not in ("allowlist", "existing"):
+            # Fail fast on an unknown mode: at request time the feature is
+            # inactive (exact 404), but a named boot refusal makes the
+            # misconfiguration impossible to miss (setting name only).
             raise RuntimeError(
-                "Insecure production configuration: "
-                "RESTAMP_TEST_LOGIN_ALLOWED_PHONES contains entries that are "
-                "not valid Indian mobile numbers (+91 + 10 digits starting "
-                "6-9); fix or remove them."
+                "Insecure production configuration: RESTAMP_TEST_LOGIN_MODE "
+                "must be 'allowlist' or 'existing' when "
+                "RESTAMP_TEST_LOGIN_ENABLED is '1'."
             )
-        if not settings.TEST_LOGIN_ALLOWED_PHONES:
-            _log.warning(
-                "RESTAMP_TEST_LOGIN_ENABLED is '1' but "
-                "RESTAMP_TEST_LOGIN_ALLOWED_PHONES is EMPTY: every "
-                "/auth/test-login attempt will be rejected (403). Add "
-                "explicit test phone numbers to enable logins."
+        if test_login_mode == "existing":
+            # Existing-accounts-only mode NEVER registers: refuse the
+            # contradictory configuration so the demo mode can never be
+            # flipped into silent account creation by an env stray.
+            if settings.TEST_LOGIN_ALLOW_REGISTRATION:
+                raise RuntimeError(
+                    "Insecure production configuration: "
+                    "RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION must be '0' when "
+                    "RESTAMP_TEST_LOGIN_MODE is 'existing' (existing-mode "
+                    "login never creates users)."
+                )
+        else:
+            # The allowlist is the ONLY permission for a phone to use the
+            # restricted test login in 'allowlist' mode (and registration
+            # additionally requires TEST_LOGIN_ALLOW_REGISTRATION=1).
+            # Entries that could never match a login silently disable the
+            # number instead — refuse production boot so misconfiguration
+            # cannot slip through (setting name only, never entry values).
+            # An EMPTY list is intentionally bootable but fails closed at
+            # request time (every attempt → 403); warn so the state is
+            # visible in logs.
+            bad_entries = invalid_test_login_phones(
+                settings.TEST_LOGIN_ALLOWED_PHONES
             )
+            if bad_entries:
+                raise RuntimeError(
+                    "Insecure production configuration: "
+                    "RESTAMP_TEST_LOGIN_ALLOWED_PHONES contains entries that "
+                    "are not valid Indian mobile numbers (+91 + 10 digits "
+                    "starting 6-9); fix or remove them."
+                )
+            if not settings.TEST_LOGIN_ALLOWED_PHONES:
+                _log.warning(
+                    "RESTAMP_TEST_LOGIN_ENABLED is '1' but "
+                    "RESTAMP_TEST_LOGIN_ALLOWED_PHONES is EMPTY: every "
+                    "/auth/test-login attempt will be rejected (403). Add "
+                    "explicit test phone numbers to enable logins."
+                )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_GOOGLE_DEV_MODE must be '0' "

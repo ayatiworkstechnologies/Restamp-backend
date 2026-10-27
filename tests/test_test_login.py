@@ -885,3 +885,191 @@ def test_test_login_token_actually_authenticates(client, monkeypatch):
     assert me_body["providers"] == ["phone"]
     assert me_body["display_name"] == phone
     assert me_body["role"] == "BUYER"
+
+
+# --- "existing" mode: accounts-only demo login (no allowlist, no registration) ---
+
+def _set_mode(monkeypatch, value: str) -> None:
+    monkeypatch.setattr(config_module.settings, "TEST_LOGIN_MODE", value)
+
+
+def test_existing_mode_logs_in_existing_account_without_allowlist(
+    client, monkeypatch
+):
+    """Any valid Indian mobile that ALREADY has a Restamp account may log
+    in; the allowlist must be irrelevant in this mode and the seeded
+    identity is reused exactly as stored (verified_by never rewritten)."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "existing")
+    _allow(monkeypatch, ())  # empty allowlist MUST NOT block existing accounts
+    c, session = client
+    phone = _phone()
+    uid = _seed_phone_user(session, phone, verified_by="otp")
+    r = _login(c, phone)
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"access_token", "token_type", "expires_in", "user_id", "role"}
+    assert body["user_id"] == uid
+    assert body["role"] == "BUYER"
+    verified_by = session.execute(
+        sqltext(
+            "SELECT verified_by FROM auth_identities WHERE provider='phone' "
+            "AND provider_identifier=:p"
+        ),
+        {"p": phone},
+    ).fetchone()[0]
+    assert verified_by == "otp"  # untouched
+    assert _identity_count(session, phone) == 1  # no duplicates
+
+
+def test_existing_mode_unknown_phone_clear_404_zero_rows(client, monkeypatch):
+    """Unknown phone + valid key → the explicit 404 message, and not a
+    single row is created or modified."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "existing")
+    c, session = client
+    phone = _phone()
+    before_ident = session.execute(sqltext("SELECT COUNT(*) FROM auth_identities")).fetchone()[0]
+    before_users = session.execute(sqltext("SELECT COUNT(*) FROM users")).fetchone()[0]
+    r = _login(c, phone)
+    assert r.status_code == 404
+    assert r.json() == {"detail": "No account found for this phone number."}
+    assert _identity_count(session, phone) == 0
+    after_ident = session.execute(sqltext("SELECT COUNT(*) FROM auth_identities")).fetchone()[0]
+    after_users = session.execute(sqltext("SELECT COUNT(*) FROM users")).fetchone()[0]
+    assert after_ident == before_ident
+    assert after_users == before_users
+
+
+def test_existing_mode_never_registers_even_with_flag_on(client, monkeypatch):
+    """Mode semantics beat the registration flag: 'existing' + flag "1"
+    still refuses unknown phones without creating anything."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "existing")
+    _allow_registration(monkeypatch)
+    c, session = client
+    phone = _phone()
+    before = session.execute(sqltext("SELECT COUNT(*) FROM users")).fetchone()[0]
+    r = _login(c, phone)
+    assert r.status_code == 404
+    assert r.json() == {"detail": "No account found for this phone number."}
+    after = session.execute(sqltext("SELECT COUNT(*) FROM users")).fetchone()[0]
+    assert after == before
+
+
+def test_existing_mode_key_precedes_account_lookup(client, monkeypatch):
+    """The no-account message is key-gated: wrong or missing keys get the
+    byte-identical generic 401 and NEVER the account-existence text."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "existing")
+    c, _ = client
+    phone = _phone()
+    wrong = _login(c, phone, key="w" * 40)
+    missing = _login(c, phone, key=None)
+    assert wrong.status_code == missing.status_code == 401
+    assert wrong.content == missing.content  # indistinguishable
+    assert wrong.json() == UNAUTHORIZED
+    assert b"No account" not in wrong.content
+
+
+def test_existing_mode_rate_limits_still_apply(client, monkeypatch):
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "existing")
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_MAX_PER_HOUR_PER_PHONE", 1
+    )
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_MAX_PER_HOUR_PER_IP", 99
+    )
+    c, session = client
+    phone = _phone()
+    _seed_phone_user(session, phone, verified_by="otp")
+    assert _login(c, phone).status_code == 200  # 1 successful attempt counts
+    r = _login(c, phone)
+    assert r.status_code == 429
+    assert r.json() == TOO_MANY
+
+
+def test_default_allowlist_mode_unchanged_after_mode_switch(client, monkeypatch):
+    """Switching the mode back to "allowlist" restores the original
+    fail-closed semantics EXACTLY: empty allowlist rejects every phone
+    (even an existing account) with the generic 403."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "allowlist")
+    _allow(monkeypatch, ())
+    c, session = client
+    phone = _phone()
+    _seed_phone_user(session, phone, verified_by="otp")
+    r = _login(c, phone)
+    assert r.status_code == 403
+    assert r.json() == FORBIDDEN
+
+
+def test_prod_existing_mode_with_registration_refuses_boot(monkeypatch):
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="existing",
+        TEST_LOGIN_ALLOW_REGISTRATION=True,
+    )
+    assert is_production() is True
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_MODE" in str(e.value)
+    assert "RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION" in str(e.value)
+
+
+def test_prod_existing_mode_boots_and_ignores_allowlist(monkeypatch, caplog):
+    """'existing' + strong key + empty/malformed allowlist boots: the
+    allowlist is inert in this mode, so the allowlist warning is absent."""
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="existing",
+        TEST_LOGIN_ALLOW_REGISTRATION=False,
+    )
+    _set_mode(monkeypatch, "existing")
+    _allow(monkeypatch, ("9876543210",))  # malformed — but ignored here
+    with caplog.at_level(logging.INFO):
+        validate_security_config()  # must not raise
+    joined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "RESTAMP_TEST_LOGIN_ALLOWED_PHONES" not in joined
+    assert "RESTAMP_TEST_LOGIN_MODE" not in joined
+
+
+def test_prod_unknown_mode_refuses_boot(monkeypatch):
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="phone-book",
+    )
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_MODE" in str(e.value)
+
+
+def test_prod_switching_back_to_allowlist_revalidates_allowlist(monkeypatch):
+    """Mode drift safety: after returning to 'allowlist' mode, a stale
+    malformed allowlist entry refuses production boot again."""
+    _prod(monkeypatch, TEST_LOGIN_ENABLED=True, TEST_LOGIN_KEY=KEY)
+    _set_mode(monkeypatch, "allowlist")
+    _allow(monkeypatch, ("9876543210",))
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_ALLOWED_PHONES" in str(e.value)
+    assert "9876543210" not in str(e.value)  # entry never echoed
+
+
+def test_local_unknown_mode_stays_inactive_exact_404(client, monkeypatch):
+    """Defense in depth: an unknown mode value keeps the endpoint fully
+    inactive even outside production (exact unknown-route 404)."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "phone-book")
+    c, _ = client
+    assert test_login_service.is_active() is False
+    r = _login(c, _phone())
+    assert r.status_code == 404
+    assert r.json() == REQUEST_404
