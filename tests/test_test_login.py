@@ -45,6 +45,7 @@ No network, no SMS, no secrets printed.
 """
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -54,6 +55,7 @@ from app import config as config_module
 from app.config import (
     invalid_test_login_phones,
     is_production,
+    parse_test_login_suffix_until,
     validate_security_config,
     _split_test_login_phones,
 )
@@ -1073,3 +1075,401 @@ def test_local_unknown_mode_stays_inactive_exact_404(client, monkeypatch):
     r = _login(c, _phone())
     assert r.status_code == 404
     assert r.json() == REQUEST_404
+
+
+# --- "suffix" mode: last-six-digit demo code (presenter convenience, -------
+#     expiry-bounded; the code is the phone's own predictable suffix, so
+#     it is NEVER a secret — every guard here exists to bound exactly that)
+
+def _future_deadline(hours: float) -> str:
+    """ISO-8601 UTC deadline string at now+hours (second precision)."""
+    return (
+        datetime.now(timezone.utc) + timedelta(hours=hours)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _set_suffix_deadline(monkeypatch, value: str) -> None:
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_SUFFIX_UNTIL", value
+    )
+
+
+def _enable_suffix(monkeypatch, deadline: str | None = None) -> None:
+    """Suffix mode ON with a str-key and a future window (default 1h)."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "suffix")
+    _set_suffix_deadline(
+        monkeypatch,
+        _future_deadline(1.0) if deadline is None else deadline,
+    )
+
+
+def _suffix_login(c, phone: str, code: str):
+    """The suffix-mode request shape: {"phone", "code"} and NO header."""
+    return c.post("/auth/test-login", json={"phone": phone, "code": code})
+
+
+def test_suffix_mode_logs_in_existing_account_with_leading_zero_suffix(
+    client, monkeypatch
+):
+    """The demo code is the LAST SIX DIGITS of the phone as a string —
+    leading zeros preserved (the exact working example: +917530006460 →
+    "006460"). The X-Test-Login-Key header is NOT required, and even a
+    garbage header cannot interfere with this mode. TokenOut is identical
+    to /auth/otp/verify and the stored identity is reused untouched."""
+    _enable_suffix(monkeypatch)
+    c, session = client
+    phone = "+917530006460"
+    # Reuse a pre-existing local row for this exact example phone when one
+    # exists (the dev database is shared across sessions); otherwise seed
+    # it. Either way the SUFFIX must be the authorization.
+    pre = users_roles.find_user_by_identity(session, "phone", phone)
+    uid = pre.id if pre is not None else _seed_phone_user(
+        session, phone, verified_by="otp"
+    )
+    r = _suffix_login(c, phone, "006460")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {
+        "access_token",
+        "token_type",
+        "expires_in",
+        "user_id",
+        "role",
+    }
+    assert body["user_id"] == uid
+    assert body["role"] == "BUYER"
+    # A wrong key-looking header must be irrelevant in this mode: the
+    # suffix code alone authorizes, no X-Test-Login-Key is consulted.
+    r2 = c.post(
+        "/auth/test-login",
+        json={"phone": phone, "code": "006460"},
+        headers={"X-Test-Login-Key": "w" * 40},
+    )
+    assert r2.status_code == 200
+    assert _identity_count(session, phone) >= 1  # never duplicated
+
+
+def test_suffix_mode_generated_phone_suffix_has_leading_zeros(
+    client, monkeypatch
+):
+    """Second leading-zero proof on a GENERATED phone: the suffix of the
+    standard test phone always starts with zeros, the six-digit string
+    suffix authenticates, and the classic int()-coercion variant (the
+    zero-DROPPED value, left-padded with a different digit) is rejected."""
+    _enable_suffix(monkeypatch)
+    c, session = client
+    phone = _phone()
+    _seed_phone_user(session, phone, verified_by="otp")
+    suffix = phone[-6:]
+    assert suffix.startswith("000")  # leading zeros by construction
+    assert _suffix_login(c, phone, suffix).status_code == 200
+    dropped = suffix.lstrip("0")  # what an int() round-trip would produce
+    assert dropped
+    r = _suffix_login(c, phone, dropped.rjust(6, "9"))
+    assert r.status_code == 401
+    assert r.json() == UNAUTHORIZED
+
+
+def test_suffix_mode_bad_code_shapes_are_generic_401(client, monkeypatch):
+    """Every non-exact-suffix value — dropped zero, short, long,
+    surrounding whitespace, non-digit content, simply wrong — is the ONE
+    generic 401, byte-identical for all of them, and never creates or
+    reveals rows."""
+    _enable_suffix(monkeypatch)
+    c, session = client
+    phone = _phone()
+    _seed_phone_user(session, phone, verified_by="otp")
+    suffix = phone[-6:]
+    before_users = session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0]
+    codes = (
+        suffix.lstrip("0") or "0",  # dropped leading zeros
+        suffix[1:],                 # five digits
+        suffix + "0",               # seven digits
+        " " + suffix,               # leading space
+        suffix + " ",               # trailing space
+        "abcdefgh",
+        "0O" + suffix[-4:],         # letter-O homoglyph
+        "9" * 6,                    # valid shape, wrong value
+        "",                         # empty
+    )
+    contents = set()
+    for code in codes:
+        r = _suffix_login(c, phone, code)
+        assert r.status_code == 401, repr(code)
+        assert r.json() == UNAUTHORIZED
+        assert b"No account" not in r.content
+        contents.add(r.content)
+    assert len(contents) == 1  # byte-identical rejections
+    after_users = session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0]
+    assert after_users == before_users
+    assert _identity_count(session, phone) == 1  # seeded row untouched
+
+
+def test_suffix_mode_unknown_phone_explicit_404_zero_rows(
+    client, monkeypatch
+):
+    """Correct suffix + phone with NO Restamp account → the explicit
+    no-account message and not a single row created or modified."""
+    _enable_suffix(monkeypatch)
+    c, session = client
+    phone = _phone()
+    before_ident = session.execute(
+        sqltext("SELECT COUNT(*) FROM auth_identities")
+    ).fetchone()[0]
+    before_users = session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0]
+    r = _suffix_login(c, phone, phone[-6:])
+    assert r.status_code == 404
+    assert r.json() == {"detail": "No account found for this phone number."}
+    assert _identity_count(session, phone) == 0
+    assert session.execute(
+        sqltext("SELECT COUNT(*) FROM auth_identities")
+    ).fetchone()[0] == before_ident
+    assert session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0] == before_users
+
+
+def test_suffix_mode_wrong_code_never_reveals_account(client, monkeypatch):
+    """The code check runs BEFORE the account lookup: a wrong code on a
+    phone WITH an account is byte-identical to a wrong code on a
+    never-seen phone — no account-existence oracle through failures."""
+    _enable_suffix(monkeypatch)
+    c, _ = client
+    existing = _phone()
+    wrong_existing = "1" * 6 if existing[-6:] != "111111" else "2" * 6
+    wrong_unknown = "3" * 6
+    r_a = _suffix_login(c, existing, wrong_existing)
+    r_b = _suffix_login(c, _phone(), wrong_unknown)
+    assert r_a.status_code == r_b.status_code == 401
+    assert r_a.content == r_b.content
+    assert r_a.json() == UNAUTHORIZED
+    assert b"No account" not in r_a.content
+
+
+def test_suffix_mode_never_registers_even_with_flag_on(client, monkeypatch):
+    """Mode semantics beat the registration flag: "suffix" + flag "1"
+    still refuses unknown phones with ZERO rows written (the suffix path
+    never INSERTs; production boots are additionally refused)."""
+    _enable_suffix(monkeypatch)
+    _allow_registration(monkeypatch)
+    c, session = client
+    phone = _phone()
+    before = session.execute(sqltext("SELECT COUNT(*) FROM users")).fetchone()[0]
+    r = _suffix_login(c, phone, phone[-6:])
+    assert r.status_code == 404
+    assert r.json() == {"detail": "No account found for this phone number."}
+    assert _identity_count(session, phone) == 0
+    assert session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0] == before
+
+
+def test_suffix_mode_inactive_without_deadline(client, monkeypatch):
+    """No RESTAMP_TEST_LOGIN_SUFFIX_UNTIL → the mode flag alone cannot
+    activate the endpoint: exact 404 even for a plausible well-shaped
+    request (fail closed)."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "suffix")
+    _set_suffix_deadline(monkeypatch, "")
+    c, _ = client
+    assert test_login_service.is_active() is False
+    phone = _phone()
+    r = _suffix_login(c, phone, phone[-6:])
+    assert r.status_code == 404
+    assert r.json() == REQUEST_404
+
+
+def test_suffix_mode_self_disarms_when_deadline_passes(client, monkeypatch):
+    """A past deadline deactivates the endpoint on EVERY request (exact
+    404) — the demo window ends by itself, with no redeploy needed."""
+    _enable(monkeypatch)
+    _set_mode(monkeypatch, "suffix")
+    _set_suffix_deadline(monkeypatch, "2020-01-01T00:00:00Z")
+    c, _ = client
+    assert test_login_service.is_active() is False
+    phone = _phone()
+    r = _suffix_login(c, phone, phone[-6:])
+    assert r.status_code == 404
+    assert r.json() == REQUEST_404
+
+
+def test_suffix_mode_invalid_phone_generic_401_zero_rows(
+    client, monkeypatch
+):
+    """A schema-invalid phone is the SAME generic 401 (never a field-level
+    422, never the no-account 404) and writes nothing."""
+    _enable_suffix(monkeypatch)
+    c, session = client
+    before_users = session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0]
+    r = _suffix_login(c, "+91123", "001123")
+    assert r.status_code == 401
+    assert r.json() == UNAUTHORIZED
+    assert session.execute(
+        sqltext("SELECT COUNT(*) FROM users")
+    ).fetchone()[0] == before_users
+
+
+def test_suffix_mode_rate_limits_still_apply(client, monkeypatch):
+    """The per-phone budget is consumed by suffix attempts exactly like
+    keyed attempts: one successful login trips a cap of 1 on the next."""
+    _enable_suffix(monkeypatch)
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_MAX_PER_HOUR_PER_PHONE", 1
+    )
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_MAX_PER_HOUR_PER_IP", 99
+    )
+    c, session = client
+    phone = _phone()
+    _seed_phone_user(session, phone, verified_by="otp")
+    assert _suffix_login(c, phone, phone[-6:]).status_code == 200
+    r = _suffix_login(c, phone, phone[-6:])
+    assert r.status_code == 429
+    assert r.json() == TOO_MANY
+
+
+def test_suffix_mode_wrong_codes_consume_shared_per_ip_budget(
+    client, monkeypatch
+):
+    """Per-IP sharing: wrong-code suffix attempts (which can never leak
+    account state) STILL consume the IP budget just like wrong keys, so
+    brute-forcing the six digits is bounded by the same caps."""
+    _enable_suffix(monkeypatch)
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_MAX_PER_HOUR_PER_IP", 3
+    )
+    monkeypatch.setattr(
+        config_module.settings, "TEST_LOGIN_MAX_PER_HOUR_PER_PHONE", 99
+    )
+    c, session = client
+    p1, p2, p3, p4 = _phone(), _phone(), _phone(), _phone()
+    for p in (p1, p2, p3, p4):
+        _seed_phone_user(session, p, verified_by="otp")
+    wrong = "9" * 6
+    for p in (p1, p2, p3):
+        assert _suffix_login(c, p, wrong).status_code == 401
+    # Fourth attempt from the same IP — even with a CORRECT code — is
+    # blocked by the shared per-IP budget.
+    r = _suffix_login(c, p4, p4[-6:])
+    assert r.status_code == 429
+    assert r.json() == TOO_MANY
+
+
+def test_suffix_deadline_parser_accepts_z_naive_offset(monkeypatch):
+    """config.parse_test_login_suffix_until: 'Z', naive (assumed UTC) and
+    explicit offsets all normalize to the SAME aware UTC moment; garbage
+    and empties return None (fail closed)."""
+    expected = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    assert parse_test_login_suffix_until("2026-01-02T03:04:05Z") == expected
+    assert parse_test_login_suffix_until("2026-01-02T03:04:05") == expected
+    assert parse_test_login_suffix_until("2026-01-02T05:04:05+02:00") == expected
+    assert parse_test_login_suffix_until("2026-01-02 03:04:05") == expected
+    assert parse_test_login_suffix_until("") is None
+    assert parse_test_login_suffix_until("   ") is None
+    assert parse_test_login_suffix_until("not a date") is None
+    assert parse_test_login_suffix_until(None) is None
+
+
+def test_require_suffix_code_unit_contract():
+    """Service-level contract of the suffix comparison: exact string
+    suffix (leading zeros) passes; every deviation is the generic 401."""
+    from fastapi import HTTPException
+
+    def attempt(phone: str, code: str):
+        try:
+            test_login_service.require_suffix_code(phone, code)
+            return None
+        except HTTPException as e:
+            return e
+
+    assert attempt("+917530006460", "006460") is None
+    for bad in ("6460", "0006460", "106460", " 006460", "006460 ", "abcdef",
+                "٠٠٦٤٦٠", ""):
+        e = attempt("+917530006460", bad)
+        assert e is not None and e.status_code == 401, repr(bad)
+
+
+def test_prod_suffix_mode_requires_deadline(monkeypatch):
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="suffix",
+        TEST_LOGIN_ALLOW_REGISTRATION=False,
+        TEST_LOGIN_SUFFIX_UNTIL="",
+    )
+    assert is_production() is True
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL" in str(e.value)
+
+
+def test_prod_suffix_mode_refuses_past_deadline(monkeypatch):
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="suffix",
+        TEST_LOGIN_ALLOW_REGISTRATION=False,
+        TEST_LOGIN_SUFFIX_UNTIL="2020-01-01T00:00:00Z",
+    )
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL" in str(e.value)
+    assert "future" in str(e.value)
+
+
+def test_prod_suffix_mode_refuses_more_than_24h_ahead(monkeypatch):
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="suffix",
+        TEST_LOGIN_ALLOW_REGISTRATION=False,
+        TEST_LOGIN_SUFFIX_UNTIL=_future_deadline(25.0),
+    )
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL" in str(e.value)
+    assert "24" in str(e.value)
+
+
+def test_prod_suffix_mode_refuses_registration(monkeypatch):
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="suffix",
+        TEST_LOGIN_ALLOW_REGISTRATION=True,
+        TEST_LOGIN_SUFFIX_UNTIL=_future_deadline(1.0),
+    )
+    with pytest.raises(RuntimeError) as e:
+        validate_security_config()
+    assert "RESTAMP_TEST_LOGIN_MODE" in str(e.value)
+    assert "RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION" in str(e.value)
+
+
+def test_prod_suffix_mode_boots_and_activates_with_valid_window(monkeypatch):
+    """A future (≤ 24h) deadline + registration off boots cleanly in
+    production and ACTIVATES the endpoint (deadline in the future)."""
+    _prod(
+        monkeypatch,
+        TEST_LOGIN_ENABLED=True,
+        TEST_LOGIN_KEY=KEY,
+        TEST_LOGIN_MODE="suffix",
+        TEST_LOGIN_ALLOW_REGISTRATION=False,
+        TEST_LOGIN_SUFFIX_UNTIL=_future_deadline(1.0),
+        TEST_LOGIN_ALLOWED_PHONES=(),  # inert in suffix mode, must not warn
+    )
+    validate_security_config()  # must not raise
+    assert test_login_service.is_active() is True
+    assert test_login_service.mode() == "suffix"

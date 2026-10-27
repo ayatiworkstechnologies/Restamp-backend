@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.engine import make_url as _sqlalchemy_make_url
 
@@ -50,6 +51,34 @@ def invalid_test_login_phones(
 
     compiled = re.compile(INDIAN_MOBILE_PATTERN)  # type: ignore[arg-type]
     return tuple(p for p in phones if not compiled.fullmatch(p))
+
+
+def parse_test_login_suffix_until(raw: str | None) -> "datetime | None":
+    """Parse RESTAMP_TEST_LOGIN_SUFFIX_UNTIL into an aware UTC datetime.
+
+    Lenient ISO-8601 on purpose so a single dashboard-side value works:
+    a trailing 'Z' is UTC; a NAIVE timestamp is assumed UTC; an explicit
+    UTC offset is honored as given (everything is normalized to UTC so
+    comparisons never depend on local time). Anything unparseable — or an
+    empty/missing setting — returns None, and callers treat None as
+    fail-closed (the 'suffix' demo mode stays inactive without a valid
+    future deadline). Never echoes the raw or parsed value.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+_SUFFIX_DEADLINE_MAX_AHEAD = timedelta(hours=24)
 
 
 class Settings:
@@ -157,10 +186,28 @@ class Settings:
     #   completely IGNORED in this mode (including its validation; if the
     #   mode is later switched back to "allowlist", the boot gate
     #   revalidates it there).
+    # - "suffix": presenter-convenience demo login — the ONLY authorization
+    #   is the LAST SIX DIGITS of the entered phone (predictable by
+    #   design, therefore NOT a secret and never proof of ownership), so
+    #   the mode is strictly TIME-BOUNDED: RESTAMP_TEST_LOGIN_SUFFIX_UNTIL
+    #   must be a future, at-most-24h-ahead ISO-8601 UTC deadline; when it
+    #   passes the endpoint SELF-DISARMS to the exact inactive 404 (re-
+    #   checked on EVERY request). Existing accounts only, registration
+    #   impossible (production refuses suffix + registration), and the key
+    #   header is NOT consulted. Default window: unset ("") keeps the mode
+    #   inactive even if MODE="suffix" is set alone (fail closed).
     # An unknown value disables the feature entirely (fail closed at
     # request time: exact 404 unknown-route body) and refuses production
     # boot while enabled.
     TEST_LOGIN_MODE: str = _get("RESTAMP_TEST_LOGIN_MODE", "allowlist")
+    # Hard expiry for the "suffix" demo mode ONLY (see the mode comment
+    # above): required by the production gate when RESTAMP_TEST_LOGIN_MODE
+    # is "suffix" (missing/unparseable/past/more-than-24h-ahead deadlines
+    # refuse production boot) and re-checked at REQUEST time — past the
+    # deadline the endpoint is inactive (exact 404) REGARDLESS of the
+    # mode flag, so the window self-disarms. Empty default keeps suffix
+    # mode inactive everywhere (fail closed).
+    TEST_LOGIN_SUFFIX_UNTIL: str = _get("RESTAMP_TEST_LOGIN_SUFFIX_UNTIL", "")
     # Account CREATION is gated SEPARATELY from the key + allowlist
     # authorization (see app/services/test_login.py): existing allowlisted
     # identities always log in, but an allowlisted UNKNOWN phone creates a
@@ -304,8 +351,12 @@ def validate_security_config() -> None:
       enabled IN 'allowlist' MODE (fail fast; an EMPTY allowlist is
       bootable but rejects every attempt at request time);
     - RESTAMP_TEST_LOGIN_MODE is set while enabled to a value other than
-      'allowlist'/'existing', or 'existing' is combined with registration
-      enabled (existing-mode login never creates users);
+      'allowlist'/'existing'/'suffix', or 'existing'/'suffix' is combined
+      with registration enabled (those modes never create users);
+    - RESTAMP_TEST_LOGIN_MODE='suffix' without a RESTAMP_TEST_LOGIN_
+      SUFFIX_UNTIL deadline that is parseable, in the FUTURE, and at most
+      24 hours ahead (the six-digit demo code is just the phone's suffix
+      — predictable, so the window MUST be explicit and self-disarming);
     - RESTAMP_GOOGLE_DEV_MODE is enabled;
     - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
     - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
@@ -334,12 +385,31 @@ def validate_security_config() -> None:
         if (
             settings.TEST_LOGIN_ENABLED
             and str(settings.TEST_LOGIN_MODE or "").strip().lower()
-            not in ("allowlist", "existing")
+            not in ("allowlist", "existing", "suffix")
         ):
             _log.warning(
-                "RESTAMP_TEST_LOGIN_MODE is not 'allowlist' or 'existing': "
-                "/auth/test-login stays INACTIVE (404) until a valid mode is "
-                "configured."
+                "RESTAMP_TEST_LOGIN_MODE is not 'allowlist', 'existing' or "
+                "'suffix': /auth/test-login stays INACTIVE (404) until a "
+                "valid mode is configured."
+            )
+        if (
+            settings.TEST_LOGIN_ENABLED
+            and str(settings.TEST_LOGIN_MODE or "").strip().lower()
+            == "suffix"
+            and (
+                parse_test_login_suffix_until(settings.TEST_LOGIN_SUFFIX_UNTIL)
+                is None
+                or parse_test_login_suffix_until(
+                    settings.TEST_LOGIN_SUFFIX_UNTIL
+                )
+                <= datetime.now(timezone.utc)
+            )
+        ):
+            _log.warning(
+                "RESTAMP_TEST_LOGIN_MODE is 'suffix' but "
+                "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL is missing, unparseable, "
+                "or in the past: /auth/test-login stays INACTIVE (404) "
+                "until a future deadline is configured."
             )
         return
     if not is_jwt_secret_strong(settings.JWT_SECRET):
@@ -371,13 +441,13 @@ def validate_security_config() -> None:
         )
     if settings.TEST_LOGIN_ENABLED:
         test_login_mode = str(settings.TEST_LOGIN_MODE or "").strip().lower()
-        if test_login_mode not in ("allowlist", "existing"):
+        if test_login_mode not in ("allowlist", "existing", "suffix"):
             # Fail fast on an unknown mode: at request time the feature is
             # inactive (exact 404), but a named boot refusal makes the
             # misconfiguration impossible to miss (setting name only).
             raise RuntimeError(
                 "Insecure production configuration: RESTAMP_TEST_LOGIN_MODE "
-                "must be 'allowlist' or 'existing' when "
+                "must be 'allowlist', 'existing' or 'suffix' when "
                 "RESTAMP_TEST_LOGIN_ENABLED is '1'."
             )
         if test_login_mode == "existing":
@@ -390,6 +460,45 @@ def validate_security_config() -> None:
                     "RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION must be '0' when "
                     "RESTAMP_TEST_LOGIN_MODE is 'existing' (existing-mode "
                     "login never creates users)."
+                )
+        elif test_login_mode == "suffix":
+            # The suffix demo code is the phone's last six digits —
+            # PREDICTABLE, so it is never a secret. Production may run it
+            # ONLY when registration is off AND an explicit, self-disarming
+            # expiry window is configured: a deadline that is missing,
+            # unparseable, already past, or more than 24 hours ahead
+            # refuses to boot (setting names only, never values).
+            if settings.TEST_LOGIN_ALLOW_REGISTRATION:
+                raise RuntimeError(
+                    "Insecure production configuration: "
+                    "RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION must be '0' when "
+                    "RESTAMP_TEST_LOGIN_MODE is 'suffix' (suffix-mode login "
+                    "never creates users)."
+                )
+            deadline = parse_test_login_suffix_until(
+                settings.TEST_LOGIN_SUFFIX_UNTIL
+            )
+            if deadline is None:
+                raise RuntimeError(
+                    "Insecure production configuration: "
+                    "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL must be set to an "
+                    "ISO-8601 timestamp when RESTAMP_TEST_LOGIN_MODE is "
+                    "'suffix' (the predictable six-digit demo code is only "
+                    "allowed inside an explicit, self-disarming window)."
+                )
+            now = datetime.now(timezone.utc)
+            if deadline <= now:
+                raise RuntimeError(
+                    "Insecure production configuration: "
+                    "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL must be in the future "
+                    "when RESTAMP_TEST_LOGIN_MODE is 'suffix'."
+                )
+            if deadline > now + _SUFFIX_DEADLINE_MAX_AHEAD:
+                raise RuntimeError(
+                    "Insecure production configuration: "
+                    "RESTAMP_TEST_LOGIN_SUFFIX_UNTIL may be at most 24 "
+                    "hours ahead when RESTAMP_TEST_LOGIN_MODE is 'suffix' "
+                    "(the window must self-disarm promptly)."
                 )
         else:
             # The allowlist is the ONLY permission for a phone to use the

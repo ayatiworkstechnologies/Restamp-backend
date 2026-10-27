@@ -98,9 +98,19 @@ services:
       - key: RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION
         value: "0"            # "1" also lets allowlisted UNKNOWN phones register
       - key: RESTAMP_TEST_LOGIN_MODE
-        value: "allowlist"    # or "existing": any +91 with an EXISTING Restamp
-                              # account may log in (no allowlist; no registration;
-                              # unknown phones → 404 "No account found...")
+        value: "allowlist"    # "existing": any +91 with an EXISTING Restamp
+                              # account may log in (no allowlist; no
+                              # registration; unknown phones → 404 "No
+                              # account found..."). "suffix": demo-window
+                              # presenter login authorized by the LAST SIX
+                              # DIGITS of the entered phone (predictable,
+                              # NOT a secret; no key header) inside the
+                              # RESTAMP_TEST_LOGIN_SUFFIX_UNTIL window.
+      - key: RESTAMP_TEST_LOGIN_SUFFIX_UNTIL
+        sync: false           # ISO-8601 UTC expiry ("2026-10-29T05:00:00Z");
+                              # REQUIRED in "suffix" mode — future, at most
+                              # 24h ahead, self-disarming at request time;
+                              # empty = suffix mode stays inactive.
       - key: RESTAMP_TEST_LOGIN_MAX_PER_HOUR_PER_IP
         value: "10"
       - key: RESTAMP_TEST_LOGIN_MAX_PER_HOUR_PER_PHONE

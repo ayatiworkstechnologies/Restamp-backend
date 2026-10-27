@@ -118,6 +118,24 @@ Explicitly supported production testing window — restricted test-only login:
     must stay `"0"` — production refuses otherwise). Production refuses
     boot for an unknown mode value; at request time an unknown mode keeps
     the endpoint disabled (exact 404).
+  - in **`"suffix"` mode** (presenter convenience for a bounded demo
+    window ONLY) the sole authorization is the LAST SIX DIGITS of the
+    entered phone, sent in a `{phone, code}` body with NO key header
+    (`X-Test-Login-Key` is ignored). **The value is predictable — the
+    client literally just typed the phone — so it is NOT a secret and
+    never proof of ownership**; the mode is therefore guarded: active
+    ONLY inside `RESTAMP_TEST_LOGIN_SUFFIX_UNTIL` (ISO-8601 UTC deadline,
+    required in production, future and at most 24h ahead at boot, and
+    re-checked on EVERY request — once it passes the endpoint
+    self-disarms to the exact inactive 404 with no redeploy), sharing the
+    per-IP (10/hr) and per-phone (20/hr) limits, existing accounts only
+    (unknown phones → the explicit 404, zero rows), registration
+    structurally impossible (production refuses suffix + registration),
+    and a wrong code is the byte-identical generic 401 for phones with
+    and without accounts (no account-existence oracle). Recommended for
+    a single presentation only; switch `RESTAMP_TEST_LOGIN_MODE` back to
+    `"existing"` (or let the deadline pass) before leaving the window
+    open.
   Enable only for bounded test windows, then set the flag back to `"0"`
   and/or rotate the key. Separate from the display mode: enabling one
   never affects the other.

@@ -6,6 +6,7 @@ Google: unknown identities NEVER auto-create (404 GOOGLE_UNKNOWN); the client
 must onboard through an approved flow before the Google identity can be linked.
 """
 import json
+import re
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -128,6 +129,36 @@ def _parse_test_login_phone(raw: bytes) -> str:
         ) from exc
 
 
+def _extract_test_login_code(raw: bytes) -> str:
+    """Extract the "suffix"-mode demo code with the SAME error-generic
+    policy as _parse_test_login_phone.
+
+    The body must be a JSON object whose `code` is a string of EXACTLY six
+    ASCII digits — everything else (missing field, wrong type, whitespace,
+    five digits with a dropped zero, seven digits, non-digit content) is
+    the SAME generic 401 as a wrong key, never a field-level 422, so the
+    code's shape reveals nothing about the feature state. No normalization
+    is applied beyond the exact-shape check: the value must arrive as the
+    literal phone suffix (leading zeros included).
+    """
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("body must be a JSON object")
+        code = payload.get("code")
+        if not isinstance(code, str) or not re.fullmatch(
+            r"[0-9]{6}", code
+        ):
+            raise ValueError("code must be exactly six ASCII digits")
+        return code
+    except (ValueError, TypeError) as exc:
+        # json.JSONDecodeError / UnicodeDecodeError (ValueError subclasses)
+        # and every shape refusal above collapse into one generic 401.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+        ) from exc
+
+
 @router.post("/test-login", response_model=schemas.TokenOut)
 async def test_login(
     request: Request,
@@ -167,6 +198,18 @@ async def test_login(
       (production refuses "existing" + registration). The mode check
       runs strictly AFTER the key verification, so the account-existence
       message is never an unauthenticated oracle.
+    - "suffix" is PRESENTER CONVENIENCE ONLY: the sole authorization is
+      the last six digits of the phone the client just typed (sent in the
+      body as {"phone", "code"}; the X-Test-Login-Key header is NOT
+      consulted in this mode). That value is predictable — NOT a secret —
+      so the mode is bounded: active ONLY inside the
+      RESTAMP_TEST_LOGIN_SUFFIX_UNTIL window (future-bounded at boot;
+      past the deadline require_active() self-disarms to the exact 404),
+      sharing the per-IP/per-phone rate limits, existing accounts only,
+      registration structurally impossible (production refuses
+      suffix + registration). require_suffix_code runs BEFORE the account
+      lookup, so a wrong code on ANY phone is the byte-identical generic
+      401 — no account-existence oracle through code failures.
     - Attempts are rate limited per IP and per phone AFTER body parsing
       and BEFORE the key check (wrong-key attempts consume budget;
       malformed bodies never do).
@@ -179,9 +222,31 @@ async def test_login(
       auditable; the key and the phone are never logged.
     """
     test_login_service.require_active()
-    phone = _parse_test_login_phone(await request.body())
+    raw_body = await request.body()
+    phone = _parse_test_login_phone(raw_body)
     ip = _client_ip(request)
     test_login_service.record_attempt(ip=ip, phone=phone)
+    if test_login_service.mode() == "suffix":
+        # Suffix demo login (presenter convenience, NOT a secret): the
+        # ONLY authorization is the last six digits of the phone just
+        # typed on screen, compared in constant time server-side. Bounded
+        # by the hard, self-disarming expiry window (re-checked in the
+        # require_active() call above — past the deadline this branch is
+        # unreachable), by the shared per-IP/per-phone budgets just
+        # consumed via record_attempt, by the existing-accounts-only
+        # policy below (unknown phones get the explicit 404 with ZERO
+        # rows written), and by structural registration impossibility
+        # (production refuses suffix + registration; this branch never
+        # INSERTs). The X-Test-Login-Key header is deliberately NOT
+        # consulted here; the long-key flow stays fully available in the
+        # keyed modes.
+        test_login_service.require_suffix_code(
+            phone, _extract_test_login_code(raw_body)
+        )
+        user = users_roles.find_user_by_identity(db, "phone", phone)
+        test_login_service.require_existing_user(user)
+        db.commit()
+        return _token_for(db, user.id)
     test_login_service.require_key(x_test_login_key)
     if test_login_service.mode() == "existing":
         # Existing-accounts-only demo login: the allowlist is not consulted
