@@ -5,7 +5,9 @@ successful verification (standard OTP registration), default role BUYER.
 Google: unknown identities NEVER auto-create (404 GOOGLE_UNKNOWN); the client
 must onboard through an approved flow before the Google identity can be linked.
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+import json
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
@@ -16,6 +18,7 @@ from ..security import create_access_token, get_current_user
 from ..services import google as google_svc
 from ..services import users_roles
 from ..services.otp import otp_service
+from ..services.test_login import test_login_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -97,6 +100,93 @@ def otp_verify(body: schemas.OTPVerify, request: Request, db: Session = Depends(
         db.commit()
     else:
         db.commit()
+    return _token_for(db, user.id)
+
+
+def _parse_test_login_phone(raw: bytes) -> str:
+    """Parse the test-login body STRICTLY AFTER the activation guard.
+
+    Deliberately error-generic: any unparseable bytes, non-object JSON, or
+    a phone that fails the SAME Indian-mobile schema as /auth/otp/request
+    raises the SAME generic 401 as a wrong key — no field-level 422
+    detail — so request shape can never reveal whether (or how) the
+    feature is active. Runs before throttling, so malformed requests also
+    never consume rate-limit budget.
+    """
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("body must be a JSON object")
+        return schemas.OTPRequest(**payload).phone
+    except (ValueError, TypeError) as exc:
+        # One generic rejection covers them all: json.JSONDecodeError and
+        # UnicodeDecodeError subclass ValueError, and pydantic's
+        # ValidationError subclasses ValueError too. The message is never
+        # exposed — see the generic detail below.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+        ) from exc
+
+
+@router.post("/test-login", response_model=schemas.TokenOut)
+async def test_login(
+    request: Request,
+    db: Session = Depends(get_db),
+    x_test_login_key: str | None = Header(default=None, alias="X-Test-Login-Key"),
+):
+    """Restricted test-only phone login: works without SMS, and NO OTP is
+    ever generated, stored, returned, or logged (separate from the local
+    OTP display mode; see app/services/test_login.py).
+
+    The body is parsed BY HAND so the shape guards can never leak state:
+
+    - Inactive (default) or misconfigured: the body is never read or
+      validated — the response is the exact 404 unknown-route body
+      ({"detail": "Not Found"}) for EVERY request, valid or malformed, so
+      neither the endpoint's existence nor its feature state can be
+      probed via a malformed payload.
+    - Active: the body must be a JSON object whose `phone` matches the
+      SAME Indian-mobile schema as /auth/otp/request; anything else —
+      unparseable bytes, non-object JSON, schema-invalid phone — is
+      rejected with the SAME generic 401 as a wrong key (never a
+      field-level validation error).
+    - Authorization is the X-Test-Login-Key header, compared in constant
+      time against RESTAMP_TEST_LOGIN_KEY; missing/mismatched keys get a
+      generic 401 with no phone-existence signal.
+    - The phone must ALSO be on the explicit
+      RESTAMP_TEST_LOGIN_ALLOWED_PHONES allowlist: ANY other phone gets a
+      generic 403 EVEN WITH a valid key — the empty list rejects every
+      phone (fail closed), and no account is ever created or touched for
+      a phone outside the list.
+    - Attempts are rate limited per IP and per phone AFTER body parsing
+      and BEFORE the key check (wrong-key attempts consume budget;
+      malformed bodies never do).
+    - Account creation is separately feature-gated: with
+      RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION unset (the default), existing
+      allowlisted accounts log in but an UNKNOWN phone gets the same
+      generic 401 as a wrong key and creates no rows; with the flag "1",
+      allowlisted unknown phones register exactly like /auth/otp/verify,
+      with verified_by="test_login" so test-issued identities remain
+      auditable; the key and the phone are never logged.
+    """
+    test_login_service.require_active()
+    phone = _parse_test_login_phone(await request.body())
+    ip = _client_ip(request)
+    test_login_service.record_attempt(ip=ip, phone=phone)
+    test_login_service.require_key(x_test_login_key)
+    test_login_service.require_phone_allowed(phone)
+    user = users_roles.find_user_by_identity(db, "phone", phone)
+    # Registration is feature-gated SEPARATELY from the key and allowlist
+    # authorization: with RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION unset, an
+    # allowlisted-but-UNKNOWN phone fails HERE with the same generic 401
+    # as a wrong key — BEFORE any INSERT, so not a single row appears.
+    test_login_service.require_registration_allowed(user)
+    if user is None:
+        user = users_roles.create_user(db, display_name=phone)
+        users_roles.link_identity(
+            db, user.id, "phone", phone, verified_by="test_login"
+        )
+    db.commit()
     return _token_for(db, user.id)
 
 

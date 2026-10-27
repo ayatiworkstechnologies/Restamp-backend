@@ -23,6 +23,7 @@ from app import db as db_module
 from app.db import engine
 from app.main import create_app
 from app.services.otp import otp_service
+from app.services.test_login import test_login_service
 
 
 # --- Disposable-database safety guard (test-only) ---------------------------
@@ -159,6 +160,7 @@ def _guard_test_database():
 @pytest.fixture()
 def client():
     otp_service.reset()
+    test_login_service.reset()
     conn = engine.connect()
     trans = conn.begin()
     # Join the test Session into the outer transaction via SAVEPOINTs
@@ -197,6 +199,7 @@ def client():
     conn.close()
     otp_service.delivery = None
     otp_service.reset()
+    test_login_service.reset()
 
 
 class TestSMSInbox:

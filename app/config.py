@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from sqlalchemy.engine import make_url as _sqlalchemy_make_url
 
@@ -20,6 +21,35 @@ def _get_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _split_test_login_phones(raw: str) -> tuple[str, ...]:
+    """Parse the comma-separated test-phone allowlist for storage on Settings.
+
+    Entries are trimmed, interior empties are dropped, and the result is a
+    tuple (no accidental mutability at runtime). Membership checks in
+    app/services/test_login.py treat an EMPTY tuple as fail-closed.
+    """
+    return tuple(
+        piece
+        for piece in (p.strip() for p in (raw or "").split(","))
+        if piece
+    )
+
+
+def invalid_test_login_phones(
+    phones: "tuple[str, ...] | list[str]",
+) -> "tuple[str, ...]":
+    """Allowlist entries that can NEVER match a login: not a parsed-format
+    Indian mobile (+91 + 10 digits starting 6-9 — the same single-source
+    pattern the OTP endpoints enforce). Such entries would silently never
+    match, which is a configuration trap, so callers use this to fail fast
+    (production boot) or warn (local). Never returns/exposes the values.
+    """
+    from .schemas import INDIAN_MOBILE_PATTERN
+
+    compiled = re.compile(INDIAN_MOBILE_PATTERN)  # type: ignore[arg-type]
+    return tuple(p for p in phones if not compiled.fullmatch(p))
 
 
 class Settings:
@@ -83,6 +113,52 @@ class Settings:
     # requests do NOT arrive through a trusted reverse proxy; clients could
     # otherwise fake the header and evade per-IP caps).
     TRUST_PROXY: bool = _get("RESTAMP_TRUST_PROXY", "0") == "1"
+
+    # Restricted test-only login (see app/services/test_login.py): lets the
+    # deployed backend support phone login WITHOUT an SMS provider during the
+    # delivery-deferral window. Deliberately separate from the local OTP
+    # display mode (independent flags, service, and state): enabling one
+    # never affects the other. No OTP is generated, stored, returned, or
+    # logged anywhere in this flow.
+    # Disabled by default twice over: RESTAMP_TEST_LOGIN_ENABLED defaults "0",
+    # and the endpoint is ALSO inactive while RESTAMP_TEST_LOGIN_KEY is empty
+    # (inactive = 404 with the same body as an unknown route, so the
+    # endpoint's existence is never disclosed). Candidates carry the key in
+    # the X-Test-Login-Key header — kept out of the request body on purpose.
+    # Production startup REFUSES the enabled state with a weak/missing key
+    # (validate_security_config) — the production gate is strengthened,
+    # never bypassed. Treat the key as a credential: enable only for bounded
+    # test windows, then disable (flag back to "0") and/or rotate.
+    TEST_LOGIN_ENABLED: bool = _get("RESTAMP_TEST_LOGIN_ENABLED", "0") == "1"
+    TEST_LOGIN_KEY: str = _get("RESTAMP_TEST_LOGIN_KEY", "")
+    # Explicit test-phone allowlist, comma-separated (each entry must be an
+    # E.164 Indian mobile "+91###...", the same pattern the OTP endpoints
+    # enforce). FAIL CLOSED: empty (or a never-matchable entry is dropped
+    # only via invalid_test_login_phones at boot) → EVERY /auth/test-login
+    # attempt is rejected (403) even with a valid key — no implicit default
+    # test numbers exist. This list is the ONLY permission to USE the
+    # endpoint: no phone outside it can ever log in, and list membership
+    # is checked AFTER the constant-time key comparison (never an
+    # unauthenticated oracle).
+    TEST_LOGIN_ALLOWED_PHONES: tuple[str, ...] = _split_test_login_phones(
+        _get("RESTAMP_TEST_LOGIN_ALLOWED_PHONES", "")
+    )
+    # Account CREATION is gated SEPARATELY from the key + allowlist
+    # authorization (see app/services/test_login.py): existing allowlisted
+    # identities always log in, but an allowlisted UNKNOWN phone creates a
+    # user only when this flag is explicitly "1". With the default "0"
+    # (login-only) the endpoint can never create an account: an unknown
+    # phone gets the SAME generic 401 body as a wrong key (no
+    # account-existence oracle) and not a single row is written.
+    TEST_LOGIN_ALLOW_REGISTRATION: bool = _get(
+        "RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION", "0"
+    ) == "1"
+    TEST_LOGIN_MAX_PER_HOUR_PER_IP: int = _get_int(
+        "RESTAMP_TEST_LOGIN_MAX_PER_HOUR_PER_IP", 10
+    )
+    TEST_LOGIN_MAX_PER_HOUR_PER_PHONE: int = _get_int(
+        "RESTAMP_TEST_LOGIN_MAX_PER_HOUR_PER_PHONE", 20
+    )
 
     # Google verification. Real verification needs GOOGLE_CLIENT_ID and a real
     # verifier; dev mode accepts only synthetic "dev:<subject>" tokens.
@@ -202,6 +278,13 @@ def validate_security_config() -> None:
     - RESTAMP_OTP_DISPLAY_MODE is enabled (it must be '0' in production:
       OTP codes must never be returned in API responses; the temporary
       display mode exists for local/internal testing only);
+    - RESTAMP_TEST_LOGIN_ENABLED is set without a strong RESTAMP_TEST_LOGIN_KEY
+      (the restricted test-only login must never boot half-configured; it is
+      a separate mechanism from the display mode with its own key);
+    - RESTAMP_TEST_LOGIN_ALLOWED_PHONES contains entries that could never
+      match a login (not valid Indian mobile numbers) while test login is
+      enabled (fail fast; an EMPTY allowlist is bootable but rejects every
+      attempt at request time);
     - RESTAMP_GOOGLE_DEV_MODE is enabled;
     - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
     - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
@@ -221,6 +304,12 @@ def validate_security_config() -> None:
             "deployments."
         )
     if not is_production():
+        if settings.TEST_LOGIN_ENABLED and not (settings.TEST_LOGIN_KEY or "").strip():
+            _log.warning(
+                "RESTAMP_TEST_LOGIN_ENABLED is '1' but RESTAMP_TEST_LOGIN_KEY is "
+                "empty: /auth/test-login stays INACTIVE (404) until a strong "
+                "key is configured."
+            )
         return
     if not is_jwt_secret_strong(settings.JWT_SECRET):
         raise RuntimeError(
@@ -237,6 +326,44 @@ def validate_security_config() -> None:
             "be '0' in production (OTP codes must never be returned in API "
             "responses)."
         )
+    if settings.TEST_LOGIN_ENABLED and not is_jwt_secret_strong(
+        settings.TEST_LOGIN_KEY
+    ):
+        # The restricted test-only login may run in production ONLY with a
+        # strong key (same policy bar as the JWT secret: length + known
+        # placeholder blocklist). Fail fast so the endpoint can never boot
+        # half-configured. Message names the setting, never the value.
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_TEST_LOGIN_KEY must "
+            "be set to a strong random value at least 32 characters long "
+            "when RESTAMP_TEST_LOGIN_ENABLED is '1'."
+        )
+    if settings.TEST_LOGIN_ENABLED:
+        # The allowlist is the ONLY permission for a phone to use the
+        # restricted test login (and registration additionally requires
+        # TEST_LOGIN_ALLOW_REGISTRATION=1). Entries that could
+        # never match a login silently disable the number instead — refuse
+        # production boot so misconfiguration cannot slip through (setting
+        # name only, never entry values). An EMPTY list is intentionally
+        # bootable but fails closed at request time (every attempt → 403);
+        # warn so the state is visible in logs.
+        bad_entries = invalid_test_login_phones(
+            settings.TEST_LOGIN_ALLOWED_PHONES
+        )
+        if bad_entries:
+            raise RuntimeError(
+                "Insecure production configuration: "
+                "RESTAMP_TEST_LOGIN_ALLOWED_PHONES contains entries that are "
+                "not valid Indian mobile numbers (+91 + 10 digits starting "
+                "6-9); fix or remove them."
+            )
+        if not settings.TEST_LOGIN_ALLOWED_PHONES:
+            _log.warning(
+                "RESTAMP_TEST_LOGIN_ENABLED is '1' but "
+                "RESTAMP_TEST_LOGIN_ALLOWED_PHONES is EMPTY: every "
+                "/auth/test-login attempt will be rejected (403). Add "
+                "explicit test phone numbers to enable logins."
+            )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_GOOGLE_DEV_MODE must be '0' "
