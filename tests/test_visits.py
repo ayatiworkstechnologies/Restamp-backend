@@ -348,7 +348,7 @@ def test_visits_table_matches_model_and_head(client):
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'property_visits'")).fetchall()}
     assert {"idx_visits_buyer", "idx_visits_owner", "idx_visits_listing"} <= idx
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == \
-        "f2a3b4c5d6e7"
+        "g7h8i9j0k1l2"
     from app.models import Base
     assert "property_visits" in Base.metadata.tables
     assert len(Base.metadata.tables) == 34
