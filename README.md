@@ -91,6 +91,30 @@ Everything else unchanged:
   tests/test_phase1_security.py` (requires the local
   DB at Alembic head).
 
+## Running the test suite (local `restamp_test`)
+
+Run the full suite against the dedicated local `restamp_test` database, not
+`restamp_dev`: existing dev data (e.g. phone identities) collides with test
+fixtures. Every test runs in a rolled-back transaction, so the suite leaves
+`restamp_test` unchanged.
+
+```bash
+# In the same shell that runs pytest/alembic (pytest does not read .env):
+export RESTAMP_DATABASE_URL="<local restamp_test URL>"
+export RESTAMP_TEST_REQUIRE_DISPOSABLE=1   # disposable-database guard
+alembic upgrade head                       # only if restamp_test is behind head
+pytest
+```
+
+- `<local restamp_test URL>` is your `restamp_dev` URL from Local setup with
+  the database name changed to `restamp_test` (same user, same
+  `unix_socket=/tmp/mysql.sock`). Never commit it or put it in tracked files.
+- `tests/conftest.py` has no fallback URL: if `RESTAMP_DATABASE_URL` is unset
+  or not local (unix socket or loopback host), pytest stops before connecting.
+- `RESTAMP_TEST_REQUIRE_DISPOSABLE=1` refuses `restamp_dev` (plus any names in
+  `RESTAMP_TEST_BLOCKED_DBS`) and URLs without a database name.
+- The session aborts unless the database is at the single Alembic head.
+
 ## Production demo override (displayed OTP without SMS)
 
 Until an SMS provider is connected, a production deployment can return the

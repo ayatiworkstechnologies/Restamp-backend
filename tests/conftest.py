@@ -5,15 +5,36 @@ RESTAMP_GOOGLE_DEV_MODE=1.
 """
 import os
 
-os.environ.setdefault(
-    "RESTAMP_DATABASE_URL",
-    "mysql+pymysql://restamp_dev:Restamp%40123@localhost/restamp_dev?unix_socket=/tmp/mysql.sock",
-)
+import pytest
+
 os.environ["RESTAMP_JWT_SECRET"] = "phase4-test-secret"
 os.environ["RESTAMP_GOOGLE_DEV_MODE"] = "1"
 os.environ["RESTAMP_DISABLE_AUTO_VERIFY"] = "1"
 
-import pytest
+# The test database URL must come from the environment (see README:
+# `export RESTAMP_DATABASE_URL=...`; pytest does not read .env). There is
+# deliberately no in-repo fallback: credentials never live in tracked files,
+# and a missing URL must stop the run instead of silently targeting the app's
+# built-in default. Only local URLs (unix socket or loopback host) are
+# accepted, so a production URL exported in the shell can never be tested
+# against. Messages never include the URL or credentials. app.config reads
+# the environment at import, so it is imported only after the forced test
+# settings above.
+from app.config import _is_local_database_url
+
+if not os.environ.get("RESTAMP_DATABASE_URL", "").strip():
+    pytest.exit(
+        "RESTAMP_DATABASE_URL is not set. Export the local test database URL "
+        "(unix-socket URL, see README) before running pytest.",
+        returncode=4,
+    )
+if not _is_local_database_url(os.environ["RESTAMP_DATABASE_URL"]):
+    pytest.exit(
+        "RESTAMP_DATABASE_URL is not a local database URL (unix socket or "
+        "loopback host). Refusing to run tests against it.",
+        returncode=4,
+    )
+
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
