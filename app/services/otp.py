@@ -39,7 +39,7 @@ from typing import Callable
 
 from fastapi import HTTPException, status
 
-from ..config import is_production, settings
+from ..config import otp_display_permitted, settings
 
 NOT_CONNECTED_503 = "OTP delivery is not configured. Try again later."
 
@@ -112,10 +112,12 @@ class OTPService:
         or malformed DB URLs / envs into production — fail closed). In
         production this is therefore unreachable even if the flag is left
         set; the startup gate additionally refuses production boot with it.
+        The single exception is the explicit RESTAMP_OTP_DISPLAY_IN_PRODUCTION
+        demo override (config.otp_display_permitted).
         """
         if not settings.OTP_DISPLAY_MODE:
             return False
-        return not is_production()
+        return otp_display_permitted()
 
     def request_code(self, phone: str, ip: str | None = None) -> str | None:
         """Generate a code with `secrets` and store its hash.

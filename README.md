@@ -90,3 +90,22 @@ Everything else unchanged:
   tests/test_otp_demo_mode.py tests/test_concurrency.py tests/test_auth_production.py
   tests/test_phase1_security.py` (requires the local
   DB at Alembic head).
+
+## Production demo override (displayed OTP without SMS)
+
+Until an SMS provider is connected, a production deployment can return the
+generated code exactly like local display mode, but only with **both**:
+
+```env
+RESTAMP_OTP_DISPLAY_MODE=1
+RESTAMP_OTP_DISPLAY_IN_PRODUCTION=1
+```
+
+- `RESTAMP_OTP_DISPLAY_MODE=1` alone still refuses production startup.
+- Startup logs a warning while the override is active.
+- Codes stay random, single use, expiring and rate limited, and are verified
+  by the normal `POST /auth/otp/verify`.
+- **Anyone who can reach the API can sign in as any phone number,
+  including existing accounts.** Set `RESTAMP_OTP_DISPLAY_IN_PRODUCTION=0`
+  (or `RESTAMP_OTP_DISPLAY_MODE=0`) to restore the fail-closed 503.
+- Tests: `pytest tests/test_otp_production_display.py`.

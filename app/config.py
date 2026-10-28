@@ -65,6 +65,15 @@ class Settings:
     # is_production() at request time — so production API responses and
     # logs can never contain a code. There is no SMS vendor behind it.
     OTP_DISPLAY_MODE: bool = _get("RESTAMP_OTP_DISPLAY_MODE", "0") == "1"
+    # DEMO OVERRIDE for a production deployment (separate, explicit opt-in).
+    # Only when this is "1" AS WELL AS RESTAMP_OTP_DISPLAY_MODE=1 may a
+    # production-classified process return the generated code as
+    # "debug_code" (no SMS provider exists yet). Anyone who can reach the
+    # API can then sign in as ANY phone number, including existing accounts.
+    # Set it to "0" (or remove it) to restore the fail-closed 503.
+    OTP_DISPLAY_IN_PRODUCTION: bool = (
+        _get("RESTAMP_OTP_DISPLAY_IN_PRODUCTION", "0") == "1"
+    )
     # Per-IP abuse protection (in-memory, per process — see otp.py).
     # These bound total OTP request/verify-failure volume from a single
     # client IP across all phones, so rotating phones does not bypass
@@ -172,6 +181,20 @@ def is_production() -> bool:
         return True
 
 
+def otp_display_permitted() -> bool:
+    """Whether the OTP display mode may be active in this process.
+
+    Non-production processes (local development) keep their behavior.
+    Production-classified processes permit it ONLY with the explicit
+    RESTAMP_OTP_DISPLAY_IN_PRODUCTION demo override. Re-evaluated per
+    request by the OTP service and enforced at startup by
+    validate_security_config().
+    """
+    if not is_production():
+        return True
+    return settings.OTP_DISPLAY_IN_PRODUCTION
+
+
 def is_jwt_secret_strong(secret: str | None) -> bool:
     """Check length + blocklist without ever logging the value."""
     if not secret or not isinstance(secret, str):
@@ -201,7 +224,9 @@ def validate_security_config() -> None:
     - JWT secret is missing, weak (<32 chars), or a known placeholder;
     - RESTAMP_OTP_DISPLAY_MODE is enabled (it must be '0' in production:
       OTP codes must never be returned in API responses; the temporary
-      display mode exists for local/internal testing only);
+      display mode exists for local/internal testing only) — unless the
+      explicit RESTAMP_OTP_DISPLAY_IN_PRODUCTION=1 demo override is also
+      set, which is logged as a warning at startup;
     - RESTAMP_GOOGLE_DEV_MODE is enabled;
     - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
     - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
@@ -230,15 +255,23 @@ def validate_security_config() -> None:
             "Insecure production configuration: RESTAMP_JWT_SECRET must be "
             "set to a strong random value at least 32 characters long."
         )
-    if settings.OTP_DISPLAY_MODE:
+    if settings.OTP_DISPLAY_MODE and not otp_display_permitted():
         # The temporary internal-testing display mode must NEVER be enabled
-        # on a production-classified deployment: OTP codes must never be
-        # returned in API responses (or logs). The service also enforces
+        # on a production-classified deployment by the flag alone: OTP codes
+        # must never be returned in API responses (or logs) unless the
+        # explicit demo override is also set. The service also enforces
         # this at request time (see app/services/otp.py _display_active).
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_OTP_DISPLAY_MODE must "
             "be '0' in production (OTP codes must never be returned in API "
             "responses)."
+        )
+    if settings.OTP_DISPLAY_MODE:
+        _log.warning(
+            "RESTAMP_OTP_DISPLAY_IN_PRODUCTION is enabled: OTP request "
+            "responses include the generated code, so any phone number can "
+            "be signed in to without SMS. Set it to '0' to restore the "
+            "fail-closed behavior."
         )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
