@@ -242,7 +242,7 @@ def test_patch_users_me_profile_update(client):
 
 
 def test_schema_regression_29_tables(client):
-    # Visits phase: 33 + property_visits.
+    # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
     c, session = client
     tables = {
         r[0]
@@ -251,13 +251,16 @@ def test_schema_regression_29_tables(client):
                   "WHERE TABLE_SCHEMA = DATABASE()")
         ).fetchall()
     } - {"alembic_version"}
-    assert len(tables) == 34
+    assert len(tables) == 35
+    assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "rent_terms" in tables
     assert "amenity_master" in tables
     assert "listing_amenities" in tables
     assert "property_visits" in tables
+    # The DB must sit at the current single script head (resolved from the
+    # migration files, so new migrations never leave a stale literal here).
+    from tests.conftest import _expected_heads
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == (
-        # Visits phase: + property_visits table.
-        "f2a3b4c5d6e7"
+        _expected_heads()[0]
     )

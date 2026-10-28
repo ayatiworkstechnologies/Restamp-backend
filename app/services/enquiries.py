@@ -7,6 +7,8 @@ fallback for true races. No snapshots, no display tables, no chat.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -30,6 +32,20 @@ def _visible_listing(db: Session, listing_id: int) -> PropertyListing:
     return listing
 
 
+def _utcnow_naive_seconds() -> datetime:
+    """Naive UTC, whole seconds: enquiries.created_at is a MySQL DATETIME
+    (no fractional part), so the value returned at creation is exactly the
+    value every later read returns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
+def _created_at_out(value: datetime | None) -> datetime | None:
+    """Stored naive UTC -> explicit UTC for the API (serialized with "Z", so
+    clients never mistake it for local time). None stays None: rows created
+    before the column existed have no trustworthy creation time."""
+    return value.replace(tzinfo=timezone.utc) if value is not None else None
+
+
 def _snapshot(db: Session, enquiry: Enquiry) -> dict:
     listing = db.get(PropertyListing, enquiry.property_listing_id)
     return {
@@ -38,6 +54,7 @@ def _snapshot(db: Session, enquiry: Enquiry) -> dict:
         "message": enquiry.message,
         "status": enquiry.status,
         "closing_reason": enquiry.closing_reason,
+        "created_at": _created_at_out(enquiry.created_at),
         "listing": {
             "title": listing.title,
             "price_paise": listing.price_paise,
@@ -73,6 +90,7 @@ def create_enquiry(
         owner_user_id=owner_id,
         message=message,
         status="NEW",
+        created_at=_utcnow_naive_seconds(),
     )
     db.add(enquiry)
     try:
@@ -134,6 +152,7 @@ def list_enquiries(
             "message": e.message,
             "status": e.status,
             "closing_reason": e.closing_reason,
+            "created_at": _created_at_out(e.created_at),
             "listing": {"title": title, "price_paise": price_paise, "price_period": price_period},
         }
         for e, title, price_paise, price_period in rows
@@ -159,19 +178,51 @@ _ALLOWED_OWNER_TRANSITIONS = {
 }
 
 
+def _buyer_display_names(db: Session, buyer_ids: list[int]) -> dict[int, str | None]:
+    """buyer_user_id -> owner-safe display name (None when there is none).
+
+    Phone-registered accounts start with display_name = their phone number,
+    so a name is only returned when it passes the same phone-leak rule the
+    public owner name uses (listings.safe_display_name). Two batched reads
+    per page; no other user columns are selected.
+    """
+    from ..models import AuthIdentity, User
+    from .listings import safe_display_name
+
+    ids = sorted({int(b) for b in buyer_ids})
+    if not ids:
+        return {}
+    phones: dict[int, set[str]] = {}
+    for uid, ident in (
+        db.query(AuthIdentity.user_id, AuthIdentity.provider_identifier)
+        .filter(AuthIdentity.user_id.in_(ids), AuthIdentity.provider == "phone")
+        .all()
+    ):
+        phones.setdefault(int(uid), set()).add(ident)
+    return {
+        int(uid): safe_display_name(name, phones.get(int(uid), set()))
+        for uid, name in db.query(User.id, User.display_name).filter(User.id.in_(ids)).all()
+    }
+
+
 def _owner_snapshot(db: Session, enquiry: Enquiry) -> dict:
     listing = db.get(PropertyListing, enquiry.property_listing_id)
+    names = _buyer_display_names(db, [enquiry.buyer_user_id])
     return {
         "id": enquiry.id,
         "property_listing_id": enquiry.property_listing_id,
         "buyer_user_id": enquiry.buyer_user_id,
+        "buyer_display_name": names.get(int(enquiry.buyer_user_id)),
+        "listing_removed": listing.deleted_at is not None,
         "message": enquiry.message,
         "status": enquiry.status,
         "closing_reason": enquiry.closing_reason,
+        "created_at": _created_at_out(enquiry.created_at),
         "listing": {
             "title": listing.title,
             "price_paise": listing.price_paise,
             "price_period": listing.price_period,
+            "property_type": listing.property_type,
         },
     }
 
@@ -212,8 +263,9 @@ def list_owner_leads(
     physical_properties.user_id at creation, the same authority contact
     reveal uses). A property filter is validated against the caller's owned
     physical properties — a foreign id raises 404, never an empty list, so
-    callers cannot probe other owners' listings. No phone numbers, names, or
-    avatars are selected: buyer identity is the stable user id only.
+    callers cannot probe other owners' listings. No phone numbers or avatars
+    are selected; the buyer's display name is included only when it is a
+    chosen name (never the phone-number default — see _buyer_display_names).
     """
     from sqlalchemy import func as _func
 
@@ -233,12 +285,17 @@ def list_owner_leads(
         if owned is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
+    # Historical leads stay visible: there is deliberately no deleted_at or
+    # listing-status filter here. A soft-removed listing keeps its row, so
+    # its real title/price are still returned, flagged via listing_removed.
     base = (
         db.query(
             Enquiry,
             PropertyListing.title,
             PropertyListing.price_paise,
             PropertyListing.price_period,
+            PropertyListing.deleted_at,
+            PropertyListing.property_type,
         )
         .join(PropertyListing, PropertyListing.id == Enquiry.property_listing_id)
         .filter(Enquiry.owner_user_id == owner_id)
@@ -251,15 +308,24 @@ def list_owner_leads(
     rows = (
         base.order_by(Enquiry.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
     )
+    names = _buyer_display_names(db, [e.buyer_user_id for e, *_ in rows])
     return [
         {
             "id": e.id,
             "property_listing_id": e.property_listing_id,
             "buyer_user_id": e.buyer_user_id,
+            "buyer_display_name": names.get(int(e.buyer_user_id)),
+            "listing_removed": deleted_at is not None,
             "message": e.message,
             "status": e.status,
             "closing_reason": e.closing_reason,
-            "listing": {"title": title, "price_paise": price_paise, "price_period": price_period},
+            "created_at": _created_at_out(e.created_at),
+            "listing": {
+                "title": title,
+                "price_paise": price_paise,
+                "price_period": price_period,
+                "property_type": property_type,
+            },
         }
-        for e, title, price_paise, price_period in rows
+        for e, title, price_paise, price_period, deleted_at, property_type in rows
     ], total

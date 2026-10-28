@@ -226,7 +226,7 @@ def test_status_filter_and_lead_shape_has_no_phone(client):
     assert body["total"] >= 1
     item = [i for i in body["items"] if i["property_listing_id"] == lid][0]
     assert set(item.keys()) == {
-        "id", "property_listing_id", "buyer_user_id", "message",
+        "id", "property_listing_id", "buyer_user_id", "buyer_display_name", "listing_removed", "created_at", "message",
         "status", "closing_reason", "listing",
     }
     import json as _json

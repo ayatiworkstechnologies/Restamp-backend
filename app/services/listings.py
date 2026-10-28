@@ -219,7 +219,24 @@ def _safe_owner_name(db: Session, user_id: int) -> str | None:
     user = db.get(User, user_id)
     if user is None:
         return None
-    name = (user.display_name or "").strip()
+    phone_ids = {
+        r[0]
+        for r in db.query(AuthIdentity.provider_identifier)
+        .filter(AuthIdentity.user_id == user_id, AuthIdentity.provider == "phone")
+        .all()
+    }
+    return safe_display_name(user.display_name, phone_ids)
+
+
+def safe_display_name(display_name: str | None, phone_identifiers: set[str]) -> str | None:
+    """The phone-leak rule behind _safe_owner_name, without the DB reads.
+
+    Returns the stripped name, or None when it is empty, phone-shaped,
+    contains a phone-length digit run, or equals one of the user's phone
+    identities. Shared so batch readers (owner leads) apply the exact same
+    rule without a per-row query.
+    """
+    name = (display_name or "").strip()
     if not name:
         return None
     digits = re.sub(r"[\s\-()]", "", name)
@@ -229,13 +246,7 @@ def _safe_owner_name(db: Session, user_id: int) -> str | None:
     # names that consist entirely of a number.
     if re.search(r"(?:\d[\s\-().]*){6,}", name):
         return None
-    phone_ids = {
-        r[0]
-        for r in db.query(AuthIdentity.provider_identifier)
-        .filter(AuthIdentity.user_id == user_id, AuthIdentity.provider == "phone")
-        .all()
-    }
-    if name in phone_ids:
+    if name in phone_identifiers:
         return None
     return name
 

@@ -36,7 +36,7 @@ from sqlalchemy import text as sqltext
 from app import config as config_module
 from app.config import validate_security_config
 from app.services import users_roles
-from app.services.otp import otp_service
+from tests.conftest import captured_otp_code
 
 REQUEST_OK = {"detail": "Not Found"}
 
@@ -146,27 +146,19 @@ def test_otp_request_schema_rejects_stray_code_field(client):
     """Login cannot be driven through the OTP request endpoint: the schema
     stays phone-only (a stray `code`/suffix field is a validation error,
     never silently accepted)."""
-    c, _ = client
+    c, session = client
     r = c.post(
         "/auth/otp/request",
         json={"phone": "+919850000004", "code": "000004"},
     )
     assert r.status_code == 422  # pydantic validation, not an auth path
-    assert _identity_count(session=pytest.importorskip("sqlalchemy").orm.Session.__init__ and None or _get_session(c), phone="+919850000004") == 0
+    assert _identity_count(session, "+919850000004") == 0
 
 
-def _get_session(c):  # the client fixture pairs (client, session); helper below
-    return _SESSION_HOLDER["s"]
-
-
-_SESSION_HOLDER = {"s": None}
-
-
-def test_otp_request_schema_rejects_stray_code_field_tight(client, session):
+def test_otp_request_schema_rejects_stray_code_field_tight(client):
     """Same contract, without the heroics above (kept legible): a stray
     `code` field on the OTP request is a 422 and creates NOTHING."""
     c, s = client
-    _SESSION_HOLDER["s"] = s
     r = c.post(
         "/auth/otp/request",
         json={"phone": "+919850000005", "code": "000005"},
@@ -195,19 +187,18 @@ def test_verify_with_arbitrary_code_cannot_register_or_authenticate(
     )
 
 
-def test_normal_otp_flow_still_authenticates(client, session):
+def test_normal_otp_flow_still_authenticates(client):
     """The real flow still works end-to-end on the OTP endpoints: request
     (via the test SMS stand-in) → real verification → token → /auth/me.
     This is the restored, supported login production will use once an SMS
     provider is attached."""
-    c, s = client
+    c, _ = client
     phone = "+919850000007"
-    # Seed the HMAC secret for this phone the way the service expects.
-    otp_service.ensure_secret(s, phone)
-    s.commit()
     req = c.post("/auth/otp/request", json={"phone": phone})
     assert req.status_code == 200
-    code = otp_service.last_code_for(s, phone)  # test-stand-in code; not printed
+    # The client fixture installs the TestSMSInbox delivery; read the code
+    # it captured (never printed), exactly as the other OTP suites do.
+    code = captured_otp_code(phone)
     ver = c.post("/auth/otp/verify", json={"phone": phone, "code": code})
     assert ver.status_code == 200
     body = ver.json()

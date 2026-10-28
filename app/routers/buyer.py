@@ -15,6 +15,7 @@ from ..services import contact as contact_svc
 from ..services import enquiries as enquiry_svc
 from ..services import saved as saved_svc
 from ..services import visits as visit_svc
+from ..services import viewed as viewed_svc
 
 router = APIRouter(prefix="/buyer", tags=["buyer"])
 
@@ -123,7 +124,9 @@ def create_buyer_enquiry(
         # Idempotent duplicate: same validated body, 200 instead of 201.
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content=schemas.EnquiryOut(**enquiry).model_dump(),
+            # mode="json": created_at is a datetime; serialize it exactly as
+            # the 201 path's response_model does (explicit UTC string).
+            content=schemas.EnquiryOut(**enquiry).model_dump(mode="json"),
         )
     return enquiry
 
@@ -258,3 +261,49 @@ def update_buyer_visit(
     sp.commit()
     db.commit()
     return visit
+
+
+@router.post("/viewed/{listing_id}", response_model=schemas.ViewedPropertyOut, status_code=201)
+def record_viewed(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """Record that the caller viewed a property listing detail.
+
+    Idempotent: repeats update viewed_at instead of duplicating rows.
+    Enforces the 20-per-buyer retention rule. 404 if the listing does not
+    exist or is not visible to buyers.
+    """
+    from ..models import PropertyListing, PhysicalProperty
+
+    visible = (
+        db.query(PropertyListing)
+        .join(PhysicalProperty, PhysicalProperty.id == PropertyListing.physical_property_id)
+        .filter(
+            PropertyListing.id == listing_id,
+            PropertyListing.verification_status == "VERIFIED",
+            PropertyListing.listing_status == "AVAILABLE",
+            PropertyListing.deleted_at.is_(None),
+            PhysicalProperty.user_id == PropertyListing.user_id,
+        )
+        .first()
+    )
+    if visible is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    vp = viewed_svc.record_view(db, buyer_id, listing_id)
+    db.commit()
+    return vp
+
+
+@router.get("/viewed", response_model=schemas.ViewedPropertiesResponse)
+def list_buyer_viewed(
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """List the caller's most recent viewed properties (max 20 per buyer)."""
+    items, total = viewed_svc.list_viewed(db, buyer_id, page, page_size)
+    return schemas.ViewedPropertiesResponse(items=items, page=page, page_size=page_size, total=total)

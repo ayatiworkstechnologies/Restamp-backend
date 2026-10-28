@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PHONE_PATTERN = r"^\+[1-9]\d{7,14}$"
 # Restamp accepts INDIAN MOBILE NUMBERS ONLY for phone-OTP login (request
@@ -52,7 +52,13 @@ class RoleOut(BaseModel):
 
 
 class OTPRequest(BaseModel):
-    """Indian mobile only (Restamp is India-only): +91 + 10 digits (6-9)."""
+    """Indian mobile only (Restamp is India-only): +91 + 10 digits (6-9).
+
+    Phone-only: unexpected fields (e.g. a stray `code`) are a 422, so login
+    can never be driven or probed through the OTP request endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     phone: str = Field(pattern=INDIAN_MOBILE_PATTERN)
 
@@ -141,6 +147,8 @@ class EnquiryCreate(BaseModel):
 
 
 class EnquiryListingSnapshot(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     title: str
     price_paise: int
     price_period: str
@@ -152,6 +160,9 @@ class EnquiryOut(BaseModel):
     message: str | None
     status: str
     closing_reason: str | None
+    # Explicit UTC creation time; null for enquiries created before the
+    # timestamp existed (their real time is unknown, never fabricated).
+    created_at: datetime | None = None
     listing: EnquiryListingSnapshot
 
 
@@ -162,22 +173,39 @@ class EnquiriesResponse(BaseModel):
     total: int
 
 
+class OwnerLeadListingSnapshot(EnquiryListingSnapshot):
+    """Owner-side listing snapshot: the shared enquiry snapshot plus the
+    listing's real property_type, so lead screens never infer a type from
+    the title. Owner endpoints only; buyer snapshots are unchanged."""
+
+    property_type: str | None = None
+
+
 class OwnerLeadOut(BaseModel):
     """One buyer enquiry visible to its owner (P3 leads MVP).
 
     Phone numbers are NEVER included: the buyer's contact stays hidden until
-    an explicitly authorized reveal. Buyer identity is the stable user id
-    only — display names are withheld because phone-registered accounts
-    default display_name to the phone number.
+    an explicitly authorized reveal. buyer_display_name is the buyer's own
+    chosen name, or null when they have none — phone-registered accounts
+    default display_name to the phone number, and that default (or any
+    phone-shaped name) is always withheld.
+
+    Historical leads are kept: listing_removed is true when the owner has
+    since removed (soft-deleted) the listing; the snapshot still carries its
+    real stored title and price.
     """
 
     id: int
     property_listing_id: int
     buyer_user_id: int
+    buyer_display_name: str | None = None
+    listing_removed: bool = False
     message: str | None
     status: str
     closing_reason: str | None
-    listing: EnquiryListingSnapshot
+    # Same contract as EnquiryOut.created_at (explicit UTC, or null = unknown).
+    created_at: datetime | None = None
+    listing: OwnerLeadListingSnapshot
 
 
 class OwnerLeadsResponse(BaseModel):
@@ -272,6 +300,29 @@ class VisitOut(BaseModel):
 
 class VisitsResponse(BaseModel):
     items: list[VisitOut]
+    page: int
+    page_size: int
+    total: int
+
+
+# --- Buyer viewed properties (Phase 8) ---------------------------------------
+
+class ViewedPropertyOut(BaseModel):
+    """Viewed property record: the buyer's own row plus the listing's public
+    card (same fields as search/saved). No phone numbers or other private
+    contact data. viewed_at is explicit UTC."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    property_listing_id: int
+    buyer_user_id: int
+    viewed_at: datetime
+    listing: ListingCard
+
+
+class ViewedPropertiesResponse(BaseModel):
+    items: list[ViewedPropertyOut]
     page: int
     page_size: int
     total: int
@@ -761,7 +812,13 @@ class ListingPhotoOut(BaseModel):
 
 
 class OwnerListingOut(BaseModel):
-    """A listing row visible to its owner (all statuses, no enquiry data)."""
+    """A listing row visible to its owner (all statuses).
+
+    enquiry_count / visit_count are totals (every status) of the owner's own
+    enquiries and visits for this listing — counts only, never buyer data.
+    removed is true for a listing the owner removed (soft-deleted): it is
+    hidden from buyers, but its record stays readable here.
+    """
 
     listing_id: int
     title: str
@@ -773,6 +830,7 @@ class OwnerListingOut(BaseModel):
     construction_status: str | None
     verification_status: str
     listing_status: str
+    removed: bool = False
     description: str | None
     locality: str
     city: str
@@ -814,6 +872,8 @@ class OwnerListingOut(BaseModel):
     cover_image_url: str | None
     gallery: list[str] = Field(default_factory=list)
     photos: list[ListingPhotoOut] = Field(default_factory=list)
+    enquiry_count: int = 0
+    visit_count: int = 0
 
 
 class OwnerListingsResponse(BaseModel):

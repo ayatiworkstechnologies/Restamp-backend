@@ -14,8 +14,10 @@ MD = Base.metadata
 
 def test_table_count_is_29():
     # Drafts phase: 32 + listing_drafts. Visits phase: + property_visits.
-    assert len(MD.tables) == 34
+    # Viewed history (h8i9j0k1l2m3): + viewed_properties.
+    assert len(MD.tables) == 35
     assert "saved_properties" in MD.tables
+    assert "viewed_properties" in MD.tables
     assert "rent_terms" in MD.tables
     assert "amenity_master" in MD.tables
     assert "listing_amenities" in MD.tables
@@ -69,11 +71,34 @@ def test_saved_properties_shape():
         assert forbidden not in t.columns
 
 
+def test_viewed_properties_shape():
+    """The one table h8i9j0k1l2m3 adds: surrogate id, one row per
+    buyer+listing, newest-first index, rows die with their buyer/listing."""
+    t = MD.tables["viewed_properties"]
+    assert [c.name for c in t.columns] == ["id", "buyer_user_id", "property_listing_id", "viewed_at"]
+    assert [c.name for c in t.primary_key.columns] == ["id"]
+    uniques = {
+        (con.name, tuple(c.name for c in con.columns))
+        for con in t.constraints if isinstance(con, UniqueConstraint)
+    }
+    assert ("uq_viewed_buyer_listing", ("buyer_user_id", "property_listing_id")) in uniques
+    idx = {i.name: [c.name for c in i.columns] for i in t.indexes}
+    assert idx["ix_viewed_properties_buyer_viewed_at"] == ["buyer_user_id", "viewed_at"]
+    fks = {(fk.parent.name, fk.column.table.name, fk.ondelete, fk.onupdate) for c in t.columns for fk in c.foreign_keys}
+    assert fks == {
+        ("buyer_user_id", "users", "CASCADE", "CASCADE"),
+        ("property_listing_id", "property_listings", "CASCADE", "CASCADE"),
+    }
+    assert all(t.columns[n].nullable is False for n in ("buyer_user_id", "property_listing_id", "viewed_at"))
+    for forbidden in ("phone", "notes", "metadata"):
+        assert forbidden not in t.columns
+
+
 def test_price_index_and_fk_counts():
     idx = [i.name for i in MD.tables["property_listings"].indexes]
     assert "idx_property_listings_price_paise" in idx
     total_fk = sum(len(list(c.foreign_keys)) for t in MD.tables.values() for c in t.columns)
-    assert total_fk == 52  # 49 existing + 3 property_visits FKs
+    assert total_fk == 54  # 49 existing + 3 property_visits + 2 viewed_properties FKs
 
 
 def test_forbidden_schema_absent():
@@ -85,7 +110,7 @@ def test_forbidden_schema_absent():
     # approved RENT design (Task 7); only a bare `phone` column stays forbidden.
     col_names = {c.name for tbl in MD.tables.values() for c in tbl.columns}
     assert "phone" not in col_names
-    assert "saved_properties" in MD.tables and len(MD.tables) == 34
+    assert "saved_properties" in MD.tables and len(MD.tables) == 35
     for tbl in MD.tables.values():
         for c in tbl.columns:
             assert type(c.type).__name__ != "Numeric"  # no DECIMAL money

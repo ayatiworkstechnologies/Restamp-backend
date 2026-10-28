@@ -130,6 +130,6 @@ def test_list_and_detail_scoping(client):
     assert {i["status"] for i in c.get("/buyer/enquiries", headers=ha).json()["items"]} == {"NEW"}
     # No leakage: exact key contract.
     item = c.get("/buyer/enquiries", headers=ha).json()["items"][0]
-    assert set(item.keys()) == {"id", "property_listing_id", "message", "status", "closing_reason", "listing"}
+    assert set(item.keys()) == {"id", "property_listing_id", "message", "status", "closing_reason", "created_at", "listing"}
     assert set(item["listing"].keys()) == {"title", "price_paise", "price_period"}
     assert "owner_user_id" not in str(item) and "phone" not in str(item).lower()

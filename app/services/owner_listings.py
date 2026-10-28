@@ -1225,6 +1225,10 @@ def _row_to_dict(row) -> dict:
         "construction_status": listing.construction_status,
         "verification_status": listing.verification_status,
         "listing_status": listing.listing_status,
+        # Soft-removed listings keep their row (and history) and stay in the
+        # owner's own reads; this flag lets clients tell them apart from
+        # live ones without changing which rows are returned.
+        "removed": listing.deleted_at is not None,
         "description": listing.description,
         "address_line": address_line,
         "locality": locality or "",
@@ -1366,8 +1370,38 @@ def list_owner_listings(
             groups = amenities_by_listing.get(
                 c["listing_id"], {"amenities": [], "property_features": [], "other_rooms": []})
             c.update(groups)
+        counts = _activity_counts_map(db, owner_id, listing_ids)
+        for c in cards:
+            c.update(counts.get(c["listing_id"], {"enquiry_count": 0, "visit_count": 0}))
 
     return cards, total
+
+
+def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> dict:
+    """listing_id -> {enquiry_count, visit_count} for the owner's own rows.
+
+    Counts every enquiry/visit ever recorded for the listing (all statuses),
+    scoped by the stored owner_user_id — the same authority GET /owner/leads
+    and GET /owner/visits use — so the cards agree with those lists. Two
+    grouped queries per page; no N+1.
+    """
+    from sqlalchemy import func as _func
+
+    from ..models import Enquiry, PropertyVisit
+
+    if not listing_ids:
+        return {}
+    out = {lid: {"enquiry_count": 0, "visit_count": 0} for lid in listing_ids}
+    for model, key in ((Enquiry, "enquiry_count"), (PropertyVisit, "visit_count")):
+        rows = (
+            db.query(model.property_listing_id, _func.count(model.id))
+            .filter(model.owner_user_id == owner_id, model.property_listing_id.in_(listing_ids))
+            .group_by(model.property_listing_id)
+            .all()
+        )
+        for lid, n in rows:
+            out[int(lid)][key] = int(n)
+    return out
 
 
 def get_owner_listing(db: Session, owner_id: int, listing_id: int) -> dict | None:
@@ -1384,6 +1418,7 @@ def get_owner_listing(db: Session, owner_id: int, listing_id: int) -> dict | Non
     card["rent_terms"] = _rent_terms_map(db, [listing_id]).get(listing_id)
     card.update(_amenities_map(db, [listing_id]).get(
         listing_id, {"amenities": [], "property_features": [], "other_rooms": []}))
+    card.update(_activity_counts_map(db, owner_id, [listing_id])[listing_id])
     return card
 
 

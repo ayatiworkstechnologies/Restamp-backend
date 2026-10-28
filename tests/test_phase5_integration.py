@@ -280,17 +280,18 @@ def test_regression_foundation_intact(client):
             text("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()")
         ).fetchall()
     } - {"alembic_version"}
-    # Visits phase: 33 + property_visits.
-    assert len(tables) == 34
+    # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
+    assert len(tables) == 35
+    assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "property_visits" in tables
-    # Visits phase: 49 + 3 property_visits FKs.
+    # Visits phase: 49 + 3 property_visits FKs. Viewed history: + 2 FKs.
     assert (
         session.execute(
             text("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
                  "WHERE CONSTRAINT_SCHEMA = DATABASE()")
         ).fetchone()[0]
-        == 52
+        == 54
     )
     idx = {
         r[0]
@@ -308,14 +309,16 @@ def test_regression_foundation_intact(client):
         "idx_broker_history_status",
     ):
         assert required in idx, required
+    # The DB must sit at the current single script head (resolved from the
+    # migration files, so new migrations never leave a stale literal here).
+    from tests.conftest import _expected_heads
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == (
-        # Visits phase: + property_visits table.
-        "f2a3b4c5d6e7"
+        _expected_heads()[0]
     )
     from app.models import Base
 
-    # Visits phase: 33 + property_visits.
-    assert len(Base.metadata.tables) == 34
+    # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
+    assert len(Base.metadata.tables) == 35
 
 
 def test_phase7_e2e_buyer_profile_owner_flow(client):

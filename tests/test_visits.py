@@ -347,8 +347,11 @@ def test_visits_table_matches_model_and_head(client):
         "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS "
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'property_visits'")).fetchall()}
     assert {"idx_visits_buyer", "idx_visits_owner", "idx_visits_listing"} <= idx
+    # The DB must sit at the current single script head (resolved from the
+    # migration files, so new migrations never leave a stale literal here).
+    from tests.conftest import _expected_heads
     assert session.execute(text("SELECT version_num FROM alembic_version")).fetchone()[0] == \
-        "g7h8i9j0k1l2"
+        _expected_heads()[0]
     from app.models import Base
     assert "property_visits" in Base.metadata.tables
-    assert len(Base.metadata.tables) == 34
+    assert len(Base.metadata.tables) == 35

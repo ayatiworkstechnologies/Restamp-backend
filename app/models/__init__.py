@@ -13,6 +13,7 @@ from .visits import PropertyVisit
 from .brokers import BrokerPostcodeAccessCurrent, BrokerPostcodeAccessHistory
 from .logs import ContactRevealAudit, ActivityLog, AuditLog
 from .saved import SavedProperty
+from .viewed import ViewedProperty
 __all__ = [
     "User","AuthIdentity","UserCurrentRole","RoleHistory","AdminAccount",
     "City","District","Taluk","Village","Locality","Postcode",
@@ -24,5 +25,6 @@ __all__ = [
     "BrokerPostcodeAccessCurrent","BrokerPostcodeAccessHistory",
     "ContactRevealAudit","ActivityLog","AuditLog",
     "SavedProperty",
+    "ViewedProperty",
 ]
 from .users import Base, User
