@@ -76,70 +76,6 @@ Notes:
 - With display mode off in a local process, requests fail closed with the
   same generic 503 as production.
 
-### Production posture
-
-Explicitly supported production testing window — restricted test-only login:
-
-- `POST /auth/test-login` — body: same shape as `/auth/otp/request`
-  (Indian mobile); header: `X-Test-Login-Key: <RESTAMP_TEST_LOGIN_KEY>` value.
-  When `RESTAMP_TEST_LOGIN_ENABLED="1"` and the key are configured, it
-  returns the SAME `TokenOut` as `/auth/otp/verify` — **only for the
-  phones explicitly listed in `RESTAMP_TEST_LOGIN_ALLOWED_PHONES`**
-  (comma-separated `+91...` Indian mobiles). **NO OTP is ever generated,
-  stored, returned, or logged.** Guards:
-  - allowlist **fails closed**: an empty list rejects EVERY phone (403
-    "Forbidden") even with a valid key;
-  - any phone outside the list is rejected (403) even with a valid key,
-    and no account is created for it — the list is the ONLY permission
-    to use the endpoint at all;
-  - account creation is a SEPARATE flag: with
-    `RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION=0` (the default), existing
-    allowlisted accounts log in but an unknown phone gets the same
-    generic 401 as a wrong key (no account is created, no oracle); with
-    `"1"`, unknown allowlisted phones register as BUYER with
-    `verified_by="test_login"`;
-  - disabled by default: with the flag off (or no key), it answers the
-    same 404 body as an unknown route;
-  - request shape is guarded too: DISABLED, every body (even malformed,
-    unparseable ones) gets that exact 404 — the body is never even read;
-    ACTIVE, malformed bodies get the same generic 401 as a wrong key
-    (never a 422), and malformed garbage never consumes rate budget;
-  - production startup REFUSES to boot if enabled with a missing/weak
-    key (< 32 chars) or with malformed allowlist entries;
-  - attempts are rate limited per IP (10/hr) and per phone (20/hr)
-    before the key check;
-  - authorization MODE (`RESTAMP_TEST_LOGIN_MODE`, default `"allowlist"`):
-    in **`"existing"` mode** the allowlist is ignored and ANY valid Indian
-    mobile may log in ONLY when a Restamp account already exists for it —
-    an unknown phone gets the explicit 404 "No account found for this
-    phone number." (key-gated: checked after the key, so it is never an
-    open account-existence oracle), ZERO rows are written, and
-    registration is impossible (`RESTAMP_TEST_LOGIN_ALLOW_REGISTRATION`
-    must stay `"0"` — production refuses otherwise). Production refuses
-    boot for an unknown mode value; at request time an unknown mode keeps
-    the endpoint disabled (exact 404).
-  - in **`"suffix"` mode** (presenter convenience for a bounded demo
-    window ONLY) the sole authorization is the LAST SIX DIGITS of the
-    entered phone, sent in a `{phone, code}` body with NO key header
-    (`X-Test-Login-Key` is ignored). **The value is predictable — the
-    client literally just typed the phone — so it is NOT a secret and
-    never proof of ownership**; the mode is therefore guarded: active
-    ONLY inside `RESTAMP_TEST_LOGIN_SUFFIX_UNTIL` (ISO-8601 UTC deadline,
-    required in production, future and at most 24h ahead at boot, and
-    re-checked on EVERY request — once it passes the endpoint
-    self-disarms to the exact inactive 404 with no redeploy), sharing the
-    per-IP (10/hr) and per-phone (20/hr) limits, existing accounts only
-    (unknown phones → the explicit 404, zero rows), registration
-    structurally impossible (production refuses suffix + registration),
-    and a wrong code is the byte-identical generic 401 for phones with
-    and without accounts (no account-existence oracle). Recommended for
-    a single presentation only; switch `RESTAMP_TEST_LOGIN_MODE` back to
-    `"existing"` (or let the deadline pass) before leaving the window
-    open.
-  Enable only for bounded test windows, then set the flag back to `"0"`
-  and/or rotate the key. Separate from the display mode: enabling one
-  never affects the other.
-
 Everything else unchanged:
 
 - `RESTAMP_OTP_DISPLAY_MODE` must stay `0` in production (startup refuses
@@ -152,5 +88,5 @@ Everything else unchanged:
   refuses it in every classification.
 - Auth tests: `pytest tests/test_otp_delivery.py tests/test_otp_display_mode.py
   tests/test_otp_demo_mode.py tests/test_concurrency.py tests/test_auth_production.py
-  tests/test_phase1_security.py tests/test_test_login.py` (requires the local
+  tests/test_phase1_security.py` (requires the local
   DB at Alembic head).
