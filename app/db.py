@@ -19,7 +19,9 @@ Configuration (never hardcoded):
 - ``RESTAMP_DB_SSL_CA`` — filesystem path to the Aiven ``ca.pem`` (Render
   Secret File mount path). Required for non-local TCP hosts.
 """
+import logging
 import os
+import re
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -28,6 +30,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from .config import settings
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+log = logging.getLogger("restamp.db")
 
 # Query keys (normalised: lower-case, "-" -> "_") that are consumed here and
 # must never reach the driver. Everything else (e.g. charset, unix_socket)
@@ -212,8 +216,77 @@ def get_db():
         db.close()
 
 
+# Redaction for connection-failure diagnostics. Driver messages can echo the
+# user name (MySQL 1045 "Access denied for user '<user>'@'<host>'") and, in
+# odd wrappers, a DSN or key=value secrets; none of that may reach the logs.
+_URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://\S+")
+# MySQL's own "(using password: YES|NO)" is diagnosis, not a secret: kept.
+_KV_SECRET_RE = re.compile(
+    r"(?i)(?<!using )\b(password|passwd|pwd|secret|token|ssl[_-]?key[_-]?password)\s*[=:]\s*\S+"
+)
+_MYSQL_USER_RE = re.compile(r"(?i)(for user )'[^']*'")
+_MAX_DIAGNOSTIC_LEN = 300
+
+
+def _sanitize_db_error(message: str) -> str:
+    """Strip credentials/URLs from a DB error message; keep the diagnosis.
+
+    Host names, MySQL error text and SSL reasons (e.g.
+    CERTIFICATE_VERIFY_FAILED) are kept because they explain *why* the
+    connection failed; the configured URL, user name and password, any URL
+    and any key=value secret are replaced with "***".
+    """
+    redacted = str(message)
+    password = username = None
+    try:
+        url = make_url(settings.DATABASE_URL)
+        password, username = url.password, url.username
+    except Exception:  # unparseable URL: still redact the raw string below
+        pass
+    # The password is redacted whatever its length (safety over legibility);
+    # the URL/user name only when long enough not to garble unrelated text.
+    if password:
+        redacted = redacted.replace(str(password), "***")
+    for literal in (settings.DATABASE_URL, username):
+        if literal and len(str(literal)) >= 3:
+            redacted = redacted.replace(str(literal), "***")
+    redacted = _URL_RE.sub("***", redacted)
+    redacted = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}=***", redacted)
+    redacted = _MYSQL_USER_RE.sub(r"\1'***'", redacted)
+    redacted = " ".join(redacted.split())  # one log line
+    if len(redacted) > _MAX_DIAGNOSTIC_LEN:
+        redacted = redacted[:_MAX_DIAGNOSTIC_LEN] + "..."
+    return redacted
+
+
+def _describe_db_error(exc: Exception) -> str:
+    """Format a failure as: <Class> [<DriverClass> <errno>]: <sanitized message>.
+
+    For SQLAlchemy DBAPI errors the driver exception (``exc.orig``) is used:
+    its args are (errno, message) for PyMySQL and it carries no SQL
+    statement or bound parameters.
+    """
+    kind = type(exc).__name__
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        args = getattr(orig, "args", ())
+        errno = args[0] if args and isinstance(args[0], int) else None
+        message = args[1] if errno is not None and len(args) > 1 else str(orig)
+        kind = f"{kind} [{type(orig).__name__}{f' {errno}' if errno is not None else ''}]"
+    else:
+        message = str(exc)
+    return f"{kind}: {_sanitize_db_error(message)}"
+
+
 def check_db() -> bool:
-    """Readiness probe target: True when a trivial query succeeds."""
+    """Readiness probe target: True when a trivial query succeeds.
+
+    Fail-closed: any failure returns False. The failure is logged (ERROR,
+    logger "restamp.db") as exception class + driver error + sanitized
+    message so the real cause (DNS, auth, SSL/CA, timeout) is visible —
+    deliberately without exc_info, because a traceback would repeat the raw,
+    unsanitized driver message.
+    """
     try:
         db: Session = SessionLocal()
         try:
@@ -221,5 +294,9 @@ def check_db() -> bool:
         finally:
             db.close()
         return True
-    except Exception:
+    except Exception as exc:
+        try:
+            log.error("Database check failed: %s", _describe_db_error(exc))
+        except Exception:  # diagnostics must never change the outcome
+            log.error("Database check failed: %s", type(exc).__name__)
         return False
