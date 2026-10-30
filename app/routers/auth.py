@@ -12,7 +12,7 @@ from .. import schemas
 from ..config import settings
 from ..db import get_db
 from ..models import AuthIdentity
-from ..security import create_access_token, get_current_user
+from ..security import create_access_token, ensure_active_user, get_current_user
 from ..services import google as google_svc
 from ..services import users_roles
 from ..services.otp import otp_service
@@ -58,6 +58,9 @@ def _client_ip(request: Request | None) -> str | None:
 
 
 def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
+    # Every login path (OTP, Google) issues its token here: a suspended or
+    # closed account gets 403 "Account disabled" instead of a session.
+    ensure_active_user(db, user_id)
     role = users_roles.get_current_role(db, user_id)
     token, ttl = create_access_token(user_id, role)
     return schemas.TokenOut(

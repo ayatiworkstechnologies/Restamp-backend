@@ -62,11 +62,26 @@ def get_current_user_id(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
-def get_current_user(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
-    """Load the authenticated User row; a token for a deleted user is rejected."""
+def ensure_active_user(db: Session, user_id: int):
+    """Load the user and refuse accounts that may not act.
+
+    A token for a deleted user is 401. A user whose `status` is not
+    'active' (suspended/closed) is 403 for every authenticated request and
+    at login, so disabling an account in the database takes effect at once,
+    even for tokens issued before it was disabled. Fail closed: any value
+    other than 'active' is refused. The detail is static and reveals only
+    the caller's own state.
+    """
     from .models import User
 
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if user.status != "active":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
     return user
+
+
+def get_current_user(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)):
+    """Load the authenticated, active User row (see ensure_active_user)."""
+    return ensure_active_user(db, user_id)

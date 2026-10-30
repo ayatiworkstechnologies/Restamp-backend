@@ -10,12 +10,14 @@ from sqlalchemy.orm import Session
 
 from .db import get_db
 from .models import PhysicalProperty
-from .security import get_current_user, get_current_user_id
+from .security import ensure_active_user, get_current_user, get_current_user_id
 from .services import users_roles
 
 
 def require_role(*allowed: str):
     def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+        # Suspended/closed accounts are refused before any role decision.
+        ensure_active_user(db, user_id)
         role = users_roles.get_current_role(db, user_id)
         if role not in allowed:
             # Actionable detail (caller's own state only, no data leak):
@@ -37,6 +39,7 @@ require_broker = require_role("BROKER")
 
 
 def require_admin(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+    ensure_active_user(db, user_id)
     if not users_roles.is_admin(db, user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     return user_id
