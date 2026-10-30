@@ -15,13 +15,14 @@ Endpoints:
   POST /owner/listings/{id}/photos — upload a photo for own listing (multipart)
   DELETE /owner/listings/{id}/photos/{media_id} — remove one photo (OWNER)
   DELETE /owner/listings/{id}         — permanently delete own listing (OWNER)
+  POST /owner/leads/{id}/messages     — reply to the buyer on own open lead
 
 No admin endpoints here; see users.py for admin grants.
 No schema changes; all writes use existing property_listings / physical_properties tables.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy.orm import Session
 from typing import Literal
 
@@ -34,6 +35,7 @@ from ..services import enquiries as enquiry_svc
 from ..services import visits as visit_svc
 from ..services import photo_storage
 from ..services import storage as storage_svc
+from ..services.media_urls import MAX_LISTING_PHOTOS
 
 router = APIRouter(prefix="/owner", tags=["owner"])
 
@@ -198,6 +200,68 @@ def update_my_lead(
     return card
 
 
+@router.get("/leads/{lead_id}", response_model=schemas.OwnerLeadDetailOut)
+def get_my_lead(
+    lead_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """One of the caller's leads with the buyer's full message thread
+    (CONTRACT §D). 404 when it is not the caller's. Pure read. Private notes
+    are not included (see /leads/{id}/notes)."""
+    return enquiry_svc.get_owner_lead(db, owner_id, lead_id)
+
+
+@router.post("/leads/{lead_id}/messages", response_model=schemas.EnquiryMessageOut, status_code=201)
+def reply_to_my_lead(
+    lead_id: int,
+    body: schemas.OwnerMessageIn,
+    response: Response,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Reply to the buyer on the caller's open lead (two-way thread).
+
+    The reply joins the same thread the buyer sees in GET
+    /buyer/enquiries/{id} and the owner sees in GET /owner/leads/{id}, with
+    sender "OWNER". 201 when stored; 200 with the stored reply when the
+    identical reply was already sent within the double-tap window. 404 when
+    the lead is not the caller's, 422 for a closed lead or an empty/over-long
+    message, 429 when the per-thread message limit is reached. Private notes
+    are never part of a thread."""
+    message, created = enquiry_svc.reply_as_owner(db, owner_id, lead_id, body.message)
+    db.commit()
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return message
+
+
+@router.get("/leads/{lead_id}/notes", response_model=schemas.LeadNotesResponse)
+def list_my_lead_notes(
+    lead_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Private notes on the caller's lead, oldest first (D4). 404 when the
+    lead is not the caller's. Never exposed through any buyer endpoint."""
+    items, total = enquiry_svc.list_lead_notes(db, owner_id, lead_id)
+    return schemas.LeadNotesResponse(items=items, total=total)
+
+
+@router.post("/leads/{lead_id}/notes", response_model=schemas.LeadNoteOut, status_code=201)
+def add_my_lead_note(
+    lead_id: int,
+    body: schemas.LeadNoteIn,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """Append a private note (1-2000 chars, trimmed) to the caller's lead.
+    Append-only; allowed on closed leads. 404 when not the caller's."""
+    note = enquiry_svc.add_lead_note(db, owner_id, lead_id, body.body)
+    db.commit()
+    return note
+
+
 @router.post("/listings/{listing_id}/photos", response_model=schemas.PhotoUploadOut, status_code=201)
 async def upload_listing_photo(
     listing_id: int,
@@ -230,6 +294,11 @@ async def upload_listing_photo(
     # with 404 before any Cloudinary upload is spent or stored.
     if not owner_svc.owner_owns_listing(db, owner_id, listing_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    # Gallery cap before any storage is spent (re-checked under the row lock
+    # in add_listing_photo for concurrent uploads).
+    if owner_svc.listing_photo_count(db, listing_id) >= MAX_LISTING_PHOTOS:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"A listing can have at most {MAX_LISTING_PHOTOS} photos")
 
     # Stream with a hard cap (MIME validated above; never trust the filename).
     chunks: list[bytes] = []
@@ -282,6 +351,14 @@ async def upload_listing_photo(
             photo_storage.delete_uploaded_image(public_id)
         db.rollback()
         raise
+    except ValueError as e:
+        # Gallery cap reached by a concurrent upload: drop the orphan, 422.
+        if is_local:
+            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
+        else:
+            photo_storage.delete_uploaded_image(public_id)
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception:
         # DB failure after the upload landed: destroy the orphan, persist nothing.
         if is_local:
@@ -729,7 +806,7 @@ def update_my_visit(
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(
-            db, "owner", owner_id, visit_id, body.scheduled_at, body.status
+            db, "owner", owner_id, visit_id, body.scheduled_at, body.status, body.note
         )
     except HTTPException as e:
         sp.rollback()

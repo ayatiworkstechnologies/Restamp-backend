@@ -336,7 +336,7 @@ def test_visits_table_matches_model_and_head(client):
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'property_visits'")).fetchall()}
     assert set(cols) == {"id", "property_listing_id", "buyer_user_id", "owner_user_id",
                          "scheduled_at", "status", "initiator", "note",
-                         "created_at", "updated_at"}
+                         "created_at", "updated_at", "rescheduled_at"}
     assert "REQUESTED" in cols["status"] and "COMPLETED" in cols["status"]
     assert "BUYER" in cols["initiator"] and "OWNER" in cols["initiator"]
     fks = session.execute(text(
@@ -354,4 +354,4 @@ def test_visits_table_matches_model_and_head(client):
         _expected_heads()[0]
     from app.models import Base
     assert "property_visits" in Base.metadata.tables
-    assert len(Base.metadata.tables) == 35
+    assert len(Base.metadata.tables) == 37

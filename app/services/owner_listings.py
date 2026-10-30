@@ -49,6 +49,7 @@ from ..models.properties import (
 )
 from ..schemas import CHENNAI_PINCODE_ERROR, normalize_chennai_pincode
 from ..services.listings import format_price
+from ..services.media_urls import MAX_LISTING_PHOTOS, validate_listing_image_url
 
 # MySQL duplicate-key error code (ER_DUP_ENTRY), surfaced by the pymysql
 # driver as ``IntegrityError.orig.args[0]``. It is the only integrity error
@@ -264,31 +265,42 @@ def _resolve_amenity_ids(db: Session, names: list[str] | None, kind: str) -> lis
 def _normalize_media_items(
     image_urls: list[str] | None,
     photos: list[dict] | None,
+    existing_urls: set[str] | None = None,
 ) -> list[dict]:
     """Build ordered media items from per-photo metadata (preferred) or the
-    legacy URL list. Cover stays index 0 by array position."""
+    legacy URL list. Cover stays index 0 by array position.
+
+    Every URL not already attached to this listing (``existing_urls``, PATCH
+    only) must pass media_urls.validate_listing_image_url: clients can never
+    introduce an arbitrary host or scheme. Already-attached URLs are kept
+    as-is so existing galleries (incl. server-generated local /media URLs)
+    can still be reordered and pruned. Duplicates and more than
+    MAX_LISTING_PHOTOS items are rejected (ValueError -> 422)."""
+    existing_urls = existing_urls or set()
+    raw: list[tuple[object, str | None]] = []
     if photos:
-        items = []
         for p in photos:
             if isinstance(p, dict):
-                url, category = p.get("url"), p.get("category")
+                raw.append((p.get("url"), p.get("category")))
             else:
-                url, category = p, None
-            if not url or not str(url).strip():
-                raise ValueError("photo url cannot be empty")
-            url = str(url).strip()
-            if len(url) > 500:
-                raise ValueError("photo url must be at most 500 characters")
-            items.append({"url": url, "category": category})
-        return items
+                raw.append((p, None))
+    else:
+        # legacy leniency: skip falsy entries in the plain URL list
+        raw = [(url, None) for url in image_urls or [] if url]
+    if len(raw) > MAX_LISTING_PHOTOS:
+        raise ValueError(f"A listing can have at most {MAX_LISTING_PHOTOS} photos")
     items = []
-    for url in image_urls or []:
-        if not url:
-            continue  # legacy leniency: skip falsy entries
-        url = str(url).strip()
-        if len(url) > 500:
-            raise ValueError("photo url must be at most 500 characters")
-        items.append({"url": url, "category": None})
+    seen: set[str] = set()
+    for url, category in raw:
+        stripped = str(url).strip() if url is not None else ""
+        if stripped and stripped in existing_urls:
+            url = stripped
+        else:
+            url = validate_listing_image_url(url)
+        if url in seen:
+            raise ValueError("duplicate photo url")
+        seen.add(url)
+        items.append({"url": url, "category": category})
     return items
 
 
@@ -349,6 +361,9 @@ def create_owner_listing(
     pincode = normalize_chennai_pincode(pincode)
     if not pincode:
         raise ValueError(CHENNAI_PINCODE_ERROR)
+    # Photo URLs/count/duplicates are validated before any row is written,
+    # for the same reason.
+    media_items = _normalize_media_items(image_urls, photos)
     postcode_id = _find_or_create_postcode(db, city, district, locality, pincode)
 
     # Canonical area unit: lowercase 'sqft' for new writes (existing 'SQFT'
@@ -432,7 +447,6 @@ def create_owner_listing(
         ))
         db.flush()
 
-    media_items = _normalize_media_items(image_urls, photos)
     for idx, item in enumerate(media_items):
         media = PropertyMedia(
             property_listing_id=listing.id,
@@ -517,6 +531,16 @@ def _write_rent_terms_row(
 # ---------------------------------------------------------------------------
 
 
+def listing_photo_count(db: Session, listing_id: int) -> int:
+    """Number of media rows on a listing (no ownership check; callers do it)."""
+    return (
+        db.query(func.count(PropertyMedia.id))
+        .filter(PropertyMedia.property_listing_id == listing_id)
+        .scalar()
+        or 0
+    )
+
+
 def add_listing_photo(
     db: Session,
     owner_id: int,
@@ -537,6 +561,10 @@ def add_listing_photo(
     listing = _get_owned_listing_for_update(db, owner_id, listing_id)
     if listing is None:
         return None
+    # Same cap as create/PATCH; checked under the listing row lock so two
+    # concurrent uploads cannot both slip past it.
+    if listing_photo_count(db, listing_id) >= MAX_LISTING_PHOTOS:
+        raise ValueError(f"A listing can have at most {MAX_LISTING_PHOTOS} photos")
     max_order = (
         db.query(func.max(PropertyMedia.order_index))
         .filter(PropertyMedia.property_listing_id == listing_id)
@@ -607,13 +635,13 @@ def _reconcile_media(
     only) so the caller can destroy the assets *after* committing.
     Flushes; the caller commits.
     """
-    desired = _normalize_media_items(image_urls, photos)
     existing = (
         db.query(PropertyMedia)
         .filter(PropertyMedia.property_listing_id == listing_id)
         .order_by(PropertyMedia.order_index, PropertyMedia.id)
         .all()
     )
+    desired = _normalize_media_items(image_urls, photos, {row.url for row in existing})
     by_url: dict[str, list] = {}
     for row in existing:
         by_url.setdefault(row.url, []).append(row)
@@ -1372,13 +1400,13 @@ def list_owner_listings(
             c.update(groups)
         counts = _activity_counts_map(db, owner_id, listing_ids)
         for c in cards:
-            c.update(counts.get(c["listing_id"], {"enquiry_count": 0, "visit_count": 0}))
+            c.update(counts.get(c["listing_id"], {"enquiry_count": 0, "visit_count": 0, "call_count": 0}))
 
     return cards, total
 
 
 def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> dict:
-    """listing_id -> {enquiry_count, visit_count} for the owner's own rows.
+    """listing_id -> {enquiry_count, visit_count, call_count} for the owner's own rows.
 
     Counts every enquiry/visit ever recorded for the listing (all statuses),
     scoped by the stored owner_user_id — the same authority GET /owner/leads
@@ -1391,7 +1419,7 @@ def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> 
 
     if not listing_ids:
         return {}
-    out = {lid: {"enquiry_count": 0, "visit_count": 0} for lid in listing_ids}
+    out = {lid: {"enquiry_count": 0, "visit_count": 0, "call_count": 0} for lid in listing_ids}
     for model, key in ((Enquiry, "enquiry_count"), (PropertyVisit, "visit_count")):
         rows = (
             db.query(model.property_listing_id, _func.count(model.id))
@@ -1401,6 +1429,12 @@ def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> 
         )
         for lid, n in rows:
             out[int(lid)][key] = int(n)
+    # Call-button taps (activity_logs, D2): counts only, never buyer identity.
+    from .call_events import call_counts
+
+    for lid, n in call_counts(db, listing_ids).items():
+        if lid in out:
+            out[lid]["call_count"] = n
     return out
 
 

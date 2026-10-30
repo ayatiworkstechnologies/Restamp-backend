@@ -15,7 +15,9 @@ MD = Base.metadata
 def test_table_count_is_29():
     # Drafts phase: 32 + listing_drafts. Visits phase: + property_visits.
     # Viewed history (h8i9j0k1l2m3): + viewed_properties.
-    assert len(MD.tables) == 35
+    # Messages/notes (j0k1l2m3n4o5): + enquiry_messages, lead_notes.
+    assert len(MD.tables) == 37
+    assert "enquiry_messages" in MD.tables and "lead_notes" in MD.tables
     assert "saved_properties" in MD.tables
     assert "viewed_properties" in MD.tables
     assert "rent_terms" in MD.tables
@@ -98,7 +100,7 @@ def test_price_index_and_fk_counts():
     idx = [i.name for i in MD.tables["property_listings"].indexes]
     assert "idx_property_listings_price_paise" in idx
     total_fk = sum(len(list(c.foreign_keys)) for t in MD.tables.values() for c in t.columns)
-    assert total_fk == 54  # 49 existing + 3 property_visits + 2 viewed_properties FKs
+    assert total_fk == 58  # 49 existing + 3 property_visits + 2 viewed_properties + 2 enquiry_messages + 2 lead_notes FKs
 
 
 def test_forbidden_schema_absent():
@@ -110,7 +112,7 @@ def test_forbidden_schema_absent():
     # approved RENT design (Task 7); only a bare `phone` column stays forbidden.
     col_names = {c.name for tbl in MD.tables.values() for c in tbl.columns}
     assert "phone" not in col_names
-    assert "saved_properties" in MD.tables and len(MD.tables) == 35
+    assert "saved_properties" in MD.tables and len(MD.tables) == 37
     for tbl in MD.tables.values():
         for c in tbl.columns:
             assert type(c.type).__name__ != "Numeric"  # no DECIMAL money

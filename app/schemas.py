@@ -154,6 +154,44 @@ class EnquiryListingSnapshot(BaseModel):
     price_period: str
 
 
+class BuyerEnquiryListingSnapshot(EnquiryListingSnapshot):
+    """Buyer-side enquiry snapshot (CONTRACT §A): what the Messages tab shows.
+    Owner, visit and viewed snapshots are separate classes."""
+
+    price_display: str | None = None
+    property_type: str | None = None
+    locality: str | None = None
+    city: str | None = None
+    cover_image_url: str | None = None
+
+
+class EnquiryMessageOut(BaseModel):
+    """One message on an enquiry thread, from the buyer or the listing owner.
+    ``sender`` is derived server-side from the stored sender id (never from
+    the client) and is the only sender information exposed: no user ids or
+    phones. id/created_at are null only for the opening message of an
+    enquiry created before messages were stored."""
+
+    id: int | None = None
+    body: str
+    sender: Literal["BUYER", "OWNER"] = "BUYER"
+    created_at: datetime | None = None
+
+
+class OwnerMessageIn(BaseModel):
+    """An owner reply on one of their leads: 1-2000 characters after trimming."""
+
+    message: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("message")
+    @classmethod
+    def _trimmed_non_empty(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("message cannot be empty")
+        return trimmed
+
+
 class EnquiryOut(BaseModel):
     id: int
     property_listing_id: int
@@ -163,7 +201,13 @@ class EnquiryOut(BaseModel):
     # Explicit UTC creation time; null for enquiries created before the
     # timestamp existed (their real time is unknown, never fabricated).
     created_at: datetime | None = None
-    listing: EnquiryListingSnapshot
+    # Thread summary (D1). `messages` is the full thread on POST and GET
+    # detail, null on list items.
+    message_count: int = 0
+    last_message: str | None = None
+    last_message_at: datetime | None = None
+    messages: list[EnquiryMessageOut] | None = None
+    listing: BuyerEnquiryListingSnapshot
 
 
 class EnquiriesResponse(BaseModel):
@@ -179,6 +223,8 @@ class OwnerLeadListingSnapshot(EnquiryListingSnapshot):
     the title. Owner endpoints only; buyer snapshots are unchanged."""
 
     property_type: str | None = None
+    locality: str | None = None
+    city: str | None = None
 
 
 class OwnerLeadOut(BaseModel):
@@ -205,7 +251,17 @@ class OwnerLeadOut(BaseModel):
     closing_reason: str | None
     # Same contract as EnquiryOut.created_at (explicit UTC, or null = unknown).
     created_at: datetime | None = None
+    message_count: int = 0
+    last_message: str | None = None
+    last_message_at: datetime | None = None
     listing: OwnerLeadListingSnapshot
+
+
+class OwnerLeadDetailOut(OwnerLeadOut):
+    """GET /owner/leads/{id}: the lead plus the buyer's full message thread.
+    Private lead notes are NOT included (separate owner-only endpoint)."""
+
+    messages: list[EnquiryMessageOut] = Field(default_factory=list)
 
 
 class OwnerLeadsResponse(BaseModel):
@@ -216,12 +272,65 @@ class OwnerLeadsResponse(BaseModel):
 
 
 class OwnerLeadUpdate(BaseModel):
-    """Owner-side status transition (P4). Only the existing backend
-    lifecycle statuses are accepted; anything else is a 422. closing_reason
-    is stored as supplied (e.g. "Not Converted") — there is no LOST status."""
+    """Owner-side status transition. Only the existing lifecycle statuses are
+    accepted. Closing (D5) requires one of the four outcomes; a reason with
+    any other status is rejected — both as 422. There is no LOST status."""
 
     status: Literal["NEW", "CONTACTED", "CLOSED"]
-    closing_reason: str | None = Field(default=None, max_length=500)
+    closing_reason: Literal["Rented", "Sold", "Leased", "Not Converted"] | None = None
+
+    @model_validator(mode="after")
+    def _reason_only_when_closing(self):
+        if self.status == "CLOSED" and self.closing_reason is None:
+            raise ValueError("closing_reason is required to close a lead")
+        if self.status != "CLOSED" and self.closing_reason is not None:
+            raise ValueError("closing_reason is only allowed when closing a lead")
+        return self
+
+
+class LeadNoteIn(BaseModel):
+    """A private owner note (D4): 1-2000 characters after trimming."""
+
+    body: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("body")
+    @classmethod
+    def _trimmed_non_empty(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("note cannot be empty")
+        return trimmed
+
+
+class LeadNoteOut(BaseModel):
+    id: int
+    body: str
+    created_at: datetime | None = None
+
+
+class LeadNotesResponse(BaseModel):
+    items: list[LeadNoteOut]
+    total: int
+
+
+class CallEventOut(BaseModel):
+    """One "Call button tapped" event (D2) — never a completed call."""
+
+    id: int
+    property_listing_id: int
+    created_at: datetime
+
+
+class CallEventItem(CallEventOut):
+    # Public card of the listing, or null when it is no longer publicly visible.
+    listing: ListingCard | None = None
+
+
+class CallEventsResponse(BaseModel):
+    items: list[CallEventItem]
+    page: int
+    page_size: int
+    total: int
 
 
 class ListingStatusUpdate(BaseModel):
@@ -267,35 +376,50 @@ class OwnerVisitCreate(BaseModel):
 
 
 class VisitUpdate(BaseModel):
-    """Reschedule and/or status-transition a visit. At least one field is
-    required; actor permissions and the state machine are enforced in the
-    service (buyer confirms/proposes-side, owner confirms/completes)."""
+    """Reschedule, edit the shared note and/or status-transition a visit. At
+    least one field is required; actor permissions and the state machine are
+    enforced in the service. `note` may be edited by whoever may edit the
+    time in the visit's current status; "" clears it."""
 
     scheduled_at: datetime | None = None
     status: Literal["CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = None
+    note: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
     def _at_least_one(self):
-        if self.scheduled_at is None and self.status is None:
-            raise ValueError("scheduled_at or status is required")
+        if self.scheduled_at is None and self.status is None and self.note is None:
+            raise ValueError("scheduled_at, status or note is required")
         return self
 
 
+class VisitListingSnapshot(EnquiryListingSnapshot):
+    """Visit-only listing snapshot (CONTRACT §C)."""
+
+    property_type: str | None = None
+    locality: str | None = None
+    city: str | None = None
+
+
 class VisitOut(BaseModel):
-    """One scheduled viewing. Buyer identity is the stable user id only —
-    no names (phone-registered display names would leak) and no phones."""
+    """One scheduled viewing. No phone numbers. Names (D6) are the buyer's
+    chosen name and the owner's public name — null when there is none, never
+    phone-based. rescheduled_at (explicit UTC) is set when the time changes
+    and cleared when the status changes; `note` is visible to both parties."""
 
     id: int
     property_listing_id: int
     buyer_user_id: int
     owner_user_id: int
+    buyer_display_name: str | None = None
+    owner_display_name: str | None = None
     scheduled_at: datetime
     status: str
     initiator: str
     note: str | None
-    listing: EnquiryListingSnapshot
+    listing: VisitListingSnapshot
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    rescheduled_at: datetime | None = None
 
 
 class VisitsResponse(BaseModel):
@@ -874,6 +998,7 @@ class OwnerListingOut(BaseModel):
     photos: list[ListingPhotoOut] = Field(default_factory=list)
     enquiry_count: int = 0
     visit_count: int = 0
+    call_count: int = 0
 
 
 class OwnerListingsResponse(BaseModel):

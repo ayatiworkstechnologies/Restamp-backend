@@ -10,6 +10,9 @@ import pytest
 os.environ["RESTAMP_JWT_SECRET"] = "phase4-test-secret"
 os.environ["RESTAMP_GOOGLE_DEV_MODE"] = "1"
 os.environ["RESTAMP_DISABLE_AUTO_VERIFY"] = "1"
+# Development-only approved photo-URL prefix used by test fixtures (ignored in
+# production; see app/services/media_urls.py). Every other host is rejected.
+os.environ["RESTAMP_DEV_MEDIA_URL_PREFIXES"] = "https://t.test/"
 
 # The test database URL must come from the environment (see README:
 # `export RESTAMP_DATABASE_URL=...`; pytest does not read .env). There is

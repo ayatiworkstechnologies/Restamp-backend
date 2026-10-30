@@ -78,9 +78,11 @@ def test_create_and_fetch_owner_listing(client):
         "bathrooms": 3,
         "description": "Spacious north-facing apartment with 2 car parks.",
         "construction_status": "READY_TO_MOVE",
+        # Approved media prefix (conftest); third-party hosts such as
+        # images.unsplash.com are now rejected (see test_media_url_security).
         "images": [
-            "https://images.unsplash.com/photo-1545324418-cc1a3fa10c00?w=800",
-            "https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=800",
+            "https://t.test/indiranagar-1.jpg",
+            "https://t.test/indiranagar-2.jpg",
         ],
     }
 

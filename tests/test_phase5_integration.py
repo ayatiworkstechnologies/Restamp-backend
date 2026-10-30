@@ -281,7 +281,7 @@ def test_regression_foundation_intact(client):
         ).fetchall()
     } - {"alembic_version"}
     # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
-    assert len(tables) == 35
+    assert len(tables) == 37  # + enquiry_messages, lead_notes (j0k1l2m3n4o5)
     assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "property_visits" in tables
@@ -291,7 +291,7 @@ def test_regression_foundation_intact(client):
             text("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
                  "WHERE CONSTRAINT_SCHEMA = DATABASE()")
         ).fetchone()[0]
-        == 54
+        == 58  # + 2 enquiry_messages + 2 lead_notes FKs
     )
     idx = {
         r[0]
@@ -318,7 +318,7 @@ def test_regression_foundation_intact(client):
     from app.models import Base
 
     # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
-    assert len(Base.metadata.tables) == 35
+    assert len(Base.metadata.tables) == 37
 
 
 def test_phase7_e2e_buyer_profile_owner_flow(client):

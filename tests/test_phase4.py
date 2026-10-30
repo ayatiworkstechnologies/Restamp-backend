@@ -251,7 +251,7 @@ def test_schema_regression_29_tables(client):
                   "WHERE TABLE_SCHEMA = DATABASE()")
         ).fetchall()
     } - {"alembic_version"}
-    assert len(tables) == 35
+    assert len(tables) == 37  # + enquiry_messages, lead_notes (j0k1l2m3n4o5)
     assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "rent_terms" in tables

@@ -216,9 +216,18 @@ def test_enquiry_403_means_wrong_role(client):
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
                headers=auth_header(broker))
     assert r.status_code == 403, r.text
-    # Switching back to BUYER restores access (self-serve preserved).
+    # Switching back to BUYER restores access (self-serve preserved): the
+    # role gate now passes. `lid` is this account's OWN listing, so the
+    # request reaches the self-enquiry rule (422, added in the 2026-10-30
+    # security review) instead of the 403 role refusal.
     c.post("/users/me/role", json={"role": "BUYER"}, headers=auth_header(token))
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
                headers=auth_header(token))
+    assert r.status_code == 422, r.text
+    assert r.json() == {"detail": "Cannot enquire on your own listing"}, r.text
+    # The broker switching to BUYER gets the full buyer path on that listing.
+    c.post("/users/me/role", json={"role": "BUYER"}, headers=auth_header(broker))
+    r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
+               headers=auth_header(broker))
     assert r.status_code in (200, 201), r.text
     _assert_no_phone_leak(r.json(), "enquiry-after-role-switch")

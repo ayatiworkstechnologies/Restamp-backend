@@ -121,6 +121,12 @@ class Settings:
     CLOUDINARY_API_KEY: str = _get("CLOUDINARY_API_KEY", "")
     CLOUDINARY_API_SECRET: str = _get("CLOUDINARY_API_SECRET", "")
     CLOUDINARY_FOLDER: str = _get("CLOUDINARY_FOLDER", "restamp")
+    # DEVELOPMENT ONLY: comma-separated exact base-URL prefixes (each ending
+    # in "/") that client-supplied listing photo URLs may also start with,
+    # e.g. a local media server. Ignored entirely in production (see
+    # app/services/media_urls.py), so it can never widen production
+    # validation; a production process that has it set logs a warning.
+    DEV_MEDIA_URL_PREFIXES: str = _get("RESTAMP_DEV_MEDIA_URL_PREFIXES", "")
 
 
 settings = Settings()
@@ -296,6 +302,14 @@ def validate_security_config() -> None:
             "is empty; listing photo uploads will fall back to local-disk storage "
             "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
             "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
+        )
+    if (settings.DEV_MEDIA_URL_PREFIXES or "").strip():
+        # Not fatal: the media-URL validator ignores it in production, so
+        # production validation is unchanged. Warn so the stray setting is
+        # visible (setting name only, never its value).
+        _log.warning(
+            "RESTAMP_DEV_MEDIA_URL_PREFIXES is set but ignored in production; "
+            "listing photo URLs must be approved Cloudinary URLs."
         )
     if settings.GOOGLE_ENABLED and not settings.GOOGLE_CLIENT_ID.strip():
         raise RuntimeError(

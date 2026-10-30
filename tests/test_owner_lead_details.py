@@ -177,7 +177,7 @@ def test_listing_counts_reflect_real_enquiries_and_visits(client):
 
     # Closing a lead keeps it in the total (counts are all-status totals).
     lead_id = _lead_for(c.get("/owner/leads", headers=ho).json(), lid)[0]["id"]
-    assert c.patch(f"/owner/leads/{lead_id}", json={"status": "CLOSED"}, headers=ho).status_code == 200
+    assert c.patch(f"/owner/leads/{lead_id}", json={"status": "CLOSED", "closing_reason": "Not Converted"}, headers=ho).status_code == 200
     assert c.get(f"/owner/listings/{lid}", headers=ho).json()["enquiry_count"] == 2
 
 
@@ -198,7 +198,7 @@ def test_counts_and_leads_never_include_another_owners_activity(client):
     assert c.get(f"/owner/listings/{lid_b}", headers=ha).status_code == 404
     assert c.get(f"/owner/leads?property_listing_id={lid_b}", headers=ha).status_code == 404
     lead_b = _lead_for(c.get("/owner/leads", headers=hb).json(), lid_b)[0]
-    assert c.patch(f"/owner/leads/{lead_b['id']}", json={"status": "CLOSED"},
+    assert c.patch(f"/owner/leads/{lead_b['id']}", json={"status": "CLOSED", "closing_reason": "Not Converted"},
                    headers=ha).status_code == 404
     still = _lead_for(c.get("/owner/leads", headers=hb).json(), lid_b)[0]
     assert still["status"] == "NEW"
@@ -224,7 +224,7 @@ def test_invalid_ids_and_payloads(client):
     assert c.get("/owner/listings/999999999", headers=ho).status_code == 404
     assert c.get("/owner/leads?property_listing_id=0", headers=ho).json() == {"detail": "Invalid request"}
     assert c.get("/owner/leads?page_size=101", headers=ho).status_code == 422
-    assert c.patch("/owner/leads/999999999", json={"status": "CLOSED"}, headers=ho).status_code == 404
+    assert c.patch("/owner/leads/999999999", json={"status": "CLOSED", "closing_reason": "Not Converted"}, headers=ho).status_code == 404
     assert c.patch("/owner/leads/1", json={"status": "LOST"}, headers=ho).status_code == 422
 
 
@@ -257,9 +257,9 @@ def test_lead_on_removed_listing_stays_visible_with_real_details(client):
     removed = _lead_for(body, lid)[0]
     assert removed["id"] == old["id"] and removed["message"] == "Still available?"
     assert removed["listing_removed"] is True
-    assert removed["listing"] == {
-        "title": "OL1", "price_paise": 100, "price_period": "TOTAL", "property_type": "APARTMENT",
-    }
+    real = {"title": "OL1", "price_paise": 100, "price_period": "TOTAL", "property_type": "APARTMENT"}
+    assert {k: removed["listing"][k] for k in real} == real
+    assert set(removed["listing"]) == set(real) | {"locality", "city"}
     live = _lead_for(body, live_lid)[0]
     assert live["listing_removed"] is False and live["listing"]["title"] == "OL2"
     # The removed listing's leads stay filterable and updatable by its owner.
@@ -297,7 +297,7 @@ def test_removed_listing_leads_stay_private_to_their_owner(client):
     assert c.get(f"/owner/leads?property_listing_id={lid_a}", headers=hb).status_code == 404
     assert lid_a not in [i["listing_id"] for i in c.get("/owner/listings", headers=hb).json()["items"]]
     lead = c.get("/owner/leads", headers=ha).json()["items"][0]
-    assert c.patch(f"/owner/leads/{lead['id']}", json={"status": "CLOSED"}, headers=hb).status_code == 404
+    assert c.patch(f"/owner/leads/{lead['id']}", json={"status": "CLOSED", "closing_reason": "Not Converted"}, headers=hb).status_code == 404
 
 
 def test_openapi_documents_removed_flags(client):
@@ -353,11 +353,16 @@ def test_lead_snapshot_carries_real_property_type_not_title_words(client):
     assert "budget" not in json.dumps(item)
 
 
-def test_buyer_enquiry_snapshot_is_unchanged(client):
+def test_buyer_enquiry_snapshot_has_buyer_fields_only(client):
+    """Buyer snapshot (CONTRACT §A) gains the Messages-tab fields; owner-only
+    lead fields never appear on the buyer side."""
     c, session = client
     lid, _, _ = seed_owner_listing(session)
     buyer = fresh_buyer(c)
     created = _enquire(c, buyer, lid)
-    assert set(created["listing"]) == {"title", "price_paise", "price_period"}
+    buyer_listing = {"title", "price_paise", "price_period", "price_display", "property_type", "locality", "city", "cover_image_url"}
+    assert set(created["listing"]) == buyer_listing
     listed = c.get("/buyer/enquiries", headers=auth_header(buyer["access_token"])).json()
-    assert set(listed["items"][0]["listing"]) == {"title", "price_paise", "price_period"}
+    assert set(listed["items"][0]["listing"]) == buyer_listing
+    for owner_only in ("buyer_display_name", "listing_removed", "buyer_user_id"):
+        assert owner_only not in created and owner_only not in listed["items"][0]

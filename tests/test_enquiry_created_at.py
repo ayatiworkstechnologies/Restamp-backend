@@ -119,7 +119,7 @@ def test_historical_rows_stay_null_everywhere(client):
     lead = [i for i in c.get("/owner/leads", headers=ho).json()["items"] if i["id"] == eid][0]
     assert lead["created_at"] is None
     # An owner update never invents a creation time for a historical lead.
-    assert c.patch(f"/owner/leads/{eid}", json={"status": "CLOSED"}, headers=ho).json()["created_at"] is None
+    assert c.patch(f"/owner/leads/{eid}", json={"status": "CLOSED", "closing_reason": "Not Converted"}, headers=ho).json()["created_at"] is None
     assert _stored(session, eid) is None
 
 
@@ -149,7 +149,7 @@ def test_migration_graph_single_head_and_parent():
 
     here = os.path.dirname(os.path.abspath(__file__))
     script = ScriptDirectory.from_config(Config(os.path.join(here, "..", "alembic.ini")))
-    assert _expected_heads() == ("i9j0k1l2m3n4",)
+    assert len(_expected_heads()) == 1  # single head (later migrations chain on)
     rev = script.get_revision("i9j0k1l2m3n4")
     assert rev.down_revision == "h8i9j0k1l2m3"
     revisions = [r.revision for r in script.walk_revisions()]
@@ -169,14 +169,23 @@ def test_duplicate_enquiry_matches_the_create_contract(client):
     assert (first.status_code, dup.status_code) == (201, 200)
     assert set(first.json()) == set(dup.json()) == {
         "id", "property_listing_id", "message", "status", "closing_reason", "created_at", "listing",
+        "message_count", "last_message", "last_message_at", "messages",
     }
     for key in ("id", "property_listing_id", "status", "created_at", "listing"):
         assert dup.json()[key] == first.json()[key], key
-    assert dup.json()["message"] == first.json()["message"]  # the original row is returned
+    assert dup.json()["message"] == first.json()["message"]  # opening message unchanged
+    # D1: the distinct second message is stored on the SAME enquiry (one lead).
+    assert first.json()["message_count"] == 1
+    assert dup.json()["message_count"] == 2
+    assert [m["body"] for m in dup.json()["messages"]] == [
+        "Is it available?", "Second message is not a new enquiry",
+    ]
+    assert dup.json()["last_message"] == "Second message is not a new enquiry"
 
     detail = c.get(f"/buyer/enquiries/{first.json()['id']}", headers=hb).json()
     listed = c.get("/buyer/enquiries", headers=hb).json()["items"][0]
-    assert detail == listed == first.json()
+    assert detail == dup.json()  # detail = full thread, same as the POST response
+    assert listed == {**dup.json(), "messages": None}  # list = summary without the thread
 
     other = fresh_buyer(c)
     assert c.get(f"/buyer/enquiries/{first.json()['id']}",

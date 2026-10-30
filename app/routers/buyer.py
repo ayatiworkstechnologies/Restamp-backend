@@ -1,4 +1,5 @@
-"""RESTAMP Buyer V1 — discovery/detail/similar + contact + enquiries + saved (6B-1..6)."""
+"""RESTAMP Buyer V1 — discovery/detail/similar + contact + enquiries + saved (6B-1..6),
+visits, viewed history and call-button events."""
 from __future__ import annotations
 
 from typing import Literal
@@ -11,6 +12,7 @@ from .. import schemas
 from ..db import get_db
 from ..deps import require_buyer
 from ..services import listings as listing_svc
+from ..services import call_events as call_svc
 from ..services import contact as contact_svc
 from ..services import enquiries as enquiry_svc
 from ..services import saved as saved_svc
@@ -121,7 +123,8 @@ def create_buyer_enquiry(
     enquiry, created = enquiry_svc.create_enquiry(db, buyer_id, body.property_listing_id, body.message)
     db.commit()
     if not created:
-        # Idempotent duplicate: same validated body, 200 instead of 201.
+        # Existing active enquiry: any new distinct message was appended to
+        # its thread (D1); 200 instead of 201 because no new lead was made.
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             # mode="json": created_at is a datetime; serialize it exactly as
@@ -250,7 +253,7 @@ def update_buyer_visit(
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(
-            db, "buyer", buyer_id, visit_id, body.scheduled_at, body.status
+            db, "buyer", buyer_id, visit_id, body.scheduled_at, body.status, body.note
         )
     except HTTPException as e:
         sp.rollback()
@@ -307,3 +310,37 @@ def list_buyer_viewed(
     """List the caller's most recent viewed properties (max 20 per buyer)."""
     items, total = viewed_svc.list_viewed(db, buyer_id, page, page_size)
     return schemas.ViewedPropertiesResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+# --- Call-button events (CONTRACT §B) -------------------------------------------
+
+
+@router.post("/listings/{listing_id}/call-events", response_model=schemas.CallEventOut, status_code=201)
+def record_call_event(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """Record that the caller TAPPED a Call button for this listing (not that
+    a call happened). 404 unless the listing is publicly visible. A repeat
+    within 60 s returns the existing event with 200 (no new row)."""
+    event, created = call_svc.record_call_tap(db, buyer_id, listing_id)
+    db.commit()
+    if not created:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=schemas.CallEventOut(**event).model_dump(mode="json"),
+        )
+    return event
+
+
+@router.get("/call-events", response_model=schemas.CallEventsResponse)
+def list_call_events(
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """The caller's own call-button taps, newest first (listing card or null)."""
+    items, total = call_svc.list_call_events(db, buyer_id, page, page_size)
+    return schemas.CallEventsResponse(items=items, page=page, page_size=page_size, total=total)

@@ -227,6 +227,7 @@ def test_status_filter_and_lead_shape_has_no_phone(client):
     item = [i for i in body["items"] if i["property_listing_id"] == lid][0]
     assert set(item.keys()) == {
         "id", "property_listing_id", "buyer_user_id", "buyer_display_name", "listing_removed", "created_at", "message",
+        "message_count", "last_message", "last_message_at",
         "status", "closing_reason", "listing",
     }
     import json as _json
@@ -318,7 +319,7 @@ def test_not_converted_persists_closed_with_reason_and_keeps_listing(client):
 def test_buyer_can_reenquire_after_close(client):
     c, session = client
     lid, ho, bh, lead_id = _setup_lead(c, session)
-    assert c.patch(f"/owner/leads/{lead_id}", json={"status": "CLOSED"}, headers=ho).status_code == 200
+    assert c.patch(f"/owner/leads/{lead_id}", json={"status": "CLOSED", "closing_reason": "Not Converted"}, headers=ho).status_code == 200
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=bh)
     assert r.status_code == 201, r.text
     assert r.json()["id"] != lead_id

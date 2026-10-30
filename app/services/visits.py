@@ -16,7 +16,12 @@ Creation rules: the listing must be VERIFIED + AVAILABLE with consistent
 dual ownership columns; scheduled_at must be in the future; buyers cannot
 schedule on their own listings; owners may propose only to buyers holding
 an existing enquiry or contact-reveal relationship on that listing (no
-arbitrary user IDs). Responses carry no phones and no display names.
+arbitrary user IDs). Responses carry no phones. Names (D6): the buyer's
+chosen name and the owner's public name, null when there is none — never a
+phone-number default. rescheduled_at (D3) is set when an accepted change
+moves the time and cleared when an accepted change moves the status; the
+shared `note` may be edited by whoever may edit the time in the current
+status ("" clears it).
 """
 from __future__ import annotations
 
@@ -75,25 +80,47 @@ def _consistent_owner_id(db: Session, listing: PropertyListing) -> int:
     return physical.user_id
 
 
+def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
+    """VisitOut dicts for a page of visits: names, listing details and
+    locations in batched reads (no per-row queries)."""
+    from .enquiries import _listing_info, safe_display_names
+
+    info = _listing_info(db, [v.property_listing_id for v in visits])
+    names = safe_display_names(db, [u for v in visits for u in (v.buyer_user_id, v.owner_user_id)])
+    out = []
+    for visit in visits:
+        li = info[int(visit.property_listing_id)]
+        listing = li["listing"]
+        out.append({
+            "id": visit.id,
+            "property_listing_id": visit.property_listing_id,
+            "buyer_user_id": visit.buyer_user_id,
+            "owner_user_id": visit.owner_user_id,
+            "buyer_display_name": names.get(int(visit.buyer_user_id)),
+            "owner_display_name": names.get(int(visit.owner_user_id)),
+            "scheduled_at": visit.scheduled_at,
+            "status": visit.status,
+            "initiator": visit.initiator,
+            "note": visit.note,
+            "listing": {
+                "title": listing.title,
+                "price_paise": listing.price_paise,
+                "price_period": listing.price_period,
+                "property_type": listing.property_type,
+                "locality": li["locality"],
+                "city": li["city"],
+            },
+            "created_at": visit.created_at,
+            "updated_at": visit.updated_at,
+            "rescheduled_at": (
+                visit.rescheduled_at.replace(tzinfo=timezone.utc) if visit.rescheduled_at else None
+            ),
+        })
+    return out
+
+
 def _snapshot(db: Session, visit: PropertyVisit) -> dict:
-    listing = db.get(PropertyListing, visit.property_listing_id)
-    return {
-        "id": visit.id,
-        "property_listing_id": visit.property_listing_id,
-        "buyer_user_id": visit.buyer_user_id,
-        "owner_user_id": visit.owner_user_id,
-        "scheduled_at": visit.scheduled_at,
-        "status": visit.status,
-        "initiator": visit.initiator,
-        "note": visit.note,
-        "listing": {
-            "title": listing.title,
-            "price_paise": listing.price_paise,
-            "price_period": listing.price_period,
-        },
-        "created_at": visit.created_at,
-        "updated_at": visit.updated_at,
-    }
+    return _snapshots(db, [visit])[0]
 
 
 def create_buyer_visit(
@@ -242,7 +269,7 @@ def list_buyer_visits(
         .limit(page_size)
         .all()
     )
-    return [_snapshot(db, v) for v in rows], total
+    return _snapshots(db, rows), total
 
 
 def get_buyer_visit(db: Session, buyer_id: int, visit_id: int) -> dict:
@@ -287,7 +314,7 @@ def list_owner_visits(
         .limit(page_size)
         .all()
     )
-    return [_snapshot(db, v) for v in rows], total
+    return _snapshots(db, rows), total
 
 
 def get_owner_visit(db: Session, owner_id: int, visit_id: int) -> dict:
@@ -331,8 +358,9 @@ def transition_visit(
     visit_id: int,
     scheduled_at: datetime | None = None,
     to_status: str | None = None,
+    note: str | None = None,
 ) -> dict:
-    """Apply a reschedule and/or status transition with actor enforcement.
+    """Apply a reschedule, note edit and/or status transition with actor enforcement.
 
     Scope: buyers see only buyer_user_id == self, owners only
     owner_user_id == self (else 404). Invalid moves raise ValueError
@@ -391,12 +419,27 @@ def transition_visit(
                 "A conflicting visit already exists for this buyer on this listing"
             )
 
-    if to_status is not None:
-        visit.status = to_status
-    if next_moment is not None:
-        visit.scheduled_at = next_moment
+    if note is not None:
+        # The shared note follows time-edit authority in the CURRENT status.
+        editors = _TIME_EDITORS.get(original_status)
+        if editors is None:
+            raise ValueError(f"Cannot edit the note of a {original_status} visit")
+        if "either" not in editors and actor not in editors:
+            raise ValueError(f"Only {editors[0]} may edit the note of a {original_status} visit")
 
-    visit.updated_at = _utcnow_naive()
+    now = _utcnow_naive()
+    if next_moment is not None:
+        if next_moment != visit.scheduled_at:
+            visit.rescheduled_at = now.replace(microsecond=0)
+        visit.scheduled_at = next_moment
+    if to_status is not None:
+        if to_status != original_status:
+            visit.rescheduled_at = None  # a status change ends the "Rescheduled" display state
+        visit.status = to_status
+    if note is not None:
+        visit.note = note.strip() or None
+
+    visit.updated_at = now
     db.flush()
     db.refresh(visit)
     return _snapshot(db, visit)
