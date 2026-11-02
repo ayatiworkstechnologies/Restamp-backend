@@ -274,11 +274,22 @@ def get_listing_detail(db: Session, listing_id: int) -> dict | None:
     card["listing_status"] = listing.listing_status
     # Both ownership records must agree before exposing a public name. A
     # mismatch means we cannot establish who the seller is.
-    physical_owner_id = (
-        db.query(PhysicalProperty.user_id)
+    phys = (
+        db.query(
+            PhysicalProperty.user_id,
+            PhysicalProperty.furnishing,
+            PhysicalProperty.facing,
+            PhysicalProperty.floor_on,
+            PhysicalProperty.total_floors,
+        )
         .filter(PhysicalProperty.id == listing.physical_property_id)
-        .scalar()
+        .first()
     )
+    physical_owner_id = phys.user_id if phys else None
+    card["furnishing"] = phys.furnishing if phys else None
+    card["facing"] = phys.facing if phys else None
+    card["floor_on"] = phys.floor_on if phys else None
+    card["total_floors"] = phys.total_floors if phys else None
     card["owner_name"] = (
         _safe_owner_name(db, listing.user_id)
         if physical_owner_id == listing.user_id

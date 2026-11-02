@@ -135,6 +135,11 @@ class ListingDetail(ListingCard):
     # Phone-sanitized owner display name (null when the owner has no safe
     # saved name — e.g. the phone-number default). Never a phone number.
     owner_name: str | None = None
+    # Owner-entered details (null when the owner did not provide them).
+    furnishing: str | None = None
+    facing: str | None = None
+    floor_on: str | None = None
+    total_floors: int | None = None
 
 
 class ContactRevealOut(BaseModel):
