@@ -13,6 +13,7 @@ from ..db import get_db
 from ..deps import require_buyer
 from ..services import listings as listing_svc
 from ..services import call_events as call_svc
+from ..services import buyer_plans as plan_svc
 from ..services import contact as contact_svc
 from ..services import enquiries as enquiry_svc
 from ..services import saved as saved_svc
@@ -102,6 +103,16 @@ def reveal_listing_contact(
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer),
 ):
+    # Buyer-plan lead quota: a NEW property beyond the plan's limit is
+    # refused with 402 BUYER_PLAN_REQUIRED before anything is revealed.
+    # The 402 carries only the last 4 digits of the owner's number (teaser);
+    # an invisible/uncontactable listing still answers 404 first.
+    owner_id, owner_phone = contact_svc.find_owner(db, listing_id)
+    if owner_id == buyer_id:
+        # Owner (switched to buyer mode) viewing their OWN listing: it's their
+        # own number — no lead, no audit, no quota (create_enquiry would 422).
+        return schemas.ContactRevealOut(phone=owner_phone)
+    plan_svc.ensure_can_reveal(db, buyer_id, listing_id, phone_last4=owner_phone[-4:])
     phone, _audit = contact_svc.reveal_contact(db, buyer_id, listing_id)
     # P3 leads MVP: a successful reveal guarantees exactly one ACTIVE lead
     # (NEW enquiry) for this buyer+listing. Reuses the existing row on
@@ -110,6 +121,33 @@ def reveal_listing_contact(
     enquiry_svc.create_enquiry(db, buyer_id, listing_id, None)
     db.commit()
     return schemas.ContactRevealOut(phone=phone)
+
+
+@router.get("/plans")
+def list_buyer_plans(db: Session = Depends(get_db)):
+    """Public catalogue of RESTAMP buyer plans (lead quotas, price, validity)."""
+    return {"items": plan_svc.catalogue(db)}
+
+
+@router.get("/plan")
+def get_buyer_plan(
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """The buyer's current plan and lead usage in its window."""
+    return plan_svc.status_for(db, buyer_id)
+
+
+@router.post("/plans/{code}/subscribe")
+def subscribe_buyer_plan(
+    code: str,
+    db: Session = Depends(get_db),
+    buyer_id: int = Depends(require_buyer),
+):
+    """Activate a paid buyer plan. PAYMENT IS SIMULATED — no money is charged."""
+    result = plan_svc.subscribe_simulated(db, buyer_id, code)
+    db.commit()
+    return result
 
 
 @router.post("/enquiries", response_model=schemas.EnquiryOut, status_code=201)

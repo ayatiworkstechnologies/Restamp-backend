@@ -9,6 +9,8 @@ failed/invisible lookups return before any write, leaving no audit rows.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -17,6 +19,27 @@ from ..models import AuthIdentity, ContactRevealAudit, PhysicalProperty, Propert
 
 def reveal_contact(db: Session, buyer_id: int, listing_id: int) -> tuple[str, object]:
     """Return (owner phone, audit row). Raises 404 for invisible/uncontactable listings."""
+    phone = find_owner_phone(db, listing_id)
+    # Explicit UTC stamp (not the MySQL server clock) so buyer-plan lead
+    # windows, which are computed in UTC, count reveals consistently.
+    audit = ContactRevealAudit(
+        user_id=buyer_id,
+        property_listing_id=listing_id,
+        revealed_at=datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0),
+    )
+    db.add(audit)
+    db.flush()
+    return phone, audit
+
+
+def find_owner_phone(db: Session, listing_id: int) -> str:
+    """Owner phone for a visible, contactable listing — NO audit, never returned
+    to a client in full except through reveal_contact. Raises 404 otherwise."""
+    return find_owner(db, listing_id)[1]
+
+
+def find_owner(db: Session, listing_id: int) -> tuple[int, str]:
+    """(owner user id, owner phone) for a visible, contactable listing. 404 otherwise."""
     listing = (
         db.query(PropertyListing)
         .filter(
@@ -41,7 +64,4 @@ def reveal_contact(db: Session, buyer_id: int, listing_id: int) -> tuple[str, ob
     )
     if phone_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    audit = ContactRevealAudit(user_id=buyer_id, property_listing_id=listing_id)
-    db.add(audit)
-    db.flush()
-    return phone_row.provider_identifier, audit
+    return owner_id, phone_row.provider_identifier
