@@ -21,6 +21,8 @@ def test_detail_valid_structure(client):
         "area_value", "area_unit", "bedrooms", "bathrooms", "address_line",
         "locality", "city", "pincode", "location_label", "cover_image_url",
         "gallery", "verification_status", "listing_status", "owner_name",
+        # Owner-entered details added to ListingDetail in 2d65cc7.
+        "furnishing", "facing", "floor_on", "total_floors",
     }
     # Seeded owners use display_name 'Owner' (a safe saved name).
     assert d["owner_name"] == "Owner"

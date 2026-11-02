@@ -128,6 +128,45 @@ class ListingsResponse(BaseModel):
     total: int
 
 
+class BrokerProfileOut(BaseModel):
+    """The authenticated agent (role BROKER). ``unavailable`` names facts the
+    backend has no source for yet; they are omitted, never invented."""
+
+    user_id: int
+    display_name: str
+    role: Literal["BROKER"]
+    covered_location_count: int
+    unavailable: list[str]
+
+
+class BrokerDashboardOut(BaseModel):
+    """Real counts only. Metrics without a backend source are null and listed
+    in ``unavailable`` (coverage limit, subscription, leads, earnings)."""
+
+    available_property_count: int
+    covered_location_count: int
+    coverage_limit: int | None = None
+    subscription: dict | None = None
+    new_lead_count: int | None = None
+    earnings: int | None = None
+    unavailable: list[str]
+
+
+class BrokerLocationOut(BaseModel):
+    """One covered postcode (an unexpired broker_postcode_access_current row)."""
+
+    postcode_id: int
+    pincode: str
+    locality: str
+    city: str
+    expires_at: datetime | None = None
+
+
+class BrokerLocationsResponse(BaseModel):
+    items: list[BrokerLocationOut]
+    total: int
+
+
 class ListingDetail(ListingCard):
     gallery: list[str]
     verification_status: str
@@ -135,6 +174,11 @@ class ListingDetail(ListingCard):
     # Phone-sanitized owner display name (null when the owner has no safe
     # saved name — e.g. the phone-number default). Never a phone number.
     owner_name: str | None = None
+    # Owner-entered details (null when the owner did not provide them).
+    furnishing: str | None = None
+    facing: str | None = None
+    floor_on: str | None = None
+    total_floors: int | None = None
 
 
 class ContactRevealOut(BaseModel):
@@ -1074,3 +1118,290 @@ class DraftOut(BaseModel):
 class DraftListOut(BaseModel):
     items: list[DraftOut]
     total: int
+
+
+# --- Admin (services/admin.py; permissions in services/admin_rbac.py) -------------------
+
+AdminRole = Literal["SUPER_ADMIN", "OPERATIONS_MANAGER", "LISTING_REVIEWER", "SUPPORT_SPECIALIST"]
+
+
+def _admin_text(v: str | None) -> str | None:
+    """Trim; an all-whitespace optional text becomes None."""
+    if v is None:
+        return None
+    trimmed = v.strip()
+    return trimmed or None
+
+
+class AdminMeOut(BaseModel):
+    user_id: int
+    display_name: str
+    admin_role: str
+    role_label: str
+    permissions: list[str]
+
+
+class AdminRoleOut(BaseModel):
+    code: str
+    label: str
+    assignable: bool
+    permissions: list[str]
+
+
+class AdminRolesResponse(BaseModel):
+    items: list[AdminRoleOut]
+
+
+class AdminListingRow(BaseModel):
+    listing_id: int
+    title: str
+    property_type: str
+    transaction_type: str
+    price_paise: int
+    price_period: str
+    price_display: str
+    verification_status: str
+    listing_status: str
+    removed: bool
+    submitted_at: datetime | None = None
+    owner_user_id: int
+    owner_name: str | None = None
+    locality: str
+    city: str
+    pincode: str
+    cover_image_url: str | None = None
+
+
+class AdminListingsResponse(BaseModel):
+    items: list[AdminListingRow]
+    page: int
+    page_size: int
+    total: int
+
+
+class AdminUserRef(BaseModel):
+    user_id: int
+    display_name: str | None = None
+    status: str | None = None
+
+
+class VerificationEventOut(BaseModel):
+    """One verifications row: actor is owner / auto / admin."""
+
+    attempt_no: int
+    action: str | None = None
+    actor: str | None = None
+    result: str
+    reason: str | None = None
+    category: str | None = None
+    triggered_at: datetime | None = None
+    triggered_by_user_id: int | None = None
+
+
+class AdminListingDetailOut(BaseModel):
+    listing: OwnerListingOut
+    owner: AdminUserRef
+    verification_history: list[VerificationEventOut]
+
+
+class AdminVerifyIn(BaseModel):
+    notes: str | None = Field(default=None, max_length=500)
+
+    @field_validator("notes")
+    @classmethod
+    def _trim(cls, v):
+        return _admin_text(v)
+
+
+class AdminRejectIn(BaseModel):
+    """A rejection always carries a reason (1-500 chars after trimming)."""
+
+    reason: str = Field(min_length=1, max_length=500)
+    category: str | None = Field(default=None, max_length=100)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("reason cannot be empty")
+        return trimmed
+
+    @field_validator("category")
+    @classmethod
+    def _category(cls, v):
+        return _admin_text(v)
+
+
+class AdminUserRow(BaseModel):
+    user_id: int
+    display_name: str | None = None
+    status: str
+    current_role: str | None = None
+    admin_role: str | None = None
+    phone_last4: str | None = None
+    joined_at: datetime | None = None
+
+
+class AdminUsersResponse(BaseModel):
+    items: list[AdminUserRow]
+    page: int
+    page_size: int
+    total: int
+
+
+class AdminUserActivity(BaseModel):
+    listings_owned: int
+    enquiries_sent: int
+    enquiries_received: int
+    visits_requested: int
+    broker_covered_locations: int
+
+
+class AdminUserDetailOut(BaseModel):
+    user_id: int
+    display_name: str
+    status: str
+    current_role: str | None = None
+    admin_role: str | None = None
+    phone: str | None = None
+    providers: list[str]
+    joined_at: datetime | None = None
+    activity: AdminUserActivity
+
+
+class AdminSuspendIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("reason cannot be empty")
+        return trimmed
+
+
+class AdminReactivateIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _trim(cls, v):
+        return _admin_text(v)
+
+
+class AdminEnquiryRow(BaseModel):
+    id: int
+    status: str
+    closing_reason: str | None = None
+    created_at: datetime | None = None
+    property_listing_id: int
+    listing_title: str | None = None
+    buyer_user_id: int
+    buyer_name: str | None = None
+    owner_user_id: int
+    owner_name: str | None = None
+    message_count: int
+    last_message: str | None = None
+    last_message_at: datetime | None = None
+
+
+class AdminEnquiriesResponse(BaseModel):
+    items: list[AdminEnquiryRow]
+    page: int
+    page_size: int
+    total: int
+
+
+class AdminEnquiryDetailOut(AdminEnquiryRow):
+    messages: list[EnquiryMessageOut]
+
+
+class AdminDashboardOut(BaseModel):
+    """Real counts. listings_*: not removed (deleted_at IS NULL); live =
+    VERIFIED + AVAILABLE (exactly what buyers can see); pending / rejected by
+    verification_status. enquiries_open: status != CLOSED. buyers / owners /
+    brokers: users by CURRENT role. Unsupported metrics in ``unavailable``."""
+
+    listings_total: int
+    listings_live: int
+    listings_pending: int
+    listings_rejected: int
+    enquiries_total: int
+    enquiries_open: int
+    users_total: int
+    users_suspended: int
+    buyers: int
+    owners: int
+    brokers: int
+    admins: int
+    unavailable: list[str]
+
+
+class AdminMonthDecisions(BaseModel):
+    month: str  # YYYY-MM (UTC)
+    verified: int
+    rejected: int
+
+
+class AdminTypeCount(BaseModel):
+    property_type: str
+    count: int
+
+
+class AdminLocalityDemand(BaseModel):
+    locality: str
+    city: str
+    enquiries: int
+
+
+class AdminAnalyticsOut(BaseModel):
+    """months: verification decisions (any actor) per UTC month;
+    listings_by_type: listings not removed; top_enquiry_localities: all-time
+    enquiry counts by the listing's locality (top 10)."""
+
+    months: list[AdminMonthDecisions]
+    listings_by_type: list[AdminTypeCount]
+    top_enquiry_localities: list[AdminLocalityDemand]
+    unavailable: list[str]
+
+
+class AdminAuditLogRow(BaseModel):
+    id: int
+    actor_user_id: int
+    actor_name: str | None = None
+    action: str
+    entity: str | None = None
+    before: dict | None = None
+    after: dict | None = None
+    created_at: datetime | None = None
+
+
+class AdminAuditLogsResponse(BaseModel):
+    items: list[AdminAuditLogRow]
+    page: int
+    page_size: int
+    total: int
+
+
+class AdminStaffRow(BaseModel):
+    user_id: int
+    display_name: str | None = None
+    admin_role: str
+    role_label: str
+    status: str
+
+
+class AdminStaffResponse(BaseModel):
+    items: list[AdminStaffRow]
+    total: int
+
+
+class AdminStaffGrantIn(BaseModel):
+    user_id: int = Field(ge=1)
+    admin_role: AdminRole
+
+
+class AdminStaffRoleIn(BaseModel):
+    admin_role: AdminRole

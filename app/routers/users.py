@@ -130,9 +130,14 @@ def admin_ping(user_id: int = Depends(deps.require_admin)):
 
 @router.post("/admin/grants", status_code=201)
 def admin_grant(
-    body: schemas.AdminGrant, db: Session = Depends(get_db), _admin: int = Depends(deps.require_admin)
+    body: schemas.AdminGrant,
+    db: Session = Depends(get_db),
+    _admin: int = Depends(deps.require_admin_permission("settings.manage_team")),
 ):
-    """No public admin registration: caller must already be an admin."""
+    """No public admin registration: caller must already be an admin with
+    settings.manage_team (otherwise any admin role could mint a full-access
+    legacy ADMIN). Prefer POST /admin/staff, which sets an explicit role and
+    writes an audit row."""
     users_roles.grant_admin(db, body.user_id)
     db.commit()
     return {"message": "admin granted", "user_id": body.user_id}

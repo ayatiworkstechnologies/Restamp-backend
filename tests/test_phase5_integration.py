@@ -10,6 +10,7 @@ import time
 import pytest
 from sqlalchemy import text
 
+from app.config import settings
 from app.db import engine
 from tests.conftest import auth_header, captured_otp_code, make_postcode, register_phone
 from tests.frontend_client import ApiError, FrontendClient, map_error
@@ -85,7 +86,7 @@ def test_e2e_otp_full_path_with_expiry_and_limits(fx):
     assert e.value.kind == "login"
     # Abuse path: request flood is throttled.
     flood = "+917000000005"
-    for _ in range(5):
+    for _ in range(settings.OTP_MAX_REQUESTS_PER_HOUR):
         fc.request_otp(flood)
     with pytest.raises(ApiError) as e:
         fc.request_otp(flood)

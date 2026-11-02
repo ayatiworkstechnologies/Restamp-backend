@@ -100,7 +100,7 @@ def test_display_mode_does_not_touch_the_delivery_seam(monkeypatch):
 def test_display_mode_rate_limits_unchanged(monkeypatch):
     _enable_display(monkeypatch)
     svc = OTPService()
-    for _ in range(5):
+    for _ in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR):
         assert svc.request_code(PHONE)
     with pytest.raises(HTTPException) as info:
         svc.request_code(PHONE)

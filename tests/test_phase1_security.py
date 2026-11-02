@@ -97,7 +97,7 @@ def test_otp_per_phone_cap_preserved():
     svc = OTPService()
     svc.delivery = TestSMSInbox()
     phone = "+916900000101"
-    for _ in range(5):
+    for _ in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR):
         svc.request_code(phone)
     with pytest.raises(HTTPException) as e:
         svc.request_code(phone)
@@ -108,7 +108,7 @@ def test_otp_per_ip_request_cap_across_phones():
     svc = OTPService()
     svc.delivery = TestSMSInbox()
     ip = "10.9.9.1"
-    for i in range(30):
+    for i in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR_PER_IP):
         svc.request_code(f"+91690010{i:04d}", ip=ip)
     with pytest.raises(HTTPException) as e:
         svc.request_code("+916900999999", ip=ip)
@@ -139,7 +139,7 @@ def test_otp_reset_clears_ip_state():
     svc = OTPService()
     svc.delivery = TestSMSInbox()
     ip = "10.9.9.4"
-    for i in range(30):
+    for i in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR_PER_IP):
         svc.request_code(f"+91690030{i:04d}", ip=ip)
     svc.reset()
     svc.request_code("+916900999997", ip=ip)  # no longer blocked

@@ -99,6 +99,38 @@ def test_override_keeps_docs_disabled(monkeypatch):
     assert app.docs_url is None and app.openapi_url is None
 
 
+def _run_lifespan(monkeypatch):
+    """Run the real startup sequence (security gate + DB check + worker);
+    the DB check is stubbed so no database is touched."""
+    import asyncio
+
+    import app.main as main_module
+    from fastapi import FastAPI
+
+    monkeypatch.setattr(main_module, "check_db", lambda: True)
+
+    async def _drain():
+        async with main_module.lifespan(FastAPI()):
+            pass
+
+    asyncio.run(_drain())
+
+
+def test_real_startup_succeeds_with_both_flags(monkeypatch, caplog):
+    """The Render configuration RESTAMP_OTP_DISPLAY_MODE=1 +
+    RESTAMP_OTP_DISPLAY_IN_PRODUCTION=1 boots (with the loud warning)."""
+    _production(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="restamp.config"):
+        _run_lifespan(monkeypatch)  # no exception: the app starts
+    assert "RESTAMP_OTP_DISPLAY_IN_PRODUCTION is enabled" in caplog.text
+
+
+def test_real_startup_refuses_display_flag_without_override(monkeypatch):
+    _production(monkeypatch, display=True, override=False)
+    with pytest.raises(RuntimeError, match="OTP_DISPLAY_MODE"):
+        _run_lifespan(monkeypatch)
+
+
 # --- service level: lifecycle unchanged ------------------------------------------
 
 def test_production_override_issues_random_code_single_use(monkeypatch):

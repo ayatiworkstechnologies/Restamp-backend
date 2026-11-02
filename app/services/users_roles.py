@@ -89,7 +89,13 @@ def is_admin(db: Session, user_id: int) -> bool:
     return db.get(AdminAccount, user_id) is not None
 
 
-def grant_admin(db: Session, user_id: int) -> None:
+def get_admin_role(db: Session, user_id: int) -> str | None:
+    """The caller's admin_role, or None when the user is not an admin."""
+    link = db.get(AdminAccount, user_id)
+    return link.admin_role if link is not None else None
+
+
+def grant_admin(db: Session, user_id: int, admin_role: str = "ADMIN") -> None:
     """Create the admin link. No public flow calls this — only the admin-only endpoint.
 
     A concurrent duplicate grant fails the flush with a duplicate-key
@@ -104,7 +110,7 @@ def grant_admin(db: Session, user_id: int) -> None:
         # savepoint entry so that the savepoint's rollback scope is exactly
         # the one insert below.
         db.flush()
-        link = AdminAccount(user_id=user_id, admin_role="ADMIN")
+        link = AdminAccount(user_id=user_id, admin_role=admin_role)
         sp = db.begin_nested()
         db.add(link)
         try:

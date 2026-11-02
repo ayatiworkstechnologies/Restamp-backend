@@ -47,9 +47,15 @@ class Settings:
     # Phone OTP behaviour.
     OTP_LENGTH: int = 6
     OTP_TTL_SECONDS: int = _get_int("RESTAMP_OTP_TTL_SECONDS", 300)
-    OTP_MAX_REQUESTS_PER_HOUR: int = _get_int("RESTAMP_OTP_MAX_REQUESTS_PER_HOUR", 5)
+    # Code requests per phone per ROLLING hour. Rejects only the excess
+    # request (no block); a successful login clears the phone's window, so
+    # re-logins after token expiry never accumulate into a lockout.
+    OTP_MAX_REQUESTS_PER_HOUR: int = _get_int("RESTAMP_OTP_MAX_REQUESTS_PER_HOUR", 10)
+    # Wrong guesses allowed against ONE code before it is invalidated.
     OTP_MAX_VERIFY_ATTEMPTS: int = _get_int("RESTAMP_OTP_MAX_VERIFY_ATTEMPTS", 5)
-    OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 900)
+    # Fixed block after too many wrong codes (per code or per IP). Attempts
+    # made while blocked are refused without extending it.
+    OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 600)
     # NOTE — SMS delivery: the OTP service has NO provider and NO vendor
     # configuration by design (see app/services/otp.py). Until real SMS
     # delivery is connected in code, OTP requests fail closed (generic 503)
@@ -80,7 +86,7 @@ class Settings:
     # the per-phone caps. Tunable via env; defaults allow normal
     # NAT sharing while stopping bulk abuse.
     OTP_MAX_REQUESTS_PER_HOUR_PER_IP: int = _get_int(
-        "RESTAMP_OTP_MAX_REQUESTS_PER_HOUR_PER_IP", 30
+        "RESTAMP_OTP_MAX_REQUESTS_PER_HOUR_PER_IP", 60
     )
     OTP_MAX_VERIFY_ATTEMPTS_PER_IP: int = _get_int(
         "RESTAMP_OTP_MAX_VERIFY_ATTEMPTS_PER_IP", 30

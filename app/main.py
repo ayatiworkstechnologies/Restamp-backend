@@ -12,7 +12,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import is_production, settings
 from .db import check_db
+from .routers import admin as admin_router
 from .routers import auth as auth_router
+from .routers import broker as broker_router
 from .routers import buyer as buyer_router
 from .routers import health as health_router
 from .routers import owner as owner_router
@@ -138,6 +140,8 @@ def create_app() -> FastAPI:
     app.include_router(users_router.router)
     app.include_router(buyer_router.router)
     app.include_router(owner_router.router)
+    app.include_router(broker_router.router)
+    app.include_router(admin_router.router)
 
     # Servable uploaded listing photos (local-dev storage; see storage.py).
     # Never a source directory — RESTAMP_MEDIA_ROOT lives outside the repo.

@@ -2,6 +2,8 @@
 Google rules, ownership, token expiry, schema regression. Rollback-isolated (conftest)."""
 from sqlalchemy import text
 
+from app.config import settings
+
 from tests.conftest import auth_header, make_postcode, register_phone
 
 
@@ -152,13 +154,13 @@ def test_invalid_and_expired_tokens(client):
 def test_otp_rate_limit_foundation(client):
     c, _ = client
     phone = "+916000000010"
-    for _ in range(5):
+    for _ in range(settings.OTP_MAX_REQUESTS_PER_HOUR):
         assert c.post("/auth/otp/request", json={"phone": phone}).status_code == 200
     assert c.post("/auth/otp/request", json={"phone": phone}).status_code == 429
     # Wrong-code attempts also trip protection.
     phone2 = "+916000000011"
     c.post("/auth/otp/request", json={"phone": phone2})
-    for _ in range(5):
+    for _ in range(settings.OTP_MAX_VERIFY_ATTEMPTS):
         c.post("/auth/otp/verify", json={"phone": phone2, "code": "000000"})
     r = c.post("/auth/otp/verify", json={"phone": phone2, "code": "000000"})
     assert r.status_code in (401, 429)

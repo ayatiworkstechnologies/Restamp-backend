@@ -27,6 +27,19 @@
   per-IP caps stop phone rotation from one client. This does NOT provide
   distributed protection: multi-worker/multi-instance deployments need a
   shared store (e.g. Redis) — see Remaining risks. Do not claim otherwise.
+- Lockout rules (all temporary, all self-recovering, none re-armed by
+  retrying):
+  * Request caps (per phone, per IP) are ROLLING one-hour windows that
+    reject only the excess request. They set no block, so a capped phone can
+    still verify the code it already received, and a new request is allowed
+    as soon as the oldest request in the window is an hour old.
+  * A successful verification clears that phone's request window: proving
+    possession of the code is legitimate use and must not count toward a
+    later lockout (re-logins after token expiry / app restarts).
+  * Wrong codes are capped per code (OTP_MAX_VERIFY_ATTEMPTS) and per IP
+    (OTP_MAX_VERIFY_ATTEMPTS_PER_IP per rolling hour). Tripping either sets a
+    single fixed block of OTP_BLOCK_SECONDS; attempts made while blocked are
+    refused without extending it.
 """
 from __future__ import annotations
 
@@ -150,7 +163,11 @@ class OTPService:
             now = time.time()
             window = [t for t in self._requests.get(phone, []) if now - t < 3600]
             if len(window) >= settings.OTP_MAX_REQUESTS_PER_HOUR:
-                self._blocked_until[phone] = now + settings.OTP_BLOCK_SECONDS
+                # Rolling-window cap only: no block is set here. A block would
+                # also refuse verification of the code the user already has,
+                # and would be re-armed on every retry while the hour-long
+                # window is still full (the old lockout loop).
+                self._requests[phone] = window
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail="Too many OTP requests. Try again later.",
@@ -158,7 +175,10 @@ class OTPService:
             if ip:
                 ip_window = [t for t in self._ip_requests.get(ip, []) if now - t < 3600]
                 if len(ip_window) >= settings.OTP_MAX_REQUESTS_PER_HOUR_PER_IP:
-                    self._ip_blocked_until[ip] = now + settings.OTP_BLOCK_SECONDS
+                    # Same rolling-window rule per IP: refuse the excess
+                    # request only; never block verification for every phone
+                    # behind a shared (NAT/carrier) IP.
+                    self._ip_requests[ip] = ip_window
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail="Too many OTP requests. Try again later.",
@@ -264,6 +284,11 @@ class OTPService:
                     )
                 return False
             self._codes.pop(phone, None)
+            # Legitimate use: a successful login must not count toward a later
+            # request lockout for this phone. Per-IP windows are kept (they
+            # bound volume across all phones from one client).
+            self._requests.pop(phone, None)
+            self._blocked_until.pop(phone, None)
             return True
 
 

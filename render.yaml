@@ -62,12 +62,14 @@ services:
         value: "0"
       - key: RESTAMP_OTP_TTL_SECONDS
         value: "300"
+      # Per phone, rolling hour; a successful login clears the phone's count.
       - key: RESTAMP_OTP_MAX_REQUESTS_PER_HOUR
-        value: "5"
+        value: "10"
+      # Wrong guesses per code, then a fixed (non-extending) block.
       - key: RESTAMP_OTP_MAX_VERIFY_ATTEMPTS
         value: "5"
       - key: RESTAMP_OTP_BLOCK_SECONDS
-        value: "900"
+        value: "600"
 
       # ── CORS ────────────────────────────────────────────────────────────────
       # Exact production frontend origin(s) only. Never "*" with credentials.

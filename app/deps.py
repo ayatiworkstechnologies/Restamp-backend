@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .db import get_db
 from .models import PhysicalProperty
 from .security import ensure_active_user, get_current_user, get_current_user_id
-from .services import users_roles
+from .services import admin_rbac, users_roles
 
 
 def require_role(*allowed: str):
@@ -45,6 +45,33 @@ def require_admin(db: Session = Depends(get_db), user_id: int = Depends(get_curr
     return user_id
 
 
+def require_admin_permission(permission: str):
+    """Admin AND a specific permission of their admin_role (admin_rbac).
+
+    Same identity gate as require_admin (active account + admin_accounts row,
+    read from the DB on every request — never from the token or the client);
+    then the role's permission set decides. An unknown role has no
+    permissions (fail closed). Non-admins get the same static 403 as
+    require_admin, so the endpoint's permission name is only ever shown to
+    admins.
+    """
+    if permission not in admin_rbac.PERMISSIONS:  # programming error, not a request error
+        raise ValueError(f"Unknown admin permission: {permission}")
+
+    def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+        ensure_active_user(db, user_id)
+        admin_role = users_roles.get_admin_role(db, user_id)
+        if admin_role is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        if not admin_rbac.has_permission(admin_role, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=f"{permission} permission required"
+            )
+        return user_id
+
+    return _check
+
+
 def require_owner_of_physical_property(
     physical_property_id: int,
     db: Session = Depends(get_db),
@@ -63,6 +90,7 @@ __all__ = [
     "get_current_user",
     "get_current_user_id",
     "require_admin",
+    "require_admin_permission",
     "require_broker",
     "require_buyer",
     "require_owner",

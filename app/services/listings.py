@@ -190,10 +190,22 @@ def apply_sort(q, sort: str):
     return q.order_by(desc(PropertyListing.id))  # relevance: newest first, deterministic
 
 
-def search_listings(db: Session, page: int, page_size: int, **filters) -> tuple[list[dict], int]:
-    """Paged cards + total. Returns (cards_without_covers, total)."""
+def search_listings(
+    db: Session, page: int, page_size: int, postcode_ids: list[int] | None = None, **filters
+) -> tuple[list[dict], int]:
+    """Paged cards + total. Returns (cards_without_covers, total).
+
+    ``postcode_ids`` (None = no restriction, the buyer search) limits results
+    to listings in those postcodes, e.g. a broker's covered locations. An
+    empty list means "covers nothing" and returns no rows without querying,
+    never "unrestricted". Buyer visibility (_visible) applies either way.
+    """
+    if postcode_ids is not None and not postcode_ids:
+        return [], 0
     sort = filters.pop("sort", "relevance")
     base = _visible(_location_joins(db.query(*_CARD_COLUMNS)))
+    if postcode_ids is not None:
+        base = base.filter(PhysicalProperty.postcode_id.in_(postcode_ids))
     base = apply_listing_filters(base, **filters)
     total = base.with_entities(func.count(func.distinct(PropertyListing.id))).scalar() or 0
     rows = (
@@ -274,11 +286,22 @@ def get_listing_detail(db: Session, listing_id: int) -> dict | None:
     card["listing_status"] = listing.listing_status
     # Both ownership records must agree before exposing a public name. A
     # mismatch means we cannot establish who the seller is.
-    physical_owner_id = (
-        db.query(PhysicalProperty.user_id)
+    phys = (
+        db.query(
+            PhysicalProperty.user_id,
+            PhysicalProperty.furnishing,
+            PhysicalProperty.facing,
+            PhysicalProperty.floor_on,
+            PhysicalProperty.total_floors,
+        )
         .filter(PhysicalProperty.id == listing.physical_property_id)
-        .scalar()
+        .first()
     )
+    physical_owner_id = phys.user_id if phys else None
+    card["furnishing"] = phys.furnishing if phys else None
+    card["facing"] = phys.facing if phys else None
+    card["floor_on"] = phys.floor_on if phys else None
+    card["total_floors"] = phys.total_floors if phys else None
     card["owner_name"] = (
         _safe_owner_name(db, listing.user_id)
         if physical_owner_id == listing.user_id
