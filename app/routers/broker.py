@@ -7,6 +7,13 @@ BROKER — require_broker reads the role from the DB, never the token):
   GET /broker/locations  — the caller's covered postcodes (unexpired grants)
   GET /broker/listings   — buyer-visible listings inside the caller's coverage
 
+Agent plans (any authenticated active account — a buyer becomes an agent by
+buying one):
+  GET  /broker/plan                    — the caller's active agent plan, if any
+  POST /broker/plans/{code}/subscribe  — buy a plan for chosen localities
+                                         (SIMULATED payment); grants coverage
+                                         and switches the role to BROKER
+
 Read-only by design: no endpoint creates or changes coverage, subscriptions,
 leads or listings. Coverage grants come from broker_postcode_access_current
 only (see services/brokers.py); an agent without grants sees empty results.
@@ -16,16 +23,49 @@ write. GET /broker/scope (users.py) is unchanged.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import schemas
 from ..db import get_db
 from ..deps import require_broker
+from ..security import ensure_active_user, get_current_user_id
+from ..services import agent_plans as agent_plan_svc
 from ..services import brokers as broker_svc
 from ..services import listings as listing_svc
 from .buyer import ConstructionStatus, Deal, PropType, Sort
 
 router = APIRouter(prefix="/broker", tags=["broker"])
+
+
+class AgentPlanSubscribeIn(BaseModel):
+    localities: list[str] = Field(default_factory=list, max_length=50)
+
+
+def _active_user(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+    ensure_active_user(db, user_id)
+    return user_id
+
+
+@router.get("/plan")
+def get_agent_plan(db: Session = Depends(get_db), user_id: int = Depends(_active_user)):
+    """The caller's active agent plan + covered localities, or has_plan=false.
+    Used after login to decide whether to open the agent dashboard."""
+    return agent_plan_svc.status_for(db, user_id)
+
+
+@router.post("/plans/{code}/subscribe")
+def subscribe_agent_plan(
+    code: str,
+    body: AgentPlanSubscribeIn,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(_active_user),
+):
+    """Buy an agent plan for the chosen localities. PAYMENT IS SIMULATED —
+    no money is charged. Grants coverage and switches the role to BROKER."""
+    result = agent_plan_svc.subscribe_simulated(db, user_id, code, body.localities)
+    db.commit()
+    return result
 
 
 @router.get("/profile", response_model=schemas.BrokerProfileOut)
