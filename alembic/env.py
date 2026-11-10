@@ -18,12 +18,29 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+_ENV_FILE = os.path.join(os.path.dirname(__file__), '..', '.env')
 try:
     from dotenv import load_dotenv
-except ImportError:  # optional: python-dotenv is not a pinned dependency
-    def load_dotenv(*args, **kwargs):
-        return False
-load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+except ImportError:  # python-dotenv is optional: read .env ourselves
+    def load_dotenv(path, **kwargs):
+        """Minimal KEY=VALUE reader; existing environment variables win
+        (same default as python-dotenv). Values are never printed."""
+        if not os.path.isfile(path):
+            return False
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().removeprefix("export ").strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        return True
+load_dotenv(_ENV_FILE)
 from app.models import Base
 target_metadata = Base.metadata
 
@@ -84,7 +101,14 @@ if _db_url:
         config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
         _migration_connect_args = {}
 else:
-    _migration_connect_args = {}
+    # Never fall back to the alembic.ini placeholder URL: it names a database
+    # ("restamp") that does not exist, so migrations would fail confusingly
+    # (or hit the wrong database). The URL must come from the environment or
+    # from the backend .env file.
+    raise SystemExit(
+        "RESTAMP_DATABASE_URL is not set. Add it to the backend .env file "
+        "(next to alembic.ini) or export it in this shell, then rerun alembic."
+    )
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
