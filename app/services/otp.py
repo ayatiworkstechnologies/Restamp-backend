@@ -52,7 +52,7 @@ from typing import Callable
 
 from fastapi import HTTPException, status
 
-from ..config import otp_display_permitted, settings
+from ..config import otp_display_permitted, otp_test_display_permitted, settings
 
 NOT_CONNECTED_503 = "OTP delivery is not configured. Try again later."
 
@@ -156,7 +156,9 @@ class OTPService:
         with self._lock:
             self._ensure_not_blocked(phone)
             self._ensure_ip_not_blocked(ip)
-            display = self._display_active()
+            # Display for local development, or for a configured internal
+            # tester (server-config phone AND network, see config.py).
+            display = self._display_active() or otp_test_display_permitted(phone, ip)
             if not display:
                 self._ensure_delivery_connected()
             now = time.time()

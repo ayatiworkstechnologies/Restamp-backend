@@ -82,7 +82,20 @@ Notes:
 Everything else unchanged:
 
 - `RESTAMP_OTP_DISPLAY_MODE` must stay `0` in production (startup refuses
-  `1` outright); production API responses and logs can never contain a code.
+  `1` outright). Production logs never contain a code, and responses contain
+  one only for a configured internal tester (next point).
+- Restricted internal tester display (off by default, server config only):
+  `RESTAMP_OTP_TEST_DISPLAY=1` + `RESTAMP_OTP_TEST_PHONES` (comma-separated
+  dedicated staff `+91` test numbers, max 20) + `RESTAMP_OTP_TEST_ALLOWED_CIDRS`
+  (office/VPN egress ranges, IPv4 /24 or narrower, IPv6 /48 or narrower).
+  `/auth/otp/request` adds `debug_code` only when the phone is listed AND the
+  client IP is inside a listed range; everyone else gets the normal response
+  (503 while no SMS provider is connected). Request bodies, query strings and
+  client-sent headers cannot enable it. Production startup refuses an
+  incomplete or over-broad configuration and logs only counts. Behind a
+  proxy, `RESTAMP_TRUST_PROXY=1` and the proxy must append the real client
+  address to `X-Forwarded-For`. Code length, expiry, single use, attempt and
+  rate limits are unchanged. Tests: `tests/test_otp_internal_test_display.py`.
 - With no SMS provider attached, public `POST /auth/otp/request` returns a
   generic 503 until real SMS delivery is implemented and wired behind
   `OTPService.delivery` (`render.yaml` notes: a code change is required —
@@ -129,6 +142,7 @@ RESTAMP_ENV=production                      # required; unset/unknown values are
 RESTAMP_DATABASE_URL=<real URL>             # the built-in placeholder is refused
 RESTAMP_JWT_SECRET=<random, 32+ chars>      # weak/placeholder secrets are refused
 RESTAMP_OTP_DISPLAY_MODE=0                  # "1" is refused; there is no override
+RESTAMP_OTP_TEST_DISPLAY=0                  # optional internal-tester display; see above
 RESTAMP_GOOGLE_DEV_MODE=0                   # "1" is refused
 RESTAMP_CORS_ORIGINS=https://restamp.in,https://www.restamp.in,https://restamp-alpha.vercel.app,https://restamp-app.vercel.app
 ```
