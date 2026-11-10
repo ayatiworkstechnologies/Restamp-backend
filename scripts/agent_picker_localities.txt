@@ -1,0 +1,33 @@
+# TEMPORARILY DISABLED — Chennai area seeding paused (the loader refuses to run).
+# Agent locality picker names - FRONTEND-DERIVED INITIAL LOCALITY CATALOG.
+# Source: Restamp-latest src/features/agent/screens/AgentLocationSelectScreen.js
+#         (ALL_LOCALITY_NAMES), copied verbatim on 2026-11-04.
+# These are display names only. They are NOT verified India Post data and
+# carry no pincodes: scripts/load_chennai_localities.py --names-file takes
+# each name's pincodes from a verified source file and reports any name the
+# source does not contain. One name per line; "#" lines are comments.
+Anna Nagar
+Kilpauk
+Mogappair
+Adyar
+Velachery
+T. Nagar
+Porur
+Guindy
+Nungambakkam
+Tambaram
+Alwarpet
+Besant Nagar
+ECR
+OMR
+Thiruvanmiyur
+Vadapalani
+Ambattur
+Kodambakkam
+Perambur
+Medavakkam
+Perungudi
+Sholinganallur
+Kotturpuram
+Mylapore
+Royapettah

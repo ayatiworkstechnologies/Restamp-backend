@@ -1405,3 +1405,30 @@ class AdminStaffGrantIn(BaseModel):
 
 class AdminStaffRoleIn(BaseModel):
     admin_role: AdminRole
+
+
+class AdminAgentLocalityRow(BaseModel):
+    locality_id: int
+    name: str
+    agent_enabled: bool
+    pincodes: list[str]
+    aliases: list[str]
+    assigned_agent_count: int
+
+
+class AdminAgentLocalitiesResponse(BaseModel):
+    items: list[AdminAgentLocalityRow]
+    page: int
+    page_size: int
+    total: int
+
+
+class AdminAgentLocalityUpdateIn(BaseModel):
+    agent_enabled: bool
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class AdminAgentLocalityOut(BaseModel):
+    locality_id: int
+    name: str
+    agent_enabled: bool

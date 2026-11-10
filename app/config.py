@@ -134,6 +134,12 @@ class Settings:
     # validation; a production process that has it set logs a warning.
     DEV_MEDIA_URL_PREFIXES: str = _get("RESTAMP_DEV_MEDIA_URL_PREFIXES", "")
 
+    # TEMPORARILY DISABLED — Chennai area seeding paused.
+    # Gates the Chennai locality catalog work (locality loader + Perungudi
+    # postcode reassignment scripts, admin agent-locality endpoints, locality
+    # aliases). Default OFF; ignored in production (area_seeding_enabled()),
+    # so it can never switch on in a deployed environment by accident.
+    AREA_SEEDING_ENABLED: bool = _get("RESTAMP_AREA_SEEDING_ENABLED", "0") == "1"
 
 
 settings = Settings()
@@ -200,6 +206,14 @@ def is_production() -> bool:
     (validate_security_config).
     """
     return not is_development()
+
+
+def area_seeding_enabled() -> bool:
+    """TEMPORARILY DISABLED — Chennai area seeding paused.
+
+    True only when RESTAMP_AREA_SEEDING_ENABLED=1 in a NON-production
+    process. Read at call time, so it never latches."""
+    return bool(settings.AREA_SEEDING_ENABLED) and not is_production()
 
 
 def otp_display_permitted() -> bool:

@@ -28,6 +28,15 @@ Endpoints (permission in brackets; "admin" = any admin):
   POST /admin/staff                       [settings.manage_team]
   PATCH /admin/staff/{user_id}            [settings.manage_team]
   DELETE /admin/staff/{user_id}           [settings.manage_team]
+  (TEMPORARILY DISABLED — Chennai area seeding paused: the five
+   agent-locality endpoints below answer 404 unless RESTAMP_AREA_SEEDING_ENABLED=1
+   in a non-production process.)
+  GET  /admin/agent-localities            [users.view]  catalog + enabled state
+  PATCH /admin/agent-localities/{id}      [settings.configure_platform]  enable/disable
+  GET  /admin/agents/{user_id}/localities [users.view]  coverage + plan allowance
+  POST /admin/agents/{user_id}/localities [settings.configure_platform]  assign (plan limit)
+  DELETE /admin/agents/{user_id}/localities/{locality_id}
+                                          [settings.configure_platform]  revoke one
 Writes commit only on success; every write is audited (services/admin.py).
 GET /admin/ping and POST /admin/grants live in users.py (unchanged paths).
 """
@@ -35,13 +44,16 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
+from ..config import area_seeding_enabled
 from ..db import get_db
 from ..deps import require_admin, require_admin_permission
 from ..services import admin as admin_svc
+from ..services import agent_plans as agent_plan_svc
+from ..services import localities as locality_svc
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -279,5 +291,98 @@ def admin_revoke_staff(
     admin_id: int = Depends(require_admin_permission("settings.manage_team")),
 ):
     admin_svc.revoke_staff(db, admin_id, user_id)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- agent localities (catalog + per-agent coverage) ---------------------------------
+# Disabling a locality only stops NEW selection: agents who already cover it
+# keep it until their plan expires. Assignments always respect the agent's
+# purchased plan limit; no payment, subscription or expiry is ever changed.
+# TEMPORARILY DISABLED — Chennai area seeding paused: every endpoint below
+# answers 404 unless the area-seeding flag is on (never in production).
+
+
+def _area_seeding_on() -> None:
+    if not area_seeding_enabled():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+@router.get(
+    "/agent-localities", response_model=schemas.AdminAgentLocalitiesResponse,
+    dependencies=[Depends(_area_seeding_on)],
+)
+def admin_list_agent_localities(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("users.view")),
+    q: str | None = Query(default=None, max_length=255),
+    enabled: bool | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    items, total = locality_svc.list_catalog(db, q=q, enabled=enabled, page=page, page_size=page_size)
+    return schemas.AdminAgentLocalitiesResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.patch(
+    "/agent-localities/{locality_id}", response_model=schemas.AdminAgentLocalityOut,
+    dependencies=[Depends(_area_seeding_on)],
+)
+def admin_set_agent_locality(
+    locality_id: int,
+    body: schemas.AdminAgentLocalityUpdateIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    """Enable/disable a locality for new agent selection (audited on change)."""
+    out = locality_svc.set_agent_enabled(db, admin_id, locality_id, body.agent_enabled, body.reason)
+    db.commit()
+    return out
+
+
+@router.get(
+    "/agents/{user_id}/localities", response_model=schemas.AdminAgentCoverageOut,
+    dependencies=[Depends(_area_seeding_on)],
+)
+def admin_get_agent_localities(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("users.view")),
+):
+    return agent_plan_svc.admin_coverage(db, user_id)
+
+
+@router.post(
+    "/agents/{user_id}/localities", response_model=schemas.AdminAgentAssignOut,
+    dependencies=[Depends(_area_seeding_on)],
+)
+def admin_assign_agent_localities(
+    user_id: int,
+    body: schemas.AdminAgentAssignIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    """Assign localities under the agent's ACTIVE plan and its limit (409
+    without a plan, 422 over the limit / nothing usable). Audited."""
+    result = agent_plan_svc.add_localities(db, user_id, body.localities, actor_id=admin_id)
+    db.commit()
+    out = agent_plan_svc.admin_coverage(db, user_id)
+    out.update({k: result[k] for k in ("added_localities", "unmatched_localities", "unavailable_localities")})
+    return out
+
+
+@router.delete(
+    "/agents/{user_id}/localities/{locality_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(_area_seeding_on)],
+)
+def admin_revoke_agent_locality(
+    user_id: int,
+    locality_id: int,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    """Remove one place from an agent's coverage. History is kept (REVOKED);
+    the plan, payment and expiry are untouched. Audited."""
+    agent_plan_svc.revoke_locality(db, admin_id, user_id, locality_id, None)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
