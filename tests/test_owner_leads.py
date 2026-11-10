@@ -71,7 +71,7 @@ def test_reveal_creates_single_lead_and_reuses_on_repeat(client):
 
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
     assert r.status_code == 200, r.text
-    assert r.json() == {"phone": owner_phone}
+    assert r.json() == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
     assert enquiry_count(session, buyer["user_id"], lid) == 1
     row = session.execute(
         text("SELECT status, owner_user_id, message FROM enquiries "
@@ -87,7 +87,7 @@ def test_reveal_creates_single_lead_and_reuses_on_repeat(client):
 
     # Repeat reveal: same phone, same single lead, second audit event.
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
-    assert r.status_code == 200 and r.json() == {"phone": owner_phone}
+    assert r.status_code == 200 and r.json() == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
     assert enquiry_count(session, buyer["user_id"], lid) == 1
     kept = session.execute(
         text("SELECT id FROM enquiries WHERE buyer_user_id=:b AND property_listing_id=:l"),
@@ -226,7 +226,8 @@ def test_status_filter_and_lead_shape_has_no_phone(client):
     assert body["total"] >= 1
     item = [i for i in body["items"] if i["property_listing_id"] == lid][0]
     assert set(item.keys()) == {
-        "id", "property_listing_id", "buyer_user_id", "buyer_display_name", "listing_removed", "created_at", "message",
+        "id", "property_listing_id", "buyer_user_id", "buyer_display_name", "source_role", "listing_removed",
+        "created_at", "message",
         "message_count", "last_message", "last_message_at",
         "status", "closing_reason", "listing",
     }

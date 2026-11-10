@@ -16,6 +16,12 @@ repeat tap on the same listing within
 _DEDUP_SECONDS returns the existing event instead of a new row (retries /
 double taps). Owners only ever see per-listing counts (owner_listings), never
 which buyer tapped.
+
+Agents (role BROKER) tap the same Call button. Each new tap stores the
+tapper's role as details = {"source_role": "BUYER" | "BROKER"}, so owners can
+also see how many taps came from agents (agent_call_counts) — still counts
+only, never an identity. Rows written before this (details NULL) are buyer
+taps: until then only BUYER-mode accounts could record one.
 """
 from __future__ import annotations
 
@@ -45,9 +51,12 @@ def _out(event: ActivityLog) -> dict:
     }
 
 
-def record_call_tap(db: Session, buyer_id: int, listing_id: int) -> tuple[dict, bool]:
+def record_call_tap(
+    db: Session, buyer_id: int, listing_id: int, source_role: str = "BUYER"
+) -> tuple[dict, bool]:
     """Record one call-button tap. Returns (event, created). Flushes; the
-    caller commits."""
+    caller commits. `source_role` is the tapper's current role (BUYER or
+    BROKER); a deduplicated repeat keeps the first tap's role."""
     listing = listing_svc._visible(db.query(PropertyListing)).filter(PropertyListing.id == listing_id).first()
     physical = db.get(PhysicalProperty, listing.physical_property_id) if listing is not None else None
     if listing is None or physical is None or physical.user_id != listing.user_id:
@@ -74,11 +83,11 @@ def record_call_tap(db: Session, buyer_id: int, listing_id: int) -> tuple[dict, 
     )
     if recent is not None:
         return _out(recent), False
-    # `details` is left unset on purpose: assigning None to a JSON column
-    # stores the JSON literal null, whereas unset keeps SQL NULL.
     event = ActivityLog(
         user_id=buyer_id, action=CALL_ACTION, entity_type=ENTITY_LISTING,
         entity_id=listing_id, created_at=now,
+        # The contacted party is the listing owner (id only: no phone number).
+        details={"source_role": source_role, "owner_user_id": int(listing.user_id)},
     )
     db.add(event)
     db.flush()
@@ -121,6 +130,25 @@ def call_counts(db: Session, listing_ids: list[int]) -> dict[int, int]:
             ActivityLog.action == CALL_ACTION,
             ActivityLog.entity_type == ENTITY_LISTING,
             ActivityLog.entity_id.in_(listing_ids),
+        )
+        .group_by(ActivityLog.entity_id)
+        .all()
+    )
+    return {int(lid): int(n) for lid, n in rows}
+
+
+def agent_call_counts(db: Session, listing_ids: list[int]) -> dict[int, int]:
+    """listing_id -> number of call-button taps made by agents (BROKER).
+    Counts only; rows without a source role are buyer taps (see module doc)."""
+    if not listing_ids:
+        return {}
+    rows = (
+        db.query(ActivityLog.entity_id, func.count(ActivityLog.id))
+        .filter(
+            ActivityLog.action == CALL_ACTION,
+            ActivityLog.entity_type == ENTITY_LISTING,
+            ActivityLog.entity_id.in_(listing_ids),
+            func.json_unquote(func.json_extract(ActivityLog.details, "$.source_role")) == "BROKER",
         )
         .group_by(ActivityLog.entity_id)
         .all()

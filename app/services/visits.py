@@ -5,7 +5,10 @@ initiated, awaiting buyer), CONFIRMED, DECLINED, CANCELLED, COMPLETED.
 
 Actor rules (enforced here, never in the frontend):
 - REQUESTED -> CONFIRMED/DECLINED: owner only; -> CANCELLED: either;
-  time edits: buyer only.
+  time edits: buyer only, except the owner's counter-proposal: an owner
+  time change (no status in the same request) moves the visit to PROPOSED
+  at the new time, so the buyer must confirm it — the owner can never set
+  a time the buyer has not agreed to.
 - PROPOSED -> CONFIRMED/DECLINED: buyer only; -> CANCELLED: either;
   time edits: owner only.
 - CONFIRMED -> COMPLETED: owner only; -> CANCELLED or time edit: either.
@@ -16,12 +19,24 @@ Creation rules: the listing must be VERIFIED + AVAILABLE with consistent
 dual ownership columns; scheduled_at must be in the future; buyers cannot
 schedule on their own listings; owners may propose only to buyers holding
 an existing enquiry or contact-reveal relationship on that listing (no
-arbitrary user IDs). Responses carry no phones. Names (D6): the buyer's
+arbitrary user IDs). An owner proposing on their OWN listing that is not
+live (closed, removed, unverified) gets a 422 naming that reason — leads
+outlive their listing, and a bare 404 there read as "lead not found". A
+listing the caller does not own stays 404 (no existence leak). Responses carry no phones. Names (D6): the buyer's
 chosen name and the owner's public name, null when there is none — never a
 phone-number default. rescheduled_at (D3) is set when an accepted change
 moves the time and cleared when an accepted change moves the status; the
 shared `note` may be edited by whoever may edit the time in the current
 status ("" clears it).
+
+Closed leads (D5): a visit belongs to the lead (enquiry) of the same
+listing + buyer + owner; the newest such enquiry is the current lead.
+Closing a lead cancels its active visits (REQUESTED/PROPOSED/CONFIRMED ->
+CANCELLED) in the same transaction (close_visits_for_lead). While that lead
+stays closed, neither party may create or change a visit for the pair: 422
+LEAD_CLOSED_DETAIL, after the usual 404 scope checks (no existence leak).
+A buyer's new enquiry opens a fresh lead and lifts the block; visits with
+no enquiry behind them (contact-reveal only) are not tied to any lead.
 """
 from __future__ import annotations
 
@@ -30,8 +45,76 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from ..models import ContactRevealAudit, Enquiry, PhysicalProperty, PropertyListing
+from ..models import ActivityLog, ContactRevealAudit, Enquiry, PhysicalProperty, PropertyListing
 from ..models.visits import PropertyVisit
+
+LEAD_CLOSED_DETAIL = "Lead is closed"
+
+# Who requested a visit (BUYER or BROKER = agent), so owners can tell agent
+# visits apart. property_visits has no role column; like call taps
+# (call_events.py) the role is kept in activity_logs, one row per buyer-made
+# visit, keyed by the visit id. Visits from before this row existed, and
+# owner proposals, have no requester role (null), never a guessed one.
+VISIT_REQUEST_ACTION = "VISIT_REQUESTED"
+ENTITY_VISIT = "property_visit"
+_ACTIVE_STATUSES = ("REQUESTED", "PROPOSED", "CONFIRMED")
+
+
+def _lead_closed(
+    db: Session, listing_id: int, buyer_id: int, owner_id: int, for_update: bool = False
+) -> bool:
+    """True when the newest enquiry for this listing + buyer + owner is CLOSED.
+
+    for_update locks that enquiry row, serializing visit creation against a
+    concurrent close (which holds the same lock while it cancels visits), so
+    a closed lead can never be left with a freshly created active visit.
+    """
+    q = (
+        db.query(Enquiry)
+        .filter(
+            Enquiry.property_listing_id == listing_id,
+            Enquiry.buyer_user_id == buyer_id,
+            Enquiry.owner_user_id == owner_id,
+        )
+        .order_by(Enquiry.id.desc())
+    )
+    if for_update:
+        q = q.with_for_update()
+    latest = q.first()
+    return latest is not None and latest.status == "CLOSED"
+
+
+def close_visits_for_lead(db: Session, enquiry: Enquiry) -> list[tuple[int, str]]:
+    """Cancel every active visit of the lead's listing + buyer + owner.
+
+    Called by the lead close with the enquiry row already locked, inside the
+    same transaction: either the lead closes AND its visits are cancelled, or
+    neither happens. Rows are locked first so a concurrent visit edit either
+    finishes before (and is then cancelled here) or runs after and is refused
+    by the closed-lead check. Terminal visits are left as they are (history).
+    Returns [(visit id, previous status)] for the caller's audit row.
+    """
+    rows = (
+        db.query(PropertyVisit)
+        .filter(
+            PropertyVisit.property_listing_id == enquiry.property_listing_id,
+            PropertyVisit.buyer_user_id == enquiry.buyer_user_id,
+            PropertyVisit.owner_user_id == enquiry.owner_user_id,
+            PropertyVisit.status.in_(_ACTIVE_STATUSES),
+        )
+        .order_by(PropertyVisit.id)
+        .with_for_update()
+        .all()
+    )
+    now = _utcnow_naive()
+    cancelled = []
+    for visit in rows:
+        cancelled.append((int(visit.id), visit.status))
+        visit.status = "CANCELLED"
+        visit.rescheduled_at = None  # a status change ends the "Rescheduled" state
+        visit.updated_at = now
+    db.flush()
+    return cancelled
 
 
 def _utcnow_naive() -> datetime:
@@ -87,6 +170,7 @@ def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
 
     info = _listing_info(db, [v.property_listing_id for v in visits])
     names = safe_display_names(db, [u for v in visits for u in (v.buyer_user_id, v.owner_user_id)])
+    roles = _requester_roles(db, [v.id for v in visits])
     out = []
     for visit in visits:
         li = info[int(visit.property_listing_id)]
@@ -101,6 +185,7 @@ def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
             "scheduled_at": visit.scheduled_at,
             "status": visit.status,
             "initiator": visit.initiator,
+            "requester_role": roles.get(int(visit.id)),
             "note": visit.note,
             "listing": {
                 "title": listing.title,
@@ -119,6 +204,27 @@ def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
     return out
 
 
+def _requester_roles(db: Session, visit_ids: list[int]) -> dict[int, str]:
+    """visit id -> requester role (BUYER/BROKER) from VISIT_REQUESTED rows."""
+    if not visit_ids:
+        return {}
+    rows = (
+        db.query(ActivityLog.entity_id, ActivityLog.details)
+        .filter(
+            ActivityLog.action == VISIT_REQUEST_ACTION,
+            ActivityLog.entity_type == ENTITY_VISIT,
+            ActivityLog.entity_id.in_(visit_ids),
+        )
+        .all()
+    )
+    out: dict[int, str] = {}
+    for vid, details in rows:
+        role = (details or {}).get("source_role") if isinstance(details, dict) else None
+        if role in ("BUYER", "BROKER"):
+            out[int(vid)] = role
+    return out
+
+
 def _snapshot(db: Session, visit: PropertyVisit) -> dict:
     return _snapshots(db, [visit])[0]
 
@@ -129,12 +235,19 @@ def create_buyer_visit(
     listing_id: int,
     scheduled_at: datetime,
     note: str | None,
+    *,
+    source_role: str,
 ) -> dict:
-    """Buyer schedules a visit (lands REQUESTED). Returns the visit body."""
+    """Buyer schedules a visit (lands REQUESTED). Returns the visit body.
+    `source_role` is the requester's current role (BUYER or BROKER); it is
+    recorded for the owner (required: never defaulted, so an agent's visit
+    cannot silently read as a buyer's)."""
     listing = _visible_listing(db, listing_id)
     owner_id = _consistent_owner_id(db, listing)
     if buyer_id == owner_id:
         raise ValueError("cannot schedule a visit on your own listing")
+    if _lead_closed(db, listing_id, buyer_id, owner_id, for_update=True):
+        raise ValueError(LEAD_CLOSED_DETAIL)
     moment = _normalize_scheduled_at(scheduled_at)
     if _has_active_visit_for_buyer_listing(db, listing_id, buyer_id, initiator="BUYER"):
         raise ValueError("A visit is already active for this buyer on this listing")
@@ -150,6 +263,12 @@ def create_buyer_visit(
         updated_at=_utcnow_naive(),
     )
     db.add(visit)
+    db.flush()
+    db.add(ActivityLog(
+        user_id=buyer_id, action=VISIT_REQUEST_ACTION, entity_type=ENTITY_VISIT,
+        entity_id=visit.id, created_at=_utcnow_naive(),
+        details={"source_role": source_role, "listing_id": int(listing_id)},
+    ))
     db.flush()
     db.refresh(visit)
     return _snapshot(db, visit)
@@ -223,15 +342,26 @@ def create_owner_visit(
     """Owner proposes a visit to a related buyer (lands PROPOSED)."""
     from ..models import User
 
-    listing = _visible_listing(db, listing_id)
-    if _consistent_owner_id(db, listing) != owner_id:
+    # Ownership first (404 for anything not the caller's), then liveness: the
+    # owner may learn their own listing's state, nobody else's.
+    candidate = db.get(PropertyListing, listing_id)
+    if candidate is None or _consistent_owner_id(db, candidate) != owner_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if not (
+        candidate.verification_status == "VERIFIED"
+        and candidate.listing_status == "AVAILABLE"
+        and candidate.deleted_at is None
+    ):
+        raise ValueError("Visits can only be scheduled on a live listing")
+    listing = _visible_listing(db, listing_id)  # row lock; 404 if it changed meanwhile
     if db.get(User, buyer_user_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     if buyer_user_id == owner_id:
         raise ValueError("cannot propose a visit to yourself")
     if not _buyer_has_relationship(db, listing_id, buyer_user_id):
         raise ValueError("buyer has no enquiry or contact relationship on this listing")
+    if _lead_closed(db, listing_id, buyer_user_id, owner_id, for_update=True):
+        raise ValueError(LEAD_CLOSED_DETAIL)
     moment = _normalize_scheduled_at(scheduled_at)
     if _has_active_visit_for_buyer_listing(
         db, listing_id, buyer_user_id, initiator="OWNER"
@@ -376,9 +506,21 @@ def transition_visit(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     if actor == "owner" and visit.owner_user_id != actor_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    # After the scope checks (no leak): a closed lead's visits are read-only
+    # for both parties, including same-state repeats from a stale screen.
+    if _lead_closed(db, visit.property_listing_id, visit.buyer_user_id, visit.owner_user_id):
+        raise ValueError(LEAD_CLOSED_DETAIL)
 
     original_status = visit.status
     next_moment = None
+    # Owner counter-proposal on a buyer request: a time change alone (never
+    # combined with a status move) re-opens the visit as PROPOSED.
+    counter_proposal = (
+        actor == "owner"
+        and original_status == "REQUESTED"
+        and scheduled_at is not None
+        and to_status is None
+    )
 
     if to_status is not None:
         allowed = _ALLOWED.get((original_status, to_status))
@@ -398,7 +540,7 @@ def transition_visit(
         editors = _TIME_EDITORS.get(original_status)
         if editors is None:
             raise ValueError(f"Cannot reschedule a {original_status} visit")
-        if "either" not in editors and actor not in editors:
+        if not counter_proposal and "either" not in editors and actor not in editors:
             raise ValueError(
                 f"Only {editors[0]} may reschedule a {original_status} visit"
             )
@@ -424,7 +566,9 @@ def transition_visit(
         editors = _TIME_EDITORS.get(original_status)
         if editors is None:
             raise ValueError(f"Cannot edit the note of a {original_status} visit")
-        if "either" not in editors and actor not in editors:
+        # A counter-proposal may carry the owner's note with the new time; a
+        # note-only owner edit of a buyer request is still refused.
+        if not counter_proposal and "either" not in editors and actor not in editors:
             raise ValueError(f"Only {editors[0]} may edit the note of a {original_status} visit")
 
     now = _utcnow_naive()
@@ -436,6 +580,11 @@ def transition_visit(
         if to_status != original_status:
             visit.rescheduled_at = None  # a status change ends the "Rescheduled" display state
         visit.status = to_status
+    if counter_proposal:
+        # Now awaiting the buyer's reply, like any owner proposal (status
+        # change, so the "Rescheduled" display state is cleared too).
+        visit.status = "PROPOSED"
+        visit.rescheduled_at = None
     if note is not None:
         visit.note = note.strip() or None
 

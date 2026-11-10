@@ -179,8 +179,11 @@ def update_my_lead(
     Only NEW/CONTACTED/CLOSED are accepted (anything else is 422 via the
     schema). Returns 404 when the lead does not belong to the caller.
     CLOSING a lead stores the supplied closing_reason (e.g. "Not Converted"),
-    frees the buyer's active-enquiry row so re-enquiry is possible, and never
-    modifies the property listing. Phone-free OwnerLeadOut response.
+    frees the buyer's active-enquiry row so re-enquiry is possible, cancels
+    the lead's active visits in the same transaction, and never modifies the
+    property listing. A closed lead is terminal: any further PATCH (even the
+    same close again) is 422 "Lead is already closed". Phone-free
+    OwnerLeadOut response.
     """
     # Savepoint (not a full rollback): same shared-test-session reason as the
     # listing PATCH above — only this request's work is discarded on failure.
@@ -234,6 +237,23 @@ def reply_to_my_lead(
     if not created:
         response.status_code = status.HTTP_200_OK
     return message
+
+
+@router.post("/leads/{lead_id}/contact", response_model=schemas.ContactRevealOut)
+def reveal_my_lead_contact(
+    lead_id: int,
+    db: Session = Depends(get_db),
+    owner_id: int = Depends(require_owner),
+):
+    """The buyer's phone for one of the caller's own leads (Call / WhatsApp).
+
+    POST, not GET: every reveal writes an audit row (GETs never write).
+    404 "Not found" unless the lead and its listing are the caller's; 404
+    "Contact not available" when the buyer has no phone on file. Lead list
+    and detail responses stay phone-free."""
+    phone = enquiry_svc.reveal_buyer_contact(db, owner_id, lead_id)
+    db.commit()
+    return schemas.ContactRevealOut(phone=phone)
 
 
 @router.get("/leads/{lead_id}/notes", response_model=schemas.LeadNotesResponse)
@@ -750,7 +770,9 @@ def propose_owner_visit(
     on one of the caller's own verified, available listings (lands PROPOSED).
 
     Returns 404 for foreign listings or unknown buyers, 422 for unrelated
-    buyers, past times, or self-visits.
+    buyers, past times, self-visits, the caller's own listing when it is
+    not live ("Visits can only be scheduled on a live listing"), or a buyer
+    whose lead the owner has closed ("Lead is closed").
     """
     if body.property_listing_id <= 0 or body.buyer_user_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
@@ -799,10 +821,12 @@ def update_my_visit(
     db: Session = Depends(get_db),
     owner_id: int = Depends(require_owner),
 ):
-    """Confirm/decline buyer-requested visits, reschedule proposed/confirmed
-    times, cancel open visits, or complete confirmed ones — per the state
-    rules. 404 when the visit is not on the caller's property, 422 for
-    invalid moves, past times, or wrong-actor transitions."""
+    """Confirm/decline buyer-requested visits, counter-propose a new time on
+    a buyer request (time only -> PROPOSED, awaiting the buyer), reschedule
+    proposed/confirmed times, cancel open visits, or complete confirmed
+    ones — per the state rules. 404 when the visit is not on the caller's property, 422 for
+    invalid moves, past times, wrong-actor transitions, or a visit whose
+    lead is closed ("Lead is closed")."""
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(

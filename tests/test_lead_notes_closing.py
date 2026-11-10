@@ -105,7 +105,8 @@ def test_close_is_terminal_audited_and_leaves_listing_alone(client):
     assert before == {"enquiry_id": eid, "status": "CONTACTED", "closing_reason": None}
     assert after == {"enquiry_id": eid, "status": "CLOSED", "closing_reason": "Sold"}
     repeat = c.patch(f"/owner/leads/{eid}", json={"status": "CLOSED", "closing_reason": "Sold"}, headers=ho)
-    assert repeat.status_code == 200  # idempotent, no second audit row
+    # Terminal: even repeating the same close is refused (no second audit row).
+    assert repeat.status_code == 422 and repeat.json()["detail"] == "Lead is already closed"
     other = c.patch(f"/owner/leads/{eid}", json={"status": "CLOSED", "closing_reason": "Rented"}, headers=ho)
     assert other.status_code == 422 and other.json()["detail"] == "Lead is already closed"
     assert c.patch(f"/owner/leads/{eid}", json={"status": "NEW"}, headers=ho).status_code == 422

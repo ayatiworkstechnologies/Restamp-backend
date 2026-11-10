@@ -8,6 +8,7 @@
 - owners see per-listing call_count only — never which buyer tapped.
 Rollback-isolated.
 """
+import json
 from sqlalchemy import text
 
 from tests.conftest import auth_header
@@ -39,7 +40,12 @@ def test_tap_is_recorded_and_deduplicated(client):
     assert retry.status_code == 200 and retry.json() == body  # same event, no new row
     rows = _events(session, buyer["user_id"], lid)
     assert len(rows) == 1
-    assert tuple(rows[0][:3]) == ("CALL_BUTTON_TAP", "property_listing", lid) and rows[0][3] is None
+    assert tuple(rows[0][:3]) == ("CALL_BUTTON_TAP", "property_listing", lid)
+    # details holds only the tapper's role (no phone or other personal data).
+    details = rows[0][3]
+    # The contacted party is the listing owner, by id only (no phone number).
+    owner_id = session.execute(text("SELECT user_id FROM property_listings WHERE id=:l"), {"l": lid}).scalar()
+    assert (json.loads(details) if isinstance(details, str) else details) == {"source_role": "BUYER", "owner_user_id": owner_id}
     session.execute(text("UPDATE activity_logs SET created_at = created_at - INTERVAL 2 MINUTE WHERE user_id=:u"),
                     {"u": buyer["user_id"]})
     later = _tap(c, buyer, lid)

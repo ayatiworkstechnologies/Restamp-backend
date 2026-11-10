@@ -12,8 +12,11 @@ existed lives only in enquiries.message and is presented as the first message
 with id/created_at = null (never a fabricated time).
 
 Owner side: leads are scoped by the stored owner_user_id; closing requires one
-of the four outcomes (D5), is terminal, writes one audit_logs row and never
-touches the listing. Private lead notes (D4) are owner-only and are never
+of the four outcomes (D5), is terminal (any later status write is a 422),
+writes one audit_logs row, cancels the lead's active visits in the same
+transaction (one more audit row when there were any) and never touches the
+listing. The buyer's phone is never part of a lead response; the owner gets
+it only through reveal_buyer_contact (audited). Private lead notes (D4) are owner-only and are never
 included in any buyer, visit or public response.
 
 Two-way threads: the listing owner may reply on an open lead
@@ -41,6 +44,7 @@ from sqlalchemy.orm import Session
 from ..models import (
     ActiveEnquiry,
     AuditLog,
+    AuthIdentity,
     Enquiry,
     EnquiryMessage,
     LeadNote,
@@ -48,6 +52,7 @@ from ..models import (
     PropertyListing,
 )
 from . import listings as listing_svc
+from . import visits as visit_svc
 
 _DOUBLE_TAP_SECONDS = 60
 _MESSAGE_RATE_LIMIT = 30
@@ -255,6 +260,9 @@ def _owner_items(db: Session, enquiries: list[Enquiry], with_messages: bool) -> 
             "property_listing_id": e.property_listing_id,
             "buyer_user_id": e.buyer_user_id,
             "buyer_display_name": names.get(int(e.buyer_user_id)),
+            # NULL = created before source_role existed, when only BUYER-mode
+            # accounts could enquire (alembic l2m3n4o5p6q7): a fact, not a guess.
+            "source_role": e.source_role or "BUYER",
             "listing_removed": listing.deleted_at is not None,
             "message": e.message,
             "status": e.status,
@@ -331,10 +339,14 @@ def _append_message(
 
 
 def create_enquiry(
-    db: Session, buyer_id: int, listing_id: int, message: str | None
+    db: Session, buyer_id: int, listing_id: int, message: str | None, *, source_role: str
 ) -> tuple[dict, bool]:
     """Create (NEW) or reuse the active enquiry; store the message. Returns
-    (body, created). A reused enquiry gets the message appended (D1)."""
+    (body, created). A reused enquiry gets the message appended (D1).
+    `source_role` is the sender's current role (BUYER or BROKER = agent),
+    stored on a NEW enquiry so its owner can tell buyer and agent leads apart;
+    a reused enquiry keeps the role it was created with. Required (no
+    default) so no caller can silently label an agent's lead as a buyer's."""
     listing = _visible_listing(db, listing_id)
     # Consistency gate first (fail-closed before any read of enquiry state):
     # both ownership columns must agree, or the row matches nobody.
@@ -376,6 +388,7 @@ def create_enquiry(
         message=body,
         status="NEW",
         created_at=now,
+        source_role=source_role,
     )
     try:
         # Savepoint: a concurrent duplicate rolls back only this insert set,
@@ -435,9 +448,11 @@ def get_enquiry(db: Session, buyer_id: int, enquiry_id: int) -> dict:
 
 # Owner-side lifecycle (P4): NEW -> CONTACTED -> CLOSED, plus NEW -> CLOSED
 # directly, CONTACTED -> NEW. Same-status writes are idempotent no-ops.
-# CLOSED is terminal (D5): repeating the same close is a no-op, a different
-# outcome is a 422. Closing frees the buyer's active-enquiry row so a new
-# enquiry creates a fresh lead. The listing is never touched.
+# CLOSED is terminal (D5): every later write — even repeating the same close
+# from a stale screen — is a 422, so a closed lead is never actionable again.
+# Closing frees the buyer's active-enquiry row so a new enquiry creates a
+# fresh lead, and cancels the lead's active visits atomically. The listing is
+# never touched.
 _ALLOWED_OWNER_TRANSITIONS = {
     "NEW": {"NEW", "CONTACTED", "CLOSED"},
     "CONTACTED": {"CONTACTED", "NEW", "CLOSED"},
@@ -458,16 +473,17 @@ def transition_owner_lead(
     """Persist an owner-side status change. 404 for foreign/missing leads,
     422 for unsupported transitions. The request schema guarantees that
     CLOSED comes with one of CLOSING_OUTCOMES and other statuses without a
-    reason. CLOSED removes the active row and writes one audit_logs row.
-    Never touches the property listing. Flushes; the caller commits."""
+    reason. CLOSED removes the active row, cancels the lead's active visits
+    and writes the audit_logs rows. Any write on an already CLOSED lead is a
+    422 "Lead is already closed". Never touches the property listing.
+    Flushes; the caller commits (one transaction: lead, visits and audit
+    rows land together or not at all)."""
     enquiry = _owned_lead(db, owner_id, lead_id, for_update=True)
     previous_status, previous_reason = enquiry.status, enquiry.closing_reason
+    if previous_status == "CLOSED":
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Lead is already closed")
     if to_status not in _ALLOWED_OWNER_TRANSITIONS.get(previous_status, set()):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
-    if previous_status == "CLOSED":
-        if closing_reason != previous_reason:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Lead is already closed")
-        return _owner_items(db, [enquiry], with_messages=False)[0]  # idempotent repeat
     enquiry.status = to_status
     if to_status == "CLOSED":
         enquiry.closing_reason = closing_reason
@@ -480,6 +496,20 @@ def transition_owner_lead(
             after_json={"enquiry_id": enquiry.id, "status": "CLOSED", "closing_reason": closing_reason},
             created_at=_utcnow_naive_seconds(),
         ))
+        cancelled = visit_svc.close_visits_for_lead(db, enquiry)
+        if cancelled:
+            # Visit history stays (rows are updated, never deleted); this row
+            # records which visits the close ended and what they were before.
+            db.add(AuditLog(
+                user_id=owner_id,
+                action="LEAD_VISITS_CANCELLED",
+                entity="property_visit",
+                before_json={"enquiry_id": enquiry.id,
+                             "visits": [{"id": vid, "status": st} for vid, st in cancelled]},
+                after_json={"enquiry_id": enquiry.id,
+                            "visits": [{"id": vid, "status": "CANCELLED"} for vid, _ in cancelled]},
+                created_at=_utcnow_naive_seconds(),
+            ))
     db.flush()
     return _owner_items(db, [enquiry], with_messages=False)[0]
 
@@ -531,6 +561,44 @@ def list_owner_leads(
 def get_owner_lead(db: Session, owner_id: int, lead_id: int) -> dict:
     """One lead with its full two-way thread; 404 unless the caller's."""
     return _owner_items(db, [_owned_lead(db, owner_id, lead_id)], with_messages=True)[0]
+
+
+def reveal_buyer_contact(db: Session, owner_id: int, lead_id: int) -> str:
+    """The buyer's verified phone for the caller's own lead, audited.
+
+    Authority is the lead itself: the enquiry's stored owner_user_id AND both
+    listing ownership columns must equal the caller (same gate as owner
+    replies), else 404 — another owner can never reach a buyer's number by
+    guessing lead ids. Closed leads still answer (read-only reference to a
+    buyer who contacted the owner); only writes are blocked on them. 404
+    "Contact not available" when the buyer has no phone identity (e.g. a
+    Google-only account). Writes one audit_logs row naming the lead and
+    buyer — never the number. Flushes; the caller commits.
+    """
+    enquiry = _owned_lead(db, owner_id, lead_id)
+    listing = db.get(PropertyListing, enquiry.property_listing_id)
+    physical = db.get(PhysicalProperty, listing.physical_property_id) if listing is not None else None
+    if listing is None or physical is None or listing.user_id != owner_id or physical.user_id != owner_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if enquiry.buyer_user_id == owner_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    phone_row = (
+        db.query(AuthIdentity)
+        .filter(AuthIdentity.user_id == enquiry.buyer_user_id, AuthIdentity.provider == "phone")
+        .first()
+    )
+    if phone_row is None or not phone_row.provider_identifier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not available")
+    db.add(AuditLog(
+        user_id=owner_id,
+        action="LEAD_CONTACT_REVEALED",
+        entity="enquiry",
+        before_json=None,
+        after_json={"enquiry_id": enquiry.id, "buyer_user_id": enquiry.buyer_user_id},
+        created_at=_utcnow_naive_seconds(),
+    ))
+    db.flush()
+    return phone_row.provider_identifier
 
 
 def reply_as_owner(db: Session, owner_id: int, lead_id: int, body: str) -> tuple[dict, bool]:

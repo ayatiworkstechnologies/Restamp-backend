@@ -185,6 +185,16 @@ class ContactRevealOut(BaseModel):
     phone: str
 
 
+class ListingContactRevealOut(ContactRevealOut):
+    """Buyer/agent reveal of a listing owner's number. Adds the owner's
+    public-safe display name (null when the owner has no safe saved name;
+    never phone-based) and whether the listing is the caller's own (an owner
+    in buyer mode: no lead, and calls/visits on it are not tracked)."""
+
+    owner_name: str | None = None
+    own_listing: bool = False
+
+
 class EnquiryCreate(BaseModel):
     property_listing_id: int
     message: str | None = Field(default=None, max_length=2000)
@@ -289,6 +299,9 @@ class OwnerLeadOut(BaseModel):
     property_listing_id: int
     buyer_user_id: int
     buyer_display_name: str | None = None
+    # Who sent the lead: BUYER, or BROKER (an agent). Recorded from the
+    # sender's role when the enquiry was created.
+    source_role: Literal["BUYER", "BROKER"] = "BUYER"
     listing_removed: bool = False
     message: str | None
     status: str
@@ -459,6 +472,9 @@ class VisitOut(BaseModel):
     scheduled_at: datetime
     status: str
     initiator: str
+    # Who requested the visit: BUYER or BROKER (agent). Null for owner
+    # proposals and visits from before the role was recorded.
+    requester_role: str | None = None
     note: str | None
     listing: VisitListingSnapshot
     created_at: datetime | None = None
@@ -1043,6 +1059,8 @@ class OwnerListingOut(BaseModel):
     enquiry_count: int = 0
     visit_count: int = 0
     call_count: int = 0
+    # Of call_count, the taps made by agents (counts only, no identities).
+    agent_call_count: int = 0
 
 
 class OwnerListingsResponse(BaseModel):

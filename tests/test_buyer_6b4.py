@@ -53,7 +53,8 @@ def test_buyer_reveal_and_audit(client):
     tok = register_phone(c, "+916200000002")
     r = c.post(f"/buyer/listings/{lid}/contact", headers=auth_header(tok["access_token"]))
     assert r.status_code == 200, r.text
-    assert r.json() == {"phone": owner_phone}
+    # The owner's public-safe name rides along (seed owner "Owner"); never a phone.
+    assert r.json() == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
     row = session.execute(
         text(
             "SELECT user_id, property_listing_id FROM contact_reveal_audits "
