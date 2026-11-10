@@ -141,6 +141,12 @@ class Settings:
     # so it can never switch on in a deployed environment by accident.
     AREA_SEEDING_ENABLED: bool = _get("RESTAMP_AREA_SEEDING_ENABLED", "0") == "1"
 
+    # Public interactive API docs (/docs, /redoc, /openapi.json) in
+    # production. Development always has them. Production only with an
+    # explicit "1" (an owner decision: the docs list every route publicly but
+    # grant no access — every endpoint keeps its own authentication).
+    DOCS_ENABLED: bool = _get("RESTAMP_DOCS_ENABLED", "0") == "1"
+
 
 settings = Settings()
 

@@ -71,6 +71,8 @@ async def lifespan(app: FastAPI):
     # SMS provider in the codebase (see app/services/otp.py). OTP requests
     # fail closed at request time with a generic 503 until real SMS delivery
     # is connected behind OTPService.delivery.
+    if is_production() and settings.DOCS_ENABLED:
+        log.warning("RESTAMP_DOCS_ENABLED=1: /docs, /redoc and /openapi.json are public in production.")
     if not is_production() and not settings.JWT_SECRET:
         log.warning("JWT secret is empty in local development.")
     elif settings.JWT_SECRET == "restamp-local-dev-secret-change-me":
@@ -94,12 +96,13 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    # Phase 1 hardening: interactive API docs/openapi are never exposed in
-    # production (they enumerate the whole route surface publicly; audited
-    # live as HTTP 200 there). Local dev keeps the default doc URLs.
+    # Interactive API docs/openapi: always on in local development; in
+    # production only with the explicit RESTAMP_DOCS_ENABLED=1 opt-in (they
+    # enumerate the whole route surface publicly, but grant no access: every
+    # endpoint keeps its own authentication and authorization).
     _doc_kwargs: dict = (
         {"docs_url": None, "redoc_url": None, "openapi_url": None}
-        if is_production()
+        if is_production() and not settings.DOCS_ENABLED
         else {}
     )
     app = FastAPI(
