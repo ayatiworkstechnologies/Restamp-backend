@@ -217,6 +217,9 @@ def client():
         # code the way a real phone would — at the delivery boundary, never
         # from an API response.
         otp_service.delivery = TestSMSInbox()
+        # Helpers that only receive the client allocate pincodes on this
+        # test's session (fresh_pincode).
+        c.test_session = session
         yield c, session
     session.close()
     trans.rollback()
@@ -296,6 +299,16 @@ def _allocate_pincode(session) -> str:
         if not exists:
             return cand
     raise RuntimeError("no free Chennai test pincode in 600001–600118")
+
+
+def fresh_pincode(c) -> str:
+    """A free Chennai pincode for a listing created through the API.
+
+    A pincode belongs to exactly one locality and owner listings must pair
+    it with that locality (owner_listings.PINCODE_LOCALITY_MISMATCH), so a
+    helper that invents a new locality name needs a pincode nobody owns yet.
+    """
+    return _allocate_pincode(c.test_session)
 
 
 def make_postcode(session, tag: str = "", pincode: str | None = None) -> int:
