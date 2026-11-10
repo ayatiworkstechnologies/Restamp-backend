@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from tests.conftest import auth_header
+from tests.conftest import auth_header, fresh_pincode
 from tests.test_owner_leads import fresh_buyer
 from tests.test_property_lifecycle import _create, _owner
 
@@ -76,7 +76,7 @@ def test_client_supplied_owner_ids_are_ignored(client):
         "/owner/listings",
         json={
             "title": "Spoofed owner", "transaction_type": "BUY", "property_type": "APARTMENT",
-            "price_rupees": 100000, "locality": "Spoof Nagar", "city": "Chennai", "pincode": "600080",
+            "price_rupees": 100000, "locality": "Spoof Nagar", "city": "Chennai", "pincode": fresh_pincode(c),
             "user_id": b_id, "owner_id": b_id, "owner_user_id": b_id,
         },
         headers=auth_header(token_a),

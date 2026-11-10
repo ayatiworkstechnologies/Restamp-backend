@@ -549,22 +549,51 @@ _AGREEMENT_MONTHS = {"11 months": 11, "1 year": 12, "2 years": 24, "3 years": 36
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
-# Chennai-only pincode rule (temporary business rule, Phase 2): every
-# listing pincode must be exactly six numeric digits in the inclusive range
-# 600001–600118. Single source of truth for both OwnerListingCreate and
-# OwnerListingUpdate — direct API calls cannot bypass it. Pincodes stay
+# Chennai-only pincode rule: every listing pincode must be exactly six
+# numeric digits in the inclusive range 600001–600118 or an explicitly
+# approved extra pincode (below). Single source of truth for both
+# OwnerListingCreate and OwnerListingUpdate — direct API calls cannot
+# bypass it. Pincodes stay
 # strings end-to-end (never int-converted) so leading zeros survive.
 CHENNAI_PINCODE_MIN = 600001
 CHENNAI_PINCODE_MAX = 600118
 CHENNAI_PINCODE_PATTERN = r"^\d{6}$"
+# Verified Chennai-service-area pincodes OUTSIDE the base range, approved one
+# by one (never a wider numeric maximum, never gap-filling):
+#   600119  Sholinganallur S.O (India Post, CHENNAI district) - approved.
+# Deliberately NOT approved: 600120-600124, 600126+ (other districts) and
+# 600125 (Mugalivakkam/Manapakkam, CHENNAI district, not in the picker).
+# Approved service localities INSIDE the base range need no entry here:
+# 600045 Tambaram and 600100 Medavakkam (CHENGALPATTU postal district) were
+# explicitly approved for the Chennai service area and are accepted by the
+# range. The mobile and website owner forms mirror this rule: change them in
+# the same release as this set.
+# TEMPORARILY DISABLED — Chennai area seeding paused.
+# The approval below is commented out, so the rule is exactly 600001-600118
+# again (matching the mobile and website owner forms). To restore: swap the
+# two pairs of lines back.
+# CHENNAI_APPROVED_EXTRA_PINCODES: frozenset[str] = frozenset({"600119"})
+# CHENNAI_PINCODE_ERROR = "Please enter a valid Chennai pincode (600001 to 600118, or 600119)."
+CHENNAI_APPROVED_EXTRA_PINCODES: frozenset[str] = frozenset()
 CHENNAI_PINCODE_ERROR = (
     "Please enter a valid pincode between 600001 and 600118."
 )
 
 
+def is_chennai_service_pincode(value: str) -> bool:
+    """The single Chennai service-area pincode policy: six digits, inside the
+    base range or explicitly approved. Used by owner listings (create/update)
+    and the locality catalog loader, so they can never disagree."""
+    s = str(value or "").strip()
+    if not re.fullmatch(r"\d{6}", s):
+        return False
+    return CHENNAI_PINCODE_MIN <= int(s) <= CHENNAI_PINCODE_MAX or s in CHENNAI_APPROVED_EXTRA_PINCODES
+
+
 def normalize_chennai_pincode(value: str | None) -> str | None:
     """Validate a listing pincode: exactly six digits within the Chennai
-    range. Returns the trimmed string unchanged. ``None`` passes through
+    service area (is_chennai_service_pincode). Returns the trimmed string
+    unchanged. ``None`` passes through
     (optional update fields); empty/whitespace and out-of-range values raise
     ValueError (→ 422)."""
     if value is None:
@@ -572,9 +601,7 @@ def normalize_chennai_pincode(value: str | None) -> str | None:
     s = str(value).strip()
     if not s:
         raise ValueError(CHENNAI_PINCODE_ERROR)
-    if not re.fullmatch(r"\d{6}", s):
-        raise ValueError(CHENNAI_PINCODE_ERROR)
-    if not (CHENNAI_PINCODE_MIN <= int(s) <= CHENNAI_PINCODE_MAX):
+    if not is_chennai_service_pincode(s):
         raise ValueError(CHENNAI_PINCODE_ERROR)
     return s
 

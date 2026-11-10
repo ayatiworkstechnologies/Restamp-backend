@@ -3,12 +3,15 @@
 An owner can create a property listing (PhysicalProperty + PropertyListing +
 PropertyMedia rows) and retrieve their own listings.
 
-Location strategy:
-  1. Try to find an exact postcode match by pincode.
-  2. Fall back to a case-insensitive locality name match.
-  3. If neither exists, auto-create the full location chain so the submission
-     never fails for a valid but unseen locality — the admin can clean/merge
-     location data independently.
+Location strategy (the owner's pincode is never discarded or replaced):
+  1. The pincode is already in the catalog: it belongs to exactly one
+     locality, so it is used only when the entered locality is that locality
+     (spelling-insensitive, or one of its aliases); otherwise the request is
+     refused with PINCODE_LOCALITY_MISMATCH (422).
+  2. The pincode is new: it is added to the entered locality (an existing
+     locality with the same spelling key is reused, preferring the entered
+     city) or, if none exists, the full location chain is created.
+     A locality's OTHER pincode is never substituted for the entered one.
 
 New listings land in PENDING/AVAILABLE state (submitted, not yet visible).
 Buyer visibility requires VERIFIED + AVAILABLE; the explicit lifecycle is:
@@ -37,7 +40,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..models.locations import City, District, Locality, Postcode, Taluk, Village
+from ..models.locations import City, District, Locality, LocalityAlias, Postcode, Taluk, Village
 from ..models.properties import (
     AmenityMaster,
     ListingAmenity,
@@ -48,6 +51,8 @@ from ..models.properties import (
     RentTerms,
 )
 from ..schemas import CHENNAI_PINCODE_ERROR, normalize_chennai_pincode
+from ..config import area_seeding_enabled
+from .localities import _sql_key, name_key
 from ..services.listings import format_price
 from ..services.media_urls import MAX_LISTING_PHOTOS, validate_listing_image_url
 
@@ -140,29 +145,76 @@ def _get_or_create_chain_row(db: Session, lookup, build):
     raise last_error
 
 
+PINCODE_LOCALITY_MISMATCH = (
+    "This pincode belongs to a different locality. Please check the locality and pincode."
+)
+
+
+def _locality_accepts(db: Session, locality_id: int, entered_key: str) -> bool:
+    """True when the entered locality names this catalog locality: its own
+    name (spelling-insensitive) or one of its aliases."""
+    loc = db.get(Locality, locality_id)
+    if loc is not None and name_key(loc.name) == entered_key:
+        return True
+    # TEMPORARILY DISABLED — Chennai area seeding paused: alias matches only
+    # while the area-seeding flag is on; the spelling-insensitive own-name
+    # match above (and the whole pincode fix) stays active.
+    if not area_seeding_enabled():
+        return False
+    return db.query(LocalityAlias.id).filter(
+        LocalityAlias.locality_id == locality_id, LocalityAlias.alias_key == entered_key
+    ).first() is not None
+
+
+def _existing_locality_for(db: Session, key: str, city: str) -> Locality | None:
+    """An existing locality with this spelling key that already has a
+    postcode, preferring one in the entered city; lowest id for determinism."""
+    rows = (
+        db.query(Locality, City.name)
+        .join(Village, Locality.village_id == Village.id)
+        .join(Taluk, Village.taluk_id == Taluk.id)
+        .join(District, Taluk.district_id == District.id)
+        .join(City, District.city_id == City.id)
+        .filter(_sql_key(Locality.name) == key, Locality.id.in_(db.query(Postcode.locality_id)))
+        .order_by(Locality.id)
+        .all()
+    )
+    same_city = [loc for loc, cname in rows if (cname or "").strip().lower() == (city or "").strip().lower()]
+    return (same_city or [loc for loc, _ in rows] or [None])[0]
+
+
 def _find_or_create_postcode(
     db: Session, city: str, district: str | None, locality: str, pincode: str
 ) -> int:
-    """Return postcode.id; creates the chain if the pincode is not in the DB.
+    """Return the postcode.id for exactly the entered pincode (see the module
+    docstring's location strategy). Raises ValueError(PINCODE_LOCALITY_MISMATCH)
+    when the pincode already belongs to a different locality.
 
     The district comes from the request (falling back to the city only when
     absent); a provided-but-blank district is a validation error, never
     silently replaced.
     """
-    # 1. Exact pincode match
+    entered_key = name_key(locality)
+    # 1. The pincode is in the catalog: it must belong to the entered locality.
     row = db.query(Postcode).filter(Postcode.pincode == pincode.strip()).first()
     if row:
-        return row.id
+        if _locality_accepts(db, row.locality_id, entered_key):
+            return row.id
+        raise ValueError(PINCODE_LOCALITY_MISMATCH)
 
-    # 2. Locality-name match (case-insensitive) — use first postcode in that locality
-    row = (
-        db.query(Postcode)
-        .join(Locality, Postcode.locality_id == Locality.id)
-        .filter(func.lower(Locality.name) == locality.strip().lower())
-        .first()
-    )
-    if row:
-        return row.id
+    # 2. New pincode for a known locality: add it there (never reuse that
+    #    locality's other pincode).
+    if entered_key:
+        known = _existing_locality_for(db, entered_key, city)
+        if known is not None:
+            pc_row = _get_or_create_chain_row(
+                db,
+                lookup=lambda: db.query(Postcode).filter(
+                    Postcode.locality_id == known.id, Postcode.pincode == pincode.strip()
+                ),
+                build=lambda: Postcode(locality_id=known.id, pincode=pincode.strip()),
+            )
+            return pc_row.id
 
     # 3. Create the full chain for this new location
     city_name = city.strip() or "Unknown City"
@@ -794,14 +846,10 @@ def update_owner_listing(
         setattr(phys, field, value)
 
     # Location: any supplied part re-resolves the postcode from merged
-    # (supplied over stored) values. Known limitation (no redesign here):
-    # the resolver tries exact-pincode first, then falls back to a
-    # locality-name match, so a submitted pincode paired with an already
-    # stored locality can resolve to that locality's previously stored
-    # postcode — i.e. a different pincode than submitted. Locality to
-    # pincode consistency needs a product decision in the future
-    # area-lookup phase; callers/tests pair unique localities with new
-    # pincodes to avoid the fallback.
+    # (supplied over stored) values with the same rules as create: exactly
+    # the submitted pincode, which must belong to the entered locality
+    # (PINCODE_LOCALITY_MISMATCH otherwise). The stored postcode is never
+    # substituted for a different submitted pincode.
     loc_keys = {"city", "district", "locality", "pincode"}
     if updates.keys() & loc_keys:
         cur = _location_of(db, listing_id)
@@ -1400,13 +1448,14 @@ def list_owner_listings(
             c.update(groups)
         counts = _activity_counts_map(db, owner_id, listing_ids)
         for c in cards:
-            c.update(counts.get(c["listing_id"], {"enquiry_count": 0, "visit_count": 0, "call_count": 0}))
+            c.update(counts.get(c["listing_id"], {"enquiry_count": 0, "visit_count": 0, "call_count": 0,
+                                                  "agent_call_count": 0}))
 
     return cards, total
 
 
 def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> dict:
-    """listing_id -> {enquiry_count, visit_count, call_count} for the owner's own rows.
+    """listing_id -> {enquiry_count, visit_count, call_count, agent_call_count} for the owner's own rows.
 
     Counts every enquiry/visit ever recorded for the listing (all statuses),
     scoped by the stored owner_user_id — the same authority GET /owner/leads
@@ -1419,7 +1468,8 @@ def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> 
 
     if not listing_ids:
         return {}
-    out = {lid: {"enquiry_count": 0, "visit_count": 0, "call_count": 0} for lid in listing_ids}
+    out = {lid: {"enquiry_count": 0, "visit_count": 0, "call_count": 0, "agent_call_count": 0}
+           for lid in listing_ids}
     for model, key in ((Enquiry, "enquiry_count"), (PropertyVisit, "visit_count")):
         rows = (
             db.query(model.property_listing_id, _func.count(model.id))
@@ -1430,11 +1480,14 @@ def _activity_counts_map(db: Session, owner_id: int, listing_ids: list[int]) -> 
         for lid, n in rows:
             out[int(lid)][key] = int(n)
     # Call-button taps (activity_logs, D2): counts only, never buyer identity.
-    from .call_events import call_counts
+    from .call_events import agent_call_counts, call_counts
 
     for lid, n in call_counts(db, listing_ids).items():
         if lid in out:
             out[lid]["call_count"] = n
+    for lid, n in agent_call_counts(db, listing_ids).items():
+        if lid in out:
+            out[lid]["agent_call_count"] = n
     return out
 
 

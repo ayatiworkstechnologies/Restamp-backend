@@ -4,7 +4,15 @@
 - Local database only: refuses URLs that are not localhost/127.0.0.1/unix-socket,
   and refuses database names outside an explicit dev allow-list.
 - Idempotent: re-running detects the seed marker (buyer phone identity) and exits
-  without creating duplicates. `--clean` removes ONLY seed-keyed rows.
+  without creating duplicates. Seeding refuses to attach seed listings to a
+  pincode that already belongs to a non-seed locality (real catalog data).
+- `--clean` removes ONLY seed-owned rows: users/listings found through the
+  seed marker phones, and location rows that sit inside the exact seed chain
+  ('Seed Chennai' -> 'Seed Central' -> 'Seed Taluk' -> 'Seed Village') with a
+  seed name and seed pincode. Nothing is ever deleted by a bare pincode or
+  locality name. If anything outside the seed references those rows (another
+  owner's property, an agent grant, an alias, a real pincode attached to a
+  seed locality), the whole clean is refused before any delete.
 - Uses only approved schema columns/enums; no invented fields.
 
 Usage:
@@ -185,13 +193,18 @@ def _get_or_create_locality(conn, ins, village_id, name):
 
 
 def _get_or_create_postcode(conn, ins, locality_id, pincode):
-    """Idempotent postcode lookup/creation (pincode is globally unique)."""
+    """Idempotent postcode lookup/creation (pincode is globally unique).
+
+    A pincode that already belongs to a different (non-seed) locality is
+    real catalog data: refuse instead of attaching seed listings to it."""
     from sqlalchemy import text
 
     row = conn.execute(
-        text("SELECT id FROM postcodes WHERE pincode=:p"), {"p": pincode}
+        text("SELECT id, locality_id FROM postcodes WHERE pincode=:p"), {"p": pincode}
     ).fetchone()
     if row:
+        if row[1] != locality_id:
+            raise SystemExit(f"REFUSED: pincode {pincode} already belongs to a non-seed locality.")
         return row[0]
     return ins("INSERT INTO postcodes (locality_id, pincode) VALUES (:l, :p)",
                {"l": locality_id, "p": pincode})
@@ -383,46 +396,154 @@ def seed(conn):
     return ids
 
 
-def clean(conn):
-    """Delete ONLY seed-keyed rows, bottom-up. Reports what was removed."""
+SEED_LOCALITY_NAMES = ("Seed Anna Nagar", "Seed OMR") + HOME_LOCALITIES
+SEED_CHAIN = ("Seed Central", "Seed Taluk", "Seed Village")
+
+
+class SeedCleanRefused(RuntimeError):
+    """Cleaning would touch rows that are not provably seed-owned."""
+
+
+def seed_location_plan(conn, city=CITY, pincodes=PINCODES + HOME_PINCODES,
+                       locality_names=SEED_LOCALITY_NAMES, seed_owner_id=None):
+    """Seed-owned location rows (ids) plus blockers that forbid deleting them.
+
+    Read-only. A row is seed-owned only when it sits inside the exact seed
+    chain city -> SEED_CHAIN AND carries a seed locality name / seed pincode.
+    Blockers: a non-seed locality or pincode inside that chain, a property
+    not owned by the seed owner, an agent grant (current or history), or an
+    alias on a seed locality."""
+    from sqlalchemy import bindparam, text
+
+    def ids(sql, **p):
+        stmt = text(sql)
+        for k, v in p.items():
+            if isinstance(v, (list, tuple)):
+                stmt = stmt.bindparams(bindparam(k, expanding=True))
+        return [r[0] for r in conn.execute(stmt, p).fetchall()] if all(p.values()) else []
+
+    plan = {"city_ids": [], "district_ids": [], "taluk_ids": [], "village_ids": [],
+            "locality_ids": [], "postcode_ids": [], "blockers": []}
+    plan["city_ids"] = ids("SELECT id FROM cities WHERE name=:n", n=city)
+    plan["district_ids"] = ids("SELECT id FROM districts WHERE city_id IN :c AND name=:n",
+                               c=plan["city_ids"], n=SEED_CHAIN[0])
+    plan["taluk_ids"] = ids("SELECT id FROM taluks WHERE district_id IN :d AND name=:n",
+                            d=plan["district_ids"], n=SEED_CHAIN[1])
+    plan["village_ids"] = ids("SELECT id FROM villages WHERE taluk_id IN :t AND name=:n",
+                              t=plan["taluk_ids"], n=SEED_CHAIN[2])
+    if not plan["village_ids"]:
+        return plan
+    stmt = text("SELECT id, name FROM localities WHERE village_id IN :v").bindparams(
+        bindparam("v", expanding=True))
+    for lid, name in conn.execute(stmt, {"v": plan["village_ids"]}).fetchall():
+        if name in locality_names:
+            plan["locality_ids"].append(lid)
+        else:
+            plan["blockers"].append(f"non-seed locality '{name}' inside the seed chain")
+    if not plan["locality_ids"]:
+        return plan
+    stmt = text("SELECT id, pincode FROM postcodes WHERE locality_id IN :l").bindparams(
+        bindparam("l", expanding=True))
+    for pid, pin in conn.execute(stmt, {"l": plan["locality_ids"]}).fetchall():
+        if pin in pincodes:
+            plan["postcode_ids"].append(pid)
+        else:
+            plan["blockers"].append(f"non-seed pincode {pin} attached to a seed locality")
+    checks = [
+        ("properties not owned by the seed owner",
+         "SELECT COUNT(*) FROM physical_properties WHERE postcode_id IN :x AND (:o IS NULL OR user_id <> :o)",
+         plan["postcode_ids"]),
+        ("current agent grants", "SELECT COUNT(*) FROM broker_postcode_access_current WHERE postcode_id IN :x",
+         plan["postcode_ids"]),
+        ("agent grant history", "SELECT COUNT(*) FROM broker_postcode_access_history WHERE postcode_id IN :x",
+         plan["postcode_ids"]),
+        ("locality aliases", "SELECT COUNT(*) FROM locality_aliases WHERE locality_id IN :x",
+         plan["locality_ids"]),
+    ]
+    for label, sql, values in checks:
+        if not values:
+            continue
+        n = conn.execute(text(sql).bindparams(bindparam("x", expanding=True)),
+                         {"x": values, "o": seed_owner_id}).scalar()
+        if n:
+            plan["blockers"].append(f"{n} {label} reference seed location rows")
+    return plan
+
+
+def clean_locations(conn, plan):
+    """Delete exactly the plan's rows by id, children first; a parent row is
+    deleted only when nothing else is left under it. No commit."""
+    from sqlalchemy import bindparam, text
+
+    if plan["blockers"]:
+        raise SeedCleanRefused("; ".join(plan["blockers"]))
+    counts = {}
+
+    def delete(table, values):
+        if values:
+            counts[table] = conn.execute(
+                text(f"DELETE FROM {table} WHERE id IN :x").bindparams(bindparam("x", expanding=True)),
+                {"x": values}).rowcount
+
+    delete("postcodes", plan["postcode_ids"])
+    delete("localities", plan["locality_ids"])
+    for table, ids_key, child, fk in (("villages", "village_ids", "localities", "village_id"),
+                                      ("taluks", "taluk_ids", "villages", "taluk_id"),
+                                      ("districts", "district_ids", "taluks", "district_id"),
+                                      ("cities", "city_ids", "districts", "city_id")):
+        empty = [i for i in plan[ids_key]
+                 if not conn.execute(text(f"SELECT COUNT(*) FROM {child} WHERE {fk}=:i"), {"i": i}).scalar()]
+        delete(table, empty)
+    return counts
+
+
+def clean_rows(conn):
+    """Delete ONLY seed-owned rows, bottom-up, without committing. Raises
+    SeedCleanRefused (before any delete) when location rows are referenced
+    by anything outside the seed."""
     from sqlalchemy import text
 
     ids = _seed_ids(conn)
-    if not ids:
-        print("Nothing to clean (no seed marker found).")
-        return
-    owner, buyer, listings = ids["owner_id"], ids["buyer_id"], ids["listing_ids"]
+    plan = seed_location_plan(conn, seed_owner_id=ids["owner_id"] if ids else None)
+    if plan["blockers"]:
+        raise SeedCleanRefused("; ".join(plan["blockers"]))
     counts = {}
-    counts["contact_reveal_audits(buyer)"] = conn.execute(
-        text(f"DELETE FROM contact_reveal_audits WHERE user_id IN {_lit_ints((buyer,))}")).rowcount
-    counts["saved_properties(buyer)"] = conn.execute(
-        text(f"DELETE FROM saved_properties WHERE buyer_user_id IN {_lit_ints((buyer,))}")).rowcount
-    counts["enquiries(buyer)"] = conn.execute(
-        text(f"DELETE FROM enquiries WHERE buyer_user_id IN {_lit_ints((buyer,))}")).rowcount
-    if listings:
-        ph = _lit_ints(listings)
-        counts["contact_reveal_audits(listing)"] = conn.execute(
-            text(f"DELETE FROM contact_reveal_audits WHERE property_listing_id IN {ph}")).rowcount
-        for tbl in ("active_enquiries", "property_media", "saved_properties"):
-            counts[tbl + "(listing)"] = conn.execute(
-                text(f"DELETE FROM {tbl} WHERE property_listing_id IN {ph}")).rowcount
-        conn.execute(text(f"DELETE FROM property_listings WHERE id IN {ph}"))
-        pps = [r[0] for r in conn.execute(
-            text("SELECT id FROM physical_properties WHERE user_id=:u"), {"u": owner}).fetchall()]
-        if pps:
-            conn.execute(text(f"DELETE FROM physical_properties WHERE id IN {_lit_ints(pps)}"))
-    pair = _lit_ints((buyer, owner))
-    for tbl in ("auth_identities", "user_current_role", "role_history"):
-        conn.execute(text(f"DELETE FROM {tbl} WHERE user_id IN {pair}"))
-    conn.execute(text(f"DELETE FROM users WHERE id IN {pair}"))
-    for tbl, col, vals in (("postcodes", "pincode", PINCODES + HOME_PINCODES),
-                           ("localities", "name", ("Seed Anna Nagar", "Seed OMR") + HOME_LOCALITIES),
-                           ("villages", "name", ("Seed Village",)),
-                           ("taluks", "name", ("Seed Taluk",)),
-                           ("districts", "name", ("Seed Central",)),
-                           ("cities", "name", (CITY,))):
-        quoted = "(" + ",".join("'" + v.replace("'", "''") + "'" for v in vals) + ")"
-        conn.execute(text(f"DELETE FROM {tbl} WHERE {col} IN {quoted}"))
+    if ids:
+        owner, buyer, listings = ids["owner_id"], ids["buyer_id"], ids["listing_ids"]
+        counts["contact_reveal_audits(buyer)"] = conn.execute(
+            text(f"DELETE FROM contact_reveal_audits WHERE user_id IN {_lit_ints((buyer,))}")).rowcount
+        counts["saved_properties(buyer)"] = conn.execute(
+            text(f"DELETE FROM saved_properties WHERE buyer_user_id IN {_lit_ints((buyer,))}")).rowcount
+        counts["enquiries(buyer)"] = conn.execute(
+            text(f"DELETE FROM enquiries WHERE buyer_user_id IN {_lit_ints((buyer,))}")).rowcount
+        if listings:
+            ph = _lit_ints(listings)
+            counts["contact_reveal_audits(listing)"] = conn.execute(
+                text(f"DELETE FROM contact_reveal_audits WHERE property_listing_id IN {ph}")).rowcount
+            for tbl in ("active_enquiries", "property_media", "saved_properties"):
+                counts[tbl + "(listing)"] = conn.execute(
+                    text(f"DELETE FROM {tbl} WHERE property_listing_id IN {ph}")).rowcount
+            conn.execute(text(f"DELETE FROM property_listings WHERE id IN {ph}"))
+            pps = [r[0] for r in conn.execute(
+                text("SELECT id FROM physical_properties WHERE user_id=:u"), {"u": owner}).fetchall()]
+            if pps:
+                conn.execute(text(f"DELETE FROM physical_properties WHERE id IN {_lit_ints(pps)}"))
+        pair = _lit_ints((buyer, owner))
+        for tbl in ("auth_identities", "user_current_role", "role_history"):
+            conn.execute(text(f"DELETE FROM {tbl} WHERE user_id IN {pair}"))
+        conn.execute(text(f"DELETE FROM users WHERE id IN {pair}"))
+    counts.update(clean_locations(conn, plan))
+    return counts
+
+
+def clean(conn):
+    """Delete ONLY seed-owned rows and commit, or refuse without changes."""
+    try:
+        counts = clean_rows(conn)
+    except SeedCleanRefused as exc:
+        conn.rollback()
+        print(f"REFUSED (nothing deleted): {exc}")
+        return
     conn.commit()
     print("Cleaned seed rows (scoped deletes):", counts)
 

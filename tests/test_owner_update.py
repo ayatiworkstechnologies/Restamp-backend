@@ -8,7 +8,7 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, register_phone
+from tests.conftest import auth_header, fresh_pincode, register_phone
 from tests.test_owner_photos import JPEG_BYTES, PNG_1PX, _mock_cloud
 
 
@@ -113,7 +113,7 @@ def test_patch_invalid_values_rejected_nothing_committed(client):
                          headers=auth_header(token)).json()["title"]
     bad = [
         {"pincode": "12345"}, {"pincode": "abcdef"},
-        {"pincode": "600000"}, {"pincode": "600119"}, {"pincode": "600500"},
+        {"pincode": "600000"}, {"pincode": "600120"}, {"pincode": "600500"},
         {"floor_on": "9", "total_floors": 3},
         {"contact_phone": "123"}, {"contact_email": "nope"},
         {"furnishing": "Gold-Plated"}, {"ownership_type": "Mars"},
@@ -224,26 +224,33 @@ def test_patch_location_change_keeps_submitted_pincode(client):
     c, session = client
     token = _setup_owner_with_phone(c, "+919876543406")
     lid = _post_listing(c, token, "Location Change Flat").json()["listing_id"]
-    # NOTE: 600110 is unused by seeds/other suites; exact-pincode-first
-    # lookup creates a fresh chain paired with this locality, so reruns of
-    # this test resolve identically.
+    # A pincode no locality owns yet (a fixed value can already belong to
+    # another locality in a shared test database): exact-pincode-first lookup
+    # creates a fresh chain paired with this locality.
+    pin = fresh_pincode(c)
     r = c.patch(f"/owner/listings/{lid}",
-                json={"locality": "New Nagar Xyz", "pincode": "600110"},
+                json={"locality": "New Nagar Xyz", "pincode": pin},
                 headers=auth_header(token))
     assert r.status_code == 200, r.text
-    assert r.json()["pincode"] == "600110"
+    assert r.json()["pincode"] == pin
     assert r.json()["locality"] == "New Nagar Xyz"
     stored = session.execute(text(
         "SELECT pc.pincode FROM property_listings l "
         "JOIN physical_properties p ON p.id = l.physical_property_id "
         "JOIN postcodes pc ON pc.id = p.postcode_id WHERE l.id=:i"),
         {"i": lid}).fetchone()[0]
-    assert stored == "600110"
-    # Locality-only change keeps the existing pincode.
-    r = c.patch(f"/owner/listings/{lid}", json={"locality": "Edit Nagar"},
+    assert stored == pin
+    # Locality-only change to the same place (another spelling) keeps it.
+    r = c.patch(f"/owner/listings/{lid}", json={"locality": "new nagar xyz"},
                 headers=auth_header(token))
     assert r.status_code == 200, r.text
-    assert r.json()["pincode"] == "600110"
+    assert r.json()["pincode"] == pin and r.json()["locality"] == "New Nagar Xyz"
+    # A different locality on a pincode that belongs to "New Nagar Xyz" is
+    # refused (it used to be silently ignored), and nothing changes.
+    r = c.patch(f"/owner/listings/{lid}", json={"locality": "Edit Nagar"},
+                headers=auth_header(token))
+    assert r.status_code == 422, r.text
+    assert c.get(f"/owner/listings/{lid}", headers=auth_header(token)).json()["locality"] == "New Nagar Xyz"
 
 
 def test_patch_media_endstate_reorder_remove_insert(client):
@@ -505,7 +512,7 @@ def test_service_boundary_rejects_out_of_range_pincode(client):
     before = session.execute(text(
         "SELECT COUNT(*) FROM property_listings")).fetchone()[0]
     # Direct create with out-of-range pincodes fails before any mutation.
-    for pin in ["600000", "600119", "600500", "560038", "abcdef", ""]:
+    for pin in ["600000", "600120", "600125", "600500", "560038", "abcdef", ""]:
         sp = session.begin_nested()
         try:
             with pytest.raises(ValueError, match="600001 and 600118"):
@@ -526,7 +533,7 @@ def test_service_boundary_rejects_out_of_range_pincode(client):
     sp = session.begin_nested()
     try:
         with pytest.raises(ValueError, match="600001 and 600118"):
-            svc.update_owner_listing(session, owner_id, lid, {"pincode": "600119"})
+            svc.update_owner_listing(session, owner_id, lid, {"pincode": "600125"})
     finally:
         sp.rollback()
     assert c.get(f"/owner/listings/{lid}",

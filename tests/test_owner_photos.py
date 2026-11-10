@@ -10,7 +10,7 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header
+from tests.conftest import auth_header, fresh_pincode
 
 PNG_1PX = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
@@ -79,7 +79,7 @@ def _create_listing(c, token: str, title: str, **extra) -> int:
     payload = {
         "title": title, "transaction_type": "RENT", "property_type": "APARTMENT",
         "price_rupees": 25000, "price_period": "MONTHLY",
-        "locality": "Photo Nagar", "city": "Chennai", "pincode": "600090",
+        "locality": "Photo Nagar", "city": "Chennai", "pincode": fresh_pincode(c),
         **extra,
     }
     r = c.post("/owner/listings", json=payload, headers=auth_header(token))

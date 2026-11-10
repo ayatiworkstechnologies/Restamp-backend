@@ -19,7 +19,7 @@ restamp_dev database, so no row created here survives the test.
 """
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone
+from tests.conftest import auth_header, register_phone, fresh_pincode
 
 _SEQ = {"n": 0}
 
@@ -52,7 +52,7 @@ def _create(c, token: str, title: str | None = None, extra: dict | None = None) 
         "price_period": "MONTHLY",
         "locality": f"Isolation Nagar {_SEQ['n']}",
         "city": "Chennai",
-        "pincode": "600090",
+        "pincode": fresh_pincode(c),
     }
     if extra:
         body.update(extra)

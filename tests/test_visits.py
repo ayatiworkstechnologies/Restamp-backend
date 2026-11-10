@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone
+from tests.conftest import auth_header, register_phone, fresh_pincode
 
 _SEQ = {"n": 0}
 FUTURE = lambda days=7: (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
@@ -39,7 +39,7 @@ def _listing(c, token, title=None):
             "price_rupees": 5000000,
             "locality": f"Visit Nagar {_SEQ['n']}",
             "city": "Chennai",
-            "pincode": "600080",
+            "pincode": fresh_pincode(c),
         },
         headers=auth_header(token),
     )
@@ -354,4 +354,4 @@ def test_visits_table_matches_model_and_head(client):
         _expected_heads()[0]
     from app.models import Base
     assert "property_visits" in Base.metadata.tables
-    assert len(Base.metadata.tables) == 37
+    assert len(Base.metadata.tables) == 38  # + locality_aliases (k1l2m3n4o5p6)

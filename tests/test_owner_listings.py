@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, make_postcode, register_phone
+from tests.conftest import auth_header, fresh_pincode, make_postcode, register_phone
 
 
 def _setup_owner(client) -> tuple[dict, str]:
@@ -60,6 +60,9 @@ def test_create_listing_requires_owner_role(client):
 def test_create_and_fetch_owner_listing(client):
     c, session = client
     _, token = _setup_owner(c)
+    # A pincode no locality owns yet: a fixed value can already belong to
+    # another locality in a shared test database (pincode -> one locality).
+    pin = fresh_pincode(c)
 
     # 1. Create a listing
     payload = {
@@ -70,7 +73,7 @@ def test_create_and_fetch_owner_listing(client):
         "price_period": "TOTAL",
         "locality": "Indiranagar",
         "city": "Bengaluru",
-        "pincode": "600115",
+        "pincode": pin,
         "address_line": "100 Feet Road, 12th Main",
         "area_value": 1850,
         "area_unit": "sqft",
@@ -660,7 +663,8 @@ def test_create_validation_errors(client):
         ({"pincode": "12345"}, "pincode"),
         ({"pincode": "abcdef"}, "pincode"),
         ({"pincode": "600000"}, "pincode-range-lo"),
-        ({"pincode": "600119"}, "pincode-range-hi"),
+        ({"pincode": "600120"}, "pincode-range-hi"),
+        ({"pincode": "600125"}, "pincode-unapproved-chennai-district"),
         ({"pincode": "600500"}, "pincode-range-far"),
         ({"pincode": "60001"}, "pincode-short"),
         ({"pincode": "6000118"}, "pincode-long"),
@@ -691,12 +695,14 @@ def test_normalize_chennai_pincode_helper():
     )
     assert (CHENNAI_PINCODE_MIN, CHENNAI_PINCODE_MAX) == (600001, 600118)
     assert "600001 and 600118" in CHENNAI_PINCODE_ERROR
-    for pin in ["600001", "600089", "600118", "600040"]:
+    # TEMPORARILY DISABLED — Chennai area seeding paused: 600119 is rejected
+    # again (approval commented out); 600045/600100 are in the base range.
+    for pin in ["600001", "600089", "600118", "600040", "600045", "600100"]:
         assert normalize_chennai_pincode(pin) == pin
     # Strings preserved (never int-converted); surrounding spaces trimmed.
     assert normalize_chennai_pincode(" 600089 ") == "600089"
     assert normalize_chennai_pincode(None) is None
-    for bad in ["600000", "600119", "600500", "560038", "60001", "6000118",
+    for bad in ["600000", "600119", "600120", "600125", "600500", "560038", "60001", "6000118",
                 "abcdef", "", "      "]:
         with pytest.raises(ValueError, match="600001 and 600118"):
             normalize_chennai_pincode(bad)
@@ -714,23 +720,24 @@ def test_chennai_pincode_range_boundaries(client):
         assert r.status_code == 201, (pin, r.status_code, r.text)
         assert r.json()["pincode"] == pin
     # Out-of-range six-digit pincodes rejected (schema-level, unbypassable
-    # via direct API calls). Note 600119/600500/560038 are format-valid six
-    # digits, so the 422 proves range enforcement specifically. (App-level
+    # via direct API calls). Note 600120/600125/600500/560038 are
+    # format-valid six digits, so the 422 proves policy enforcement
+    # specifically (600125 is a Chennai-district pincode that is NOT approved). (App-level
     # schema errors collapse to a generic detail string; service-level
     # errors keep their message — asserted where applicable.)
-    for idx, pin in enumerate(["600000", "600119", "600500", "560038"]):
+    for idx, pin in enumerate(["600000", "600119", "600120", "600125", "600500", "560038"]):
         r = _post_listing(c, token, f"Range Reject {idx}", pincode=pin)
         assert r.status_code == 422, (pin, r.status_code, r.text)
-    # PATCH enforces the same rule on the same listing (locality paired so
-    # the resolver stores the submitted pincode, never a different one).
+    # PATCH enforces the same rule on the same listing. 600089 now belongs
+    # to "Range Nagar R1" (created above), so it is paired with that locality.
     lid = _post_listing(c, token, "Range Patch Flat",
                         locality="Range Patch Nagar").json()["listing_id"]
     r = c.patch(f"/owner/listings/{lid}",
-                json={"locality": "Range Patch Nagar 2", "pincode": "600089"},
+                json={"locality": "Range Nagar R1", "pincode": "600089"},
                 headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["pincode"] == "600089"
-    for pin in ["600000", "600119", "abcdef", ""]:
+    for pin in ["600000", "600119", "600120", "600125", "abcdef", ""]:
         r = c.patch(f"/owner/listings/{lid}", json={"pincode": pin},
                     headers=auth_header(token))
         assert r.status_code == 422, (pin, r.status_code, r.text)
@@ -768,13 +775,14 @@ def test_create_rollback_on_invalid_amenity(client):
         "SELECT user_id FROM auth_identities WHERE provider='phone' "
         "AND provider_identifier='+919876543280'")).fetchone()[0]
     from app.services import owner_listings as svc
+    pin = fresh_pincode(c)  # free pincode: the amenity check must be what fails
     sp = session.begin_nested()
     try:
         with pytest.raises(ValueError, match="Unknown amenity"):
             svc.create_owner_listing(
                 session, owner_id, title="Rollback Flat", transaction_type="RENT",
                 property_type="APARTMENT", price_paise=2500000, price_period="MONTHLY",
-                locality="Rollback Nagar", city="Chennai", pincode="600112",
+                locality="Rollback Nagar", city="Chennai", pincode=pin,
                 address_line=None, area_value=None, area_unit=None, bedrooms=2,
                 bathrooms=2, description=None, construction_status=None,
                 image_urls=["https://t.test/r.jpg"], amenities=["Gym", "Bogus Room X"])
