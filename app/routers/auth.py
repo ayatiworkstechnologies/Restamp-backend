@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
-from ..config import settings
+from ..config import is_production, settings
 from ..db import get_db
 from ..models import AuthIdentity
 from ..security import create_access_token, ensure_active_user, get_current_user
@@ -74,15 +74,17 @@ def otp_request(body: schemas.OTPRequest, request: Request):
 
     Normal mode: no code leaves the server — delivery happens only through
     the (currently unconnected) delivery seam, and the response shape is
-    constant ({message}). Explicitly restricted internal-testing display
-    mode (see app/services/otp.py _display_active: env flag + never
-    production-classified, also refused at production startup): the
-    backend-selected code is added to the response so the frontend can
-    display it. Production can never reach the display branch.
+    constant ({message}). Local-development display mode (see
+    app/services/otp.py _display_active: env flag + explicit development
+    RESTAMP_ENV, refused at production startup): the backend-selected code
+    is added to the response so the frontend can display it. Production
+    never returns a code (no override; also re-checked here).
     """
     code = otp_service.request_code(body.phone, ip=_client_ip(request))
     resp = {"message": "If the number is valid, an OTP was sent."}
-    if code is not None:
+    # Second, independent guard: a production process never puts a code in
+    # a response, whatever the OTP service returned.
+    if code is not None and not is_production():
         resp["debug_code"] = code
     return resp
 

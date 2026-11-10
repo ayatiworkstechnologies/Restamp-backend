@@ -220,7 +220,8 @@ def _prod(monkeypatch, **overrides):
     monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_ENABLED", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_CLIENT_ID", "")
-    monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "")
+    # Production requires explicit browser origins (RESTAMP_CORS_ORIGINS).
+    monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "https://restamp.in")
     monkeypatch.setattr(config_module.settings, "OTP_DISPLAY_MODE", False)
     monkeypatch.setattr(
         config_module.settings,

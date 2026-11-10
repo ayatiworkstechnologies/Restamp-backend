@@ -10,10 +10,10 @@ services:
 
     envVars:
       # ── Runtime environment ────────────────────────────────────────────────
-      # Explicit production posture: enables the startup security gate (JWT
-      # secret strength, Google dev off, CORS without '*'). Behavior matches
-      # the automatic production detection; this only makes the intent
-      # explicit in the blueprint.
+      # REQUIRED: production is decided by RESTAMP_ENV alone (never by the
+      # database host) and startup refuses an unset/unknown value. Enables the
+      # startup security gate (JWT secret strength, OTP display off, Google
+      # dev off, explicit https CORS origins).
       - key: RESTAMP_ENV
         value: "production"
 
@@ -72,9 +72,10 @@ services:
         value: "600"
 
       # ── CORS ────────────────────────────────────────────────────────────────
-      # Exact production frontend origin(s) only. Never "*" with credentials.
+      # REQUIRED in production and the ONLY allowed browser origins: exact
+      # https origins, no path/trailing slash, never "*", never localhost/LAN.
       - key: RESTAMP_CORS_ORIGINS
-        value: "https://restamp-app.vercel.app,https://restamp-alpha.vercel.app"
+        value: "https://restamp.in,https://www.restamp.in,https://restamp-alpha.vercel.app,https://restamp-app.vercel.app"
 
       # ── Google OAuth (optional) ──────────────────────────────────────────────
       - key: RESTAMP_GOOGLE_CLIENT_ID

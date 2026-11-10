@@ -91,7 +91,7 @@ def test_sms_env_vars_are_inert(monkeypatch):
     monkeypatch.setattr(s, "GOOGLE_DEV_MODE", False)
     monkeypatch.setattr(s, "GOOGLE_ENABLED", False)
     monkeypatch.setattr(s, "GOOGLE_CLIENT_ID", "")
-    monkeypatch.setattr(s, "CORS_ORIGINS", "")
+    monkeypatch.setattr(s, "CORS_ORIGINS", "https://restamp.in")  # required in production
     validate_security_config()  # must not raise
 
 

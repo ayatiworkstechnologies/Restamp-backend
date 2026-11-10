@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from urllib.parse import urlsplit
 
 from sqlalchemy.engine import make_url as _sqlalchemy_make_url
 
@@ -23,11 +25,13 @@ def _get_int(name: str, default: int) -> int:
 
 
 class Settings:
-    # Explicit environment name. Local dev/tests use "local" (default);
-    # production/staging deployments MUST set RESTAMP_ENV=production
-    # (or staging). Production hardening is also triggered automatically
-    # when DATABASE_URL points at a non-local host (see is_production()).
-    ENV: str = _get("RESTAMP_ENV", "local")
+    # Explicit environment name, REQUIRED (no default): the app refuses to
+    # start without it (validate_security_config). Development values:
+    # local / development / dev / test. Production values: production /
+    # prod / staging. Production is decided ONLY by this setting, never
+    # inferred from the database host; an unset or unknown value is treated
+    # as production by is_production() (fail closed) and refused at startup.
+    ENV: str = _get("RESTAMP_ENV", "")
     # Local development MySQL. Example:
     #   mysql+pymysql://restamp_dev:<pwd>@localhost/restamp_dev?unix_socket=/tmp/mysql.sock
     DATABASE_URL: str = _get(
@@ -61,25 +65,16 @@ class Settings:
     # delivery is connected in code, OTP requests fail closed (generic 503)
     # and phone-OTP login is unavailable. There is nothing to configure via
     # environment variables.
-    # TEMPORARY INTERNAL-TESTING DISPLAY (explicitly restricted). When this
-    # is "1" in a NON-production-classified process, the OTP request
-    # response INCLUDES the backend-selected code ("debug_code") so
-    # internal testers can log in without SMS delivery; the delivery seam
-    # is bypassed while the mode is active and no SMS is sent. In
-    # production this MUST be "0": validate_security_config() refuses
-    # production startup with it enabled, and the OTP service re-checks
-    # is_production() at request time — so production API responses and
-    # logs can never contain a code. There is no SMS vendor behind it.
+    # LOCAL-DEVELOPMENT DISPLAY (explicitly restricted). When this is "1"
+    # in a development environment (RESTAMP_ENV=local/development/dev/test),
+    # the OTP request response INCLUDES the backend-selected code
+    # ("debug_code") so developers can log in without SMS delivery; the
+    # delivery seam is bypassed while the mode is active and no SMS is sent.
+    # Production can never show a code: validate_security_config() refuses
+    # production startup with this flag on, the OTP service re-checks
+    # is_production() on every request, and the auth router drops any code
+    # in production. There is no production override.
     OTP_DISPLAY_MODE: bool = _get("RESTAMP_OTP_DISPLAY_MODE", "0") == "1"
-    # DEMO OVERRIDE for a production deployment (separate, explicit opt-in).
-    # Only when this is "1" AS WELL AS RESTAMP_OTP_DISPLAY_MODE=1 may a
-    # production-classified process return the generated code as
-    # "debug_code" (no SMS provider exists yet). Anyone who can reach the
-    # API can then sign in as ANY phone number, including existing accounts.
-    # Set it to "0" (or remove it) to restore the fail-closed 503.
-    OTP_DISPLAY_IN_PRODUCTION: bool = (
-        _get("RESTAMP_OTP_DISPLAY_IN_PRODUCTION", "0") == "1"
-    )
     # Per-IP abuse protection (in-memory, per process — see otp.py).
     # These bound total OTP request/verify-failure volume from a single
     # client IP across all phones, so rotating phones does not bypass
@@ -110,7 +105,12 @@ class Settings:
     GOOGLE_ENABLED: bool = _get("RESTAMP_GOOGLE_ENABLED", "0") == "1"
 
     APP_NAME: str = "restamp-backend"
-    # Local CORS origins (comma-separated). Empty = built-in local defaults in main.py.
+    # Allowed browser origins (comma-separated exact origins, e.g.
+    # "https://restamp.in,https://www.restamp.in"). REQUIRED in production,
+    # where it is the ONLY source of allowed origins (each must be an exact
+    # https origin; no "*", no localhost/LAN, no path). In development, empty
+    # = the built-in local defaults in main.py, and localhost/LAN origins are
+    # also allowed.
     CORS_ORIGINS: str = _get("RESTAMP_CORS_ORIGINS", "")
 
     # Local media storage for listing photo uploads (see app/services/storage.py).
@@ -135,6 +135,7 @@ class Settings:
     DEV_MEDIA_URL_PREFIXES: str = _get("RESTAMP_DEV_MEDIA_URL_PREFIXES", "")
 
 
+
 settings = Settings()
 
 
@@ -142,6 +143,9 @@ settings = Settings()
 _log = logging.getLogger("restamp.config")
 
 _PROD_ENVS = {"production", "prod", "staging"}
+_DEV_ENVS = {"local", "development", "dev", "test"}
+# The built-in placeholder DATABASE_URL (never valid outside a laptop).
+_DEFAULT_DATABASE_URL = "mysql+pymysql://user:pass@localhost/restamp"
 _JWT_KNOWN_WEAK = {
     "",
     "restamp-local-dev-secret-change-me",
@@ -176,35 +180,33 @@ def _is_local_database_url(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1")
 
 
-def is_production() -> bool:
-    """True when running against production-like configuration.
+def _env() -> str:
+    return (settings.ENV or "").strip().lower()
 
-    Explicit RESTAMP_ENV=production/prod/staging wins; otherwise a
-    non-local DATABASE_URL (no unix socket, non-loopback host) is
-    treated as production. Fail-closed: unknown/malformed URLs are
-    treated as production so hardening cannot be skipped by misconfig.
+
+def is_development() -> bool:
+    """True only for an explicit development RESTAMP_ENV (local/development/dev/test)."""
+    return _env() in _DEV_ENVS
+
+
+def is_production() -> bool:
+    """True unless RESTAMP_ENV is explicitly a development value.
+
+    Production is decided by RESTAMP_ENV alone (production/prod/staging),
+    never inferred from the database host. Fail-closed: an unset or unknown
+    value is also treated as production here, so request-time hardening
+    (hidden docs, no OTP display, no synthetic Google identities) can never
+    be skipped by a missing setting; startup refuses those values outright
+    (validate_security_config).
     """
-    env = (settings.ENV or "").strip().lower()
-    if env in _PROD_ENVS:
-        return True
-    try:
-        return not _is_local_database_url(settings.DATABASE_URL)
-    except Exception:
-        return True
+    return not is_development()
 
 
 def otp_display_permitted() -> bool:
-    """Whether the OTP display mode may be active in this process.
-
-    Non-production processes (local development) keep their behavior.
-    Production-classified processes permit it ONLY with the explicit
-    RESTAMP_OTP_DISPLAY_IN_PRODUCTION demo override. Re-evaluated per
-    request by the OTP service and enforced at startup by
-    validate_security_config().
-    """
-    if not is_production():
-        return True
-    return settings.OTP_DISPLAY_IN_PRODUCTION
+    """Whether the OTP display mode may be active in this process: only in
+    an explicit development environment, never in production (no override).
+    Re-evaluated per request by the OTP service and the auth router."""
+    return is_development()
 
 
 def is_jwt_secret_strong(secret: str | None) -> bool:
@@ -223,34 +225,71 @@ def is_jwt_secret_strong(secret: str | None) -> bool:
     return True
 
 
+def parse_cors_origins(raw: str | None) -> list[str]:
+    """RESTAMP_CORS_ORIGINS as a list of exact origins (comma-separated, trimmed)."""
+    return [o.strip() for o in (raw or "").split(",") if o.strip()]
+
+
+_PRIVATE_HOST = re.compile(
+    r"^(localhost|.*\.localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|::1|10\.\d+\.\d+\.\d+|"
+    r"192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+)$"
+)
+
+
+def is_valid_production_origin(origin: str) -> bool:
+    """An exact public https origin: scheme + host (+ optional port), nothing
+    else. Rejects "*", wildcards, http, paths/query/fragment, trailing
+    slashes, upper-case hosts, credentials in the URL, and localhost /
+    loopback / private-LAN hosts (those are development-only)."""
+    if not origin or "*" in origin or origin != origin.strip():
+        return False
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    # Exactly as a browser sends it (lowercase host, no default-port noise):
+    # CORS compares origins as exact strings, so anything else never matches.
+    rebuilt = f"https://{parts.hostname}" + (f":{port}" if port else "")
+    if origin != rebuilt:
+        return False
+    return not _PRIVATE_HOST.match(parts.hostname.strip("[]"))
+
+
 def validate_security_config() -> None:
-    """Fail fast with non-sensitive errors when production config is unsafe.
+    """Fail fast with non-sensitive errors when the configuration is unsafe.
 
-    Raises RuntimeError naming RESTAMP_ENV=demo FIRST, unconditionally
-    (regardless of environment classification): the demo OTP login was
-    removed from the codebase, so that legacy value must never boot as
-    anything else.
+    Always (every environment):
+    - RESTAMP_ENV must be set explicitly to a known value: development
+      (local/development/dev/test) or production (production/prod/staging).
+      Unset or unknown values are refused (no silent default), and the
+      removed RESTAMP_ENV=demo is refused by name.
+    - A development RESTAMP_ENV must use a local database (unix socket or
+      loopback host): a deployment that forgot RESTAMP_ENV=production must
+      not boot with development behaviour against a real database.
 
-    Safe in local/dev/test beyond that (no-op). Raises RuntimeError in
-    production when:
-    - JWT secret is missing, weak (<32 chars), or a known placeholder;
-    - RESTAMP_OTP_DISPLAY_MODE is enabled (it must be '0' in production:
-      OTP codes must never be returned in API responses; the temporary
-      display mode exists for local/internal testing only) — unless the
-      explicit RESTAMP_OTP_DISPLAY_IN_PRODUCTION=1 demo override is also
-      set, which is logged as a warning at startup;
-    - RESTAMP_GOOGLE_DEV_MODE is enabled;
-    - RESTAMP_CORS_ORIGINS contains '*' (never valid with credentials);
-    - Google login is enabled without a real RESTAMP_GOOGLE_CLIENT_ID.
-    (SMS/OTP delivery is not configurable and not validated here: real SMS
-    delivery must be connected in code per app/services/otp.py; until then
-    OTP requests fail closed at request time. The temporary demo/test
-      login and all demo/suffix authentication were removed — no demo or
-      suffix authentication exists anymore; lingering env values for them
-      are simply ignored.)
+    Production (RESTAMP_ENV=production/prod/staging) also refuses:
+    - RESTAMP_DATABASE_URL unset (the built-in placeholder);
+    - a missing, weak (<32 chars) or placeholder RESTAMP_JWT_SECRET;
+    - RESTAMP_OTP_DISPLAY_MODE=1 (OTP codes are never returned in
+      production; there is no override);
+    - RESTAMP_GOOGLE_DEV_MODE=1, or RESTAMP_GOOGLE_ENABLED=1 without a real
+      RESTAMP_GOOGLE_CLIENT_ID;
+    - RESTAMP_CORS_ORIGINS empty, containing "*", or containing anything
+      other than exact public https origins (no localhost/LAN, no paths).
+    SMS delivery is not validated here: with no provider connected, OTP
+    requests fail closed (503) at request time.
     Messages name only the setting, never its value.
     """
-    if (settings.ENV or "").strip().lower() == "demo":
+    env = _env()
+    if env == "demo":
         # The dedicated demo mode (predefined codes shown for login) was
         # removed: RESTAMP_ENV=demo must fail fast instead of silently
         # behaving like local/production anywhere it is left configured.
@@ -260,46 +299,68 @@ def validate_security_config() -> None:
             "local/development locally or production/prod/staging for "
             "deployments."
         )
-    if not is_production():
+    if env not in _DEV_ENVS and env not in _PROD_ENVS:
+        raise RuntimeError(
+            "Unsafe configuration: RESTAMP_ENV must be set explicitly — "
+            "production (or prod/staging) for deployments, local (or "
+            "development/dev/test) for development."
+        )
+    if env in _DEV_ENVS:
+        if not _is_local_database_url(settings.DATABASE_URL):
+            raise RuntimeError(
+                "Unsafe configuration: RESTAMP_DATABASE_URL points at a "
+                "non-local database while RESTAMP_ENV is a development value; "
+                "deployments must set RESTAMP_ENV=production."
+            )
         return
+
+    # --- production --------------------------------------------------------
+    if (settings.DATABASE_URL or "").strip() in ("", _DEFAULT_DATABASE_URL):
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_DATABASE_URL must be "
+            "set explicitly in production."
+        )
     if not is_jwt_secret_strong(settings.JWT_SECRET):
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_JWT_SECRET must be "
             "set to a strong random value at least 32 characters long."
         )
-    if settings.OTP_DISPLAY_MODE and not otp_display_permitted():
-        # The temporary internal-testing display mode must NEVER be enabled
-        # on a production-classified deployment by the flag alone: OTP codes
-        # must never be returned in API responses (or logs) unless the
-        # explicit demo override is also set. The service also enforces
-        # this at request time (see app/services/otp.py _display_active).
+    if settings.OTP_DISPLAY_MODE:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_OTP_DISPLAY_MODE must "
             "be '0' in production (OTP codes must never be returned in API "
             "responses)."
-        )
-    if settings.OTP_DISPLAY_MODE:
-        _log.warning(
-            "RESTAMP_OTP_DISPLAY_IN_PRODUCTION is enabled: OTP request "
-            "responses include the generated code, so any phone number can "
-            "be signed in to without SMS. Set it to '0' to restore the "
-            "fail-closed behavior."
         )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_GOOGLE_DEV_MODE must be '0' "
             "in production (synthetic dev tokens must never be accepted)."
         )
-    cors = [o.strip() for o in (settings.CORS_ORIGINS or "").split(",") if o.strip()]
+    if settings.GOOGLE_ENABLED and not settings.GOOGLE_CLIENT_ID.strip():
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_GOOGLE_ENABLED requires "
+            "a real RESTAMP_GOOGLE_CLIENT_ID in production."
+        )
+    cors = parse_cors_origins(settings.CORS_ORIGINS)
     if "*" in cors:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_CORS_ORIGINS must not "
             "contain '*' when credentials are enabled."
         )
+    if not cors:
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_CORS_ORIGINS must list "
+            "the allowed website origins in production."
+        )
+    if not all(is_valid_production_origin(o) for o in cors):
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_CORS_ORIGINS must contain "
+            "only exact public https origins (scheme and host, no path, no "
+            "wildcard, no localhost or private-network hosts)."
+        )
     # Photo-upload storage: NOT a hard failure (that would be a behavior
     # change requiring an explicit product decision). When production has no
-    # Cloudinary cloud configured, uploads fall back to the local disk, which
-    # is ephemeral on Render and bakes request-base-URLs into property_media.
+    # Cloudinary cloud configured, uploads fall back to the local disk.
     # Warn loudly at startup so the trade-off is visible, naming settings
     # only (never values).
     if not settings.CLOUDINARY_CLOUD_NAME:
@@ -316,11 +377,6 @@ def validate_security_config() -> None:
         _log.warning(
             "RESTAMP_DEV_MEDIA_URL_PREFIXES is set but ignored in production; "
             "listing photo URLs must be approved Cloudinary URLs."
-        )
-    if settings.GOOGLE_ENABLED and not settings.GOOGLE_CLIENT_ID.strip():
-        raise RuntimeError(
-            "Insecure production configuration: RESTAMP_GOOGLE_ENABLED requires "
-            "a real RESTAMP_GOOGLE_CLIENT_ID in production."
         )
 
 

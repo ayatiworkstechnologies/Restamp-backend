@@ -69,8 +69,8 @@ def test_env_demo_refused_when_production_classified(monkeypatch):
 
 
 def test_env_demo_refused_even_locally(monkeypatch):
-    """The refusal runs BEFORE the is_production() early-return: a leftover
-    RESTAMP_ENV=demo must never silently boot as local development."""
+    """A leftover RESTAMP_ENV=demo is refused by name (even with a local
+    database) and never boots as local development."""
     s = config_module.settings
     monkeypatch.setattr(s, "ENV", "demo")
     monkeypatch.setattr(
@@ -78,7 +78,9 @@ def test_env_demo_refused_even_locally(monkeypatch):
         "DATABASE_URL",
         "mysql+pymysql://u:p@localhost/restamp_dev?unix_socket=/tmp/mysql.sock",
     )
-    assert is_production() is False  # sanity: this is the LOCAL classification
+    # An unknown RESTAMP_ENV (demo included) is never development: request-time
+    # checks fail closed as production, and startup refuses it by name.
+    assert is_production() is True
     with pytest.raises(RuntimeError, match="RESTAMP_ENV=demo"):
         validate_security_config()
 

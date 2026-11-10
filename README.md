@@ -10,17 +10,18 @@ every `POST /auth/otp/request` fails closed with a generic 503. This is
 deliberate — production phone-OTP login stays unavailable until a real SMS
 provider is integrated in code.
 
-For **local / internal testing only**, the codebase ships a restricted
-display mode: when `RESTAMP_OTP_DISPLAY_MODE=1` in a **non-production-classified
-** process, `/auth/otp/request` returns the backend-selected code as
-`debug_code` in the API response so testers can log in without SMS. Nothing
-is sent and the delivery seam is bypassed while active. Safeguards:
+For **local development only**, the codebase ships a restricted display
+mode: when `RESTAMP_OTP_DISPLAY_MODE=1` and `RESTAMP_ENV` is a development
+value (`local`/`development`/`dev`/`test`), `/auth/otp/request` returns the
+backend-selected code as `debug_code` so developers can log in without SMS.
+Nothing is sent and the delivery seam is bypassed while active. Safeguards:
 
-- The flag alone is never enough: `is_production()` is re-checked on every
-  request, and it fail-closes (unknown/malformed DATABASE_URL counts as
-  production).
-- In production the startup gate (`validate_security_config`,
-  `app/config.py:191–239`) **refuses to boot** with the flag enabled.
+- The flag alone is never enough: the environment is re-checked on every
+  request by the OTP service and again by the auth router, and an unset or
+  unknown `RESTAMP_ENV` counts as production (fail closed).
+- In production the startup gate (`validate_security_config` in
+  `app/config.py`) **refuses to boot** with the flag enabled. There is no
+  production override.
 - Display mode substitutes delivery only — every lifecycle rule is
   unchanged: per-phone (5/hr) and per-IP (30/hr) request caps, 5 wrong-code
   attempts, 300s expiry, single-use verification, 900s blocks.
@@ -33,6 +34,7 @@ pip install -r requirements.txt
 
 # Local MySQL dev database (defaults to restamp_dev over
 # /tmp/mysql.sock); provision it and migrate to head ONCE:
+export RESTAMP_ENV=local   # required: the app has no default environment
 export RESTAMP_DATABASE_URL="mysql+pymysql://USER:PASSWORD@localhost/restamp_dev?unix_socket=/tmp/mysql.sock"
 alembic upgrade head
 ```
@@ -40,9 +42,10 @@ alembic upgrade head
 ### Run the backend with restricted display mode
 
 ```bash
+export RESTAMP_ENV=local
 export RESTAMP_DATABASE_URL="mysql+pymysql://USER:PASSWORD@localhost/restamp_dev?unix_socket=/tmp/mysql.sock"
 export RESTAMP_JWT_SECRET="pick-a-strong-random-secret-32-chars-min"
-export RESTAMP_OTP_DISPLAY_MODE=1   # LOCAL/INTERNAL TESTING ONLY — never production
+export RESTAMP_OTP_DISPLAY_MODE=1   # LOCAL DEVELOPMENT ONLY — refused in production
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -85,11 +88,11 @@ Everything else unchanged:
   `OTPService.delivery` (`render.yaml` notes: a code change is required —
   there is no dashboard-only toggle).
 - `RESTAMP_ENV=demo` is no longer a supported environment anywhere; startup
-  refuses it in every classification.
+  refuses it, like any unset or unknown `RESTAMP_ENV`.
 - Auth tests: `pytest tests/test_otp_delivery.py tests/test_otp_display_mode.py
   tests/test_otp_demo_mode.py tests/test_concurrency.py tests/test_auth_production.py
-  tests/test_phase1_security.py` (requires the local
-  DB at Alembic head).
+  tests/test_phase1_security.py tests/test_production_hardening.py` (requires
+  the local DB at Alembic head).
 
 ## Running the test suite (local `restamp_test`)
 
@@ -115,21 +118,29 @@ pytest
   `RESTAMP_TEST_BLOCKED_DBS`) and URLs without a database name.
 - The session aborts unless the database is at the single Alembic head.
 
-## Production demo override (displayed OTP without SMS)
+## Production configuration
 
-Until an SMS provider is connected, a production deployment can return the
-generated code exactly like local display mode, but only with **both**:
+Production is decided by `RESTAMP_ENV` alone (never by the database host), so
+a single-server deployment with MySQL on `localhost` is production when it
+says so. Startup refuses to boot unless all of these hold:
 
 ```env
-RESTAMP_OTP_DISPLAY_MODE=1
-RESTAMP_OTP_DISPLAY_IN_PRODUCTION=1
+RESTAMP_ENV=production                      # required; unset/unknown values are refused
+RESTAMP_DATABASE_URL=<real URL>             # the built-in placeholder is refused
+RESTAMP_JWT_SECRET=<random, 32+ chars>      # weak/placeholder secrets are refused
+RESTAMP_OTP_DISPLAY_MODE=0                  # "1" is refused; there is no override
+RESTAMP_GOOGLE_DEV_MODE=0                   # "1" is refused
+RESTAMP_CORS_ORIGINS=https://restamp.in,https://www.restamp.in,https://restamp-alpha.vercel.app,https://restamp-app.vercel.app
 ```
 
-- `RESTAMP_OTP_DISPLAY_MODE=1` alone still refuses production startup.
-- Startup logs a warning while the override is active.
-- Codes stay random, single use, expiring and rate limited, and are verified
-  by the normal `POST /auth/otp/verify`.
-- **Anyone who can reach the API can sign in as any phone number,
-  including existing accounts.** Set `RESTAMP_OTP_DISPLAY_IN_PRODUCTION=0`
-  (or `RESTAMP_OTP_DISPLAY_MODE=0`) to restore the fail-closed 503.
-- Tests: `pytest tests/test_otp_production_display.py`.
+- `RESTAMP_CORS_ORIGINS` is the only source of allowed browser origins in
+  production: exact `https://host[:port]` origins (lowercase), no path or
+  trailing slash, no `*`, no localhost/private-LAN hosts. Listed origins get
+  credentialed CORS; every other origin gets no CORS headers.
+- `RESTAMP_GOOGLE_ENABLED=1` additionally requires a real
+  `RESTAMP_GOOGLE_CLIENT_ID`.
+- A development `RESTAMP_ENV` with a non-local database is refused (a
+  deployment that forgot `RESTAMP_ENV=production`).
+- With no SMS provider connected, `POST /auth/otp/request` returns 503 in
+  production; OTP codes are never returned in responses.
+- Tests: `pytest tests/test_production_hardening.py`.

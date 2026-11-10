@@ -36,14 +36,19 @@ def test_is_production_explicit_env(monkeypatch):
     assert is_production() is False
 
 
-def test_is_production_remote_url_triggers(monkeypatch):
+def test_remote_database_no_longer_implies_production(monkeypatch):
+    """C3: production is decided by RESTAMP_ENV alone, never by the database
+    host — but a development RESTAMP_ENV against a remote database is
+    refused at startup (a deployment that forgot RESTAMP_ENV=production)."""
     monkeypatch.setattr(config_module.settings, "ENV", "local")
     monkeypatch.setattr(
         config_module.settings,
         "DATABASE_URL",
         "mysql+pymysql://u:p@db.example.com/restamp_prod",
     )
-    assert is_production() is True
+    assert is_production() is False
+    with pytest.raises(RuntimeError, match="RESTAMP_ENV=production"):
+        validate_security_config()
 
 
 # --- Unit: JWT strength (no DB, no secrets in output) -----------------------
@@ -303,14 +308,17 @@ def test_local_db_url_detection():
     assert not _is_local_database_url("this is not a url")
 
 
-def test_is_production_not_fooled_by_substring_host(monkeypatch):
+def test_dev_env_not_fooled_by_substring_host(monkeypatch):
+    """A host that merely contains "localhost" is not local: a development
+    RESTAMP_ENV against it is refused at startup."""
     monkeypatch.setattr(config_module.settings, "ENV", "local")
     monkeypatch.setattr(
         config_module.settings,
         "DATABASE_URL",
         "mysql+pymysql://u:p@localhost.attacker.tld/restamp_dev",
     )
-    assert is_production() is True
+    with pytest.raises(RuntimeError, match="non-local database"):
+        validate_security_config()
 
 
 # Interactive API docs enumerate the full public route surface: they must

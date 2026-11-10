@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import is_production, settings
+from .config import is_production, parse_cors_origins, settings
 from .db import check_db
 from .routers import admin as admin_router
 from .routers import auth as auth_router
@@ -24,10 +24,13 @@ from .worker import worker_lifespan
 
 log = logging.getLogger("restamp")
 
-# Allowed browser origins. Local-development defaults (Expo web :8081,
-# classic :19006); override via RESTAMP_CORS_ORIGINS (comma-separated) on
-# Render with the exact production frontend origins. Never "*" with
-# credentials; native apps are unaffected by CORS.
+# Allowed browser origins (native apps are unaffected by CORS).
+# - Production: ONLY the exact origins in RESTAMP_CORS_ORIGINS (validated at
+#   startup: exact public https origins, never "*", never localhost/LAN).
+# - Development: RESTAMP_CORS_ORIGINS if set, else these local defaults
+#   (Expo web :8081, classic :19006), plus any localhost / private-LAN origin
+#   (_DEV_ORIGIN_REGEX) for on-device testing.
+# Credentials are allowed only for those explicitly listed/matched origins.
 _DEFAULT_LOCAL_ORIGINS = [
     "http://localhost:8081",
     "http://127.0.0.1:8081",
@@ -36,11 +39,20 @@ _DEFAULT_LOCAL_ORIGINS = [
 ]
 
 
-def _cors_origins() -> list[str]:
-    raw = settings.CORS_ORIGINS
-    if raw:
-        return [o.strip() for o in raw.split(",") if o.strip()]
-    return _DEFAULT_LOCAL_ORIGINS
+_DEV_ORIGIN_REGEX = (
+    r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$"
+)
+
+
+def _cors_settings() -> dict:
+    """CORSMiddleware origin settings for the current environment."""
+    configured = parse_cors_origins(settings.CORS_ORIGINS)
+    if is_production():
+        # Exactly the configured origins; never a regex, never "*" (an
+        # invalid list is refused at startup by validate_security_config).
+        return {"allow_origins": [o for o in configured if o != "*"], "allow_origin_regex": None}
+    return {"allow_origins": configured or _DEFAULT_LOCAL_ORIGINS, "allow_origin_regex": _DEV_ORIGIN_REGEX}
 
 
 @asynccontextmanager
@@ -98,12 +110,25 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_cors_origins(),
-        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$",
+        **_cors_settings(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Credentials are granted only together with an allowed origin.
+    # Starlette's CORSMiddleware adds "Access-Control-Allow-Credentials" to
+    # every response that carries an Origin header, even when the origin is
+    # refused (no Access-Control-Allow-Origin); browsers ignore it then, but
+    # it is dropped here so a refused origin is never told credentials are
+    # allowed. Registered after CORSMiddleware, so it wraps it.
+    @app.middleware("http")
+    async def _credentials_only_for_allowed_origins(request: Request, call_next):
+        response = await call_next(request)
+        if "access-control-allow-origin" not in response.headers:
+            if "access-control-allow-credentials" in response.headers:
+                del response.headers["access-control-allow-credentials"]
+        return response
 
     @app.exception_handler(HTTPException)
     async def http_error(_: Request, exc: HTTPException):

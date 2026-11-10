@@ -12,9 +12,9 @@
   no "sent" response can ever lie. Real SMS delivery must be implemented and
   attached behind this seam (a `Callable`) before public phone login can
   work.
-- TEMPORARY INTERNAL-TESTING DISPLAY (explicitly restricted): when
-  RESTAMP_OTP_DISPLAY_MODE="1" in a NON-production-classified process
-  (local development / internal test deployments only), request_code
+- LOCAL-DEVELOPMENT DISPLAY (explicitly restricted): when
+  RESTAMP_OTP_DISPLAY_MODE="1" and RESTAMP_ENV is an explicit development
+  value (local/development/dev/test — never production), request_code
   RETURNS the generated code so the API response can display it — no SMS
   is sent and the delivery seam is bypassed while the mode is active. In
   every other configuration — ALWAYS in production, where the startup gate
@@ -117,16 +117,15 @@ class OTPService:
             )
 
     def _display_active(self) -> bool:
-        """Whether the temporary internal-testing display mode is active.
+        """Whether the local-development display mode is active.
 
         Deliberately restricted on TWO independent conditions, re-evaluated
-        at every call: the explicit env flag must be "1", AND the process
-        must not be production-classified (is_production() refuses unknown
-        or malformed DB URLs / envs into production — fail closed). In
-        production this is therefore unreachable even if the flag is left
-        set; the startup gate additionally refuses production boot with it.
-        The single exception is the explicit RESTAMP_OTP_DISPLAY_IN_PRODUCTION
-        demo override (config.otp_display_permitted).
+        at every call: the explicit env flag must be "1", AND RESTAMP_ENV
+        must be an explicit development value (config.otp_display_permitted;
+        an unset/unknown RESTAMP_ENV counts as production — fail closed). In
+        production this is unreachable even if the flag is left set (there is
+        no production override); the startup gate also refuses production
+        boot with it, and the auth router drops any code in production.
         """
         if not settings.OTP_DISPLAY_MODE:
             return False
@@ -193,7 +192,7 @@ class OTPService:
             )
             self._codes[phone] = entry
             if display:
-                # Restricted internal-testing display: the backend-selected
+                # Restricted local-development display: the backend-selected
                 # code is handed back to the router for response display.
                 # It is never logged here, and the delivery seam is not
                 # touched (no SMS, no leak channel beyond the response).

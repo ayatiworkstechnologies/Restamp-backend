@@ -1,12 +1,14 @@
 """Phase 4 test isolation: every test runs inside a rolled-back transaction on the
 LOCAL restamp_dev database, so no test rows ever persist. Requires env:
 RESTAMP_DATABASE_URL (unix-socket URL), RESTAMP_JWT_SECRET,
-RESTAMP_GOOGLE_DEV_MODE=1.
+RESTAMP_GOOGLE_DEV_MODE=1. RESTAMP_ENV is forced to "local": the app has no
+default environment and production is decided by RESTAMP_ENV alone.
 """
 import os
 
 import pytest
 
+os.environ["RESTAMP_ENV"] = "local"
 os.environ["RESTAMP_JWT_SECRET"] = "phase4-test-secret"
 os.environ["RESTAMP_GOOGLE_DEV_MODE"] = "1"
 os.environ["RESTAMP_DISABLE_AUTO_VERIFY"] = "1"
