@@ -4,7 +4,7 @@ restamp_dev only. No real SMS/network calls.
 """
 import json
 
-from tests.conftest import auth_header, register_phone
+from tests.conftest import auth_header, register_phone, fresh_pincode
 
 OWNER_PHONE = "+919840123456"
 LISTING_PHONE = "+919840654321"
@@ -34,7 +34,7 @@ def _create(c, token, deal, title=None):
             "price_period": "MONTHLY" if deal in ("RENT", "LEASE") else "TOTAL",
             "locality": f"Guest Nagar {_SEQ['n']}",
             "city": "Chennai",
-            "pincode": "600080",
+            "pincode": fresh_pincode(c),
             "contact_phone": LISTING_PHONE,
             "photos": [{"url": f"https://t.test/g{_SEQ['n']}.jpg",
                         "category": "Living Room"}],
@@ -161,7 +161,8 @@ def test_authenticated_flows_preserved_without_leaks(client):
     # Phone is revealed ONLY through the contact endpoint ...
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
     assert r.status_code == 200, r.text
-    assert r.json() == {"phone": OWNER_PHONE}
+    # Plus the owner's public-safe name (none saved here) and own-listing flag.
+    assert r.json() == {"phone": OWNER_PHONE, "owner_name": None, "own_listing": False}
     # ... and appears nowhere else, even authenticated.
     r = c.get(f"/buyer/listings/{lid}", headers=h)
     assert r.status_code == 200, r.text
@@ -210,12 +211,13 @@ def test_enquiry_403_means_wrong_role(client):
     r = c.post(f"/buyer/listings/{lid}/contact", headers=auth_header(token))
     assert r.status_code == 403, r.text
     assert "phone" not in r.json()
-    # BROKER role likewise refused.
+    # BROKER (agent) passes the role gate but is area-limited: with no plan
+    # area the enquiry is refused with the upgrade code, not the role error.
     broker = register_phone(c, "+919100888803")["access_token"]
     c.post("/users/me/role", json={"role": "BROKER"}, headers=auth_header(broker))
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
                headers=auth_header(broker))
-    assert r.status_code == 403, r.text
+    assert r.status_code == 402 and r.json()["detail"]["code"] == "AGENT_AREA_NOT_IN_PLAN", r.text
     # Switching back to BUYER restores access (self-serve preserved): the
     # role gate now passes. `lid` is this account's OWN listing, so the
     # request reaches the self-enquiry rule (422, added in the 2026-10-30

@@ -71,6 +71,26 @@ def active_postcode_ids(db: Session, broker_id: int) -> list[int]:
     return sorted(int(g.postcode_id) for g in _active_grants(db, broker_id).all())
 
 
+def area_postcode_ids(db: Session, broker_id: int) -> list[int]:
+    """Every postcode of the localities the broker's unexpired grants are in.
+
+    Agent plans are sold per locality (agent_plans counts localities, not
+    postcodes), but a grant stores the locality's postcodes as they were at
+    grant time. A locality can gain a postcode later (an owner lists with a
+    new pincode for a known locality, owner_listings._find_or_create_postcode),
+    and listings there must still count as inside the agent's area. So listing
+    visibility for agents matches on the canonical locality id. Still derived
+    only from the broker's own active grants: no grant -> no postcodes, and a
+    locality without a grant is never reached."""
+    granted_localities = (
+        db.query(Postcode.locality_id)
+        .join(BrokerPostcodeAccessCurrent, BrokerPostcodeAccessCurrent.postcode_id == Postcode.id)
+        .filter(BrokerPostcodeAccessCurrent.broker_user_id == broker_id, _grant_is_active())
+    )
+    rows = db.query(Postcode.id).filter(Postcode.locality_id.in_(granted_localities.scalar_subquery())).all()
+    return sorted(int(pid) for (pid,) in rows)
+
+
 def list_covered_locations(db: Session, broker_id: int) -> list[dict]:
     """The broker's own unexpired grants with pincode/locality/city names,
     ordered by pincode. Only the caller's rows are ever read."""

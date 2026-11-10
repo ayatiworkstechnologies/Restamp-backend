@@ -14,7 +14,7 @@ from .security import ensure_active_user, get_current_user, get_current_user_id
 from .services import admin_rbac, users_roles
 
 
-def require_role(*allowed: str):
+def require_role(*allowed: str, detail: str | None = None):
     def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
         # Suspended/closed accounts are refused before any role decision.
         ensure_active_user(db, user_id)
@@ -26,7 +26,7 @@ def require_role(*allowed: str):
             # a buyer action) instead of a bare "Forbidden".
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"{'/'.join(allowed)} role required",
+                detail=detail or f"{'/'.join(allowed)} role required",
             )
         return user_id
 
@@ -34,6 +34,11 @@ def require_role(*allowed: str):
 
 
 require_buyer = require_role("BUYER")
+# Buyer activity (wishlist, enquiries, visits, viewed, call taps, owner
+# contact) is shared by buyers and agents (BROKER): an agent connects with
+# owners exactly like a buyer, on their own account. The 403 text stays
+# "BUYER role required" so an OWNER-mode account still knows what to switch to.
+require_buyer_or_agent = require_role("BUYER", "BROKER", detail="BUYER role required")
 require_owner = require_role("OWNER")
 require_broker = require_role("BROKER")
 

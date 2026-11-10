@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone
+from tests.conftest import auth_header, register_phone, fresh_pincode
 
 _SEQ = {"n": 0}
 FUTURE = lambda days=7: (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
@@ -74,7 +74,7 @@ def _listing(c, token, title=None):
             "price_rupees": 5000000,
             "locality": f"Buyer Action Nagar {_SEQ['n']}",
             "city": "Chennai",
-            "pincode": "600080",
+            "pincode": fresh_pincode(c),
         },
         headers=auth_header(token),
     )
@@ -150,7 +150,9 @@ def test_visit_requires_authentication(client):
 # --- Buyer authorization (the 403 matrix) ---------------------------------
 
 def test_enquiry_rejects_non_buyer_roles(client):
-    """OWNER/BROKER accounts are refused with the actionable detail."""
+    """OWNER accounts are refused with the actionable detail. Agents (BROKER)
+    pass the role gate but act only inside their plan's areas: an agent with
+    no area gets 402 AGENT_AREA_NOT_IN_PLAN (see test_agent_trial.py)."""
     c, _ = client
     _, otoken = _owner(c)
     lid = _listing(c, otoken)
@@ -167,8 +169,7 @@ def test_enquiry_rejects_non_buyer_roles(client):
     r = c.post(
         "/buyer/enquiries", json=_enquiry_body(lid), headers=auth_header(broker["access_token"])
     )
-    assert r.status_code == 403, r.text
-    assert r.json() == {"detail": "BUYER role required"}, r.text
+    assert r.status_code == 402 and r.json()["detail"]["code"] == "AGENT_AREA_NOT_IN_PLAN", r.text
 
     # No row was written for the refused attempts.
     count = c.get("/buyer/enquiries", headers=auth_header(otoken)).status_code
@@ -188,13 +189,13 @@ def test_visit_rejects_non_buyer_roles(client):
     assert r.status_code == 403, r.text
     assert r.json() == {"detail": "BUYER role required"}, r.text
 
+    # Agents (BROKER) pass the role gate but need the listing's area in their plan.
     broker = _register(c)
     c.post("/users/me/role", json={"role": "BROKER"}, headers=auth_header(broker["access_token"]))
     r = c.post(
         "/buyer/visits", json=_visit_body(lid), headers=auth_header(broker["access_token"])
     )
-    assert r.status_code == 403, r.text
-    assert r.json() == {"detail": "BUYER role required"}, r.text
+    assert r.status_code == 402 and r.json()["detail"]["code"] == "AGENT_AREA_NOT_IN_PLAN", r.text
 
 
 # --- Enquiry creation ------------------------------------------------------

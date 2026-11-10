@@ -6,6 +6,8 @@ BROKER — require_broker reads the role from the DB, never the token):
   GET /broker/dashboard  — real counts; unsupported metrics null + listed
   GET /broker/locations  — the caller's covered postcodes (unexpired grants)
   GET /broker/listings   — buyer-visible listings inside the caller's coverage
+  GET /broker/listings/{id}         — detail, only inside coverage (402 otherwise)
+  GET /broker/listings/{id}/similar — similar listings inside coverage only
 
 Agent plans (any authenticated active account — a buyer becomes an agent by
 buying one):
@@ -13,10 +15,15 @@ buying one):
   POST /broker/plans/{code}/subscribe  — buy a plan for chosen localities
                                          (SIMULATED payment); grants coverage
                                          and switches the role to BROKER
+  POST /broker/plan/localities         — add localities to the ACTIVE plan
+                                         within its limit; no payment
+  POST /broker/trial                   — start the agent free trial with ONE
+                                         area (once per account, no payment)
 
-Read-only by design: no endpoint creates or changes coverage, subscriptions,
-leads or listings. Coverage grants come from broker_postcode_access_current
-only (see services/brokers.py); an agent without grants sees empty results.
+Only the two plan POSTs change coverage; the four agent GETs are read-only and
+never create or change coverage, subscriptions, leads or listings. Coverage
+grants come from broker_postcode_access_current only (see
+services/brokers.py); an agent without grants sees empty results.
 Property detail stays on the public GET /buyer/listings/{id}. GETs never
 write. GET /broker/scope (users.py) is unchanged.
 """
@@ -33,6 +40,7 @@ from ..security import ensure_active_user, get_current_user_id
 from ..services import agent_plans as agent_plan_svc
 from ..services import brokers as broker_svc
 from ..services import listings as listing_svc
+from ..models import PhysicalProperty, PropertyListing
 from .buyer import ConstructionStatus, Deal, PropType, Sort
 
 router = APIRouter(prefix="/broker", tags=["broker"])
@@ -64,6 +72,37 @@ def subscribe_agent_plan(
     """Buy an agent plan for the chosen localities. PAYMENT IS SIMULATED —
     no money is charged. Grants coverage and switches the role to BROKER."""
     result = agent_plan_svc.subscribe_simulated(db, user_id, code, body.localities)
+    db.commit()
+    return result
+
+
+@router.post("/trial", response_model=schemas.AgentPlanStatusOut)
+def start_agent_trial(
+    body: schemas.AgentTrialIn,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(_active_user),
+):
+    """Start the agent free trial with one area: unlimited owner numbers,
+    properties in that area only. 409 if a plan is active or the trial was
+    already used; 422 if the area is not served."""
+    result = agent_plan_svc.start_trial(db, user_id, body.locality)
+    db.commit()
+    return result
+
+
+@router.post("/plan/localities", response_model=schemas.AgentPlanLocalitiesOut)
+def add_agent_plan_localities(
+    body: schemas.AgentLocalitiesIn,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(_active_user),
+):
+    """Use the active plan's unused allowance: add localities with no payment;
+    the plan's expiry is unchanged. Names resolve to canonical localities or
+    aliases (services/localities.py). 409 "No active agent plan"; 422 when
+    the plan limit would be exceeded or nothing chosen is usable. Covered
+    places are skipped; unknown and admin-disabled names are listed in
+    unmatched_localities / unavailable_localities."""
+    result = agent_plan_svc.add_localities(db, user_id, body.localities)
     db.commit()
     return result
 
@@ -109,14 +148,15 @@ def list_broker_listings(
     count_only: bool = Query(default=False),
 ):
     """Same filters, sorting, paging and visibility as GET /buyer/listings,
-    restricted to the caller's covered postcodes (none covered -> empty)."""
+    restricted to the caller's covered areas: every postcode of each granted
+    locality (brokers.area_postcode_ids; none covered -> empty)."""
     if min_price_paise is not None and max_price_paise is not None and min_price_paise > max_price_paise:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     cards, total = listing_svc.search_listings(
         db,
         page=page,
         page_size=0 if count_only else page_size,
-        postcode_ids=broker_svc.active_postcode_ids(db, broker_id),
+        postcode_ids=broker_svc.area_postcode_ids(db, broker_id),
         deal=deal,
         property_type=property_type,
         locality=locality,
@@ -138,3 +178,42 @@ def list_broker_listings(
         page_size=page_size,
         total=total,
     )
+
+
+@router.get("/listings/{listing_id}", response_model=schemas.ListingDetail)
+def get_broker_listing(
+    listing_id: int, db: Session = Depends(get_db), broker_id: int = Depends(require_broker)
+):
+    """Property detail for agents: only inside the caller's covered areas
+    (402 AGENT_AREA_NOT_IN_PLAN otherwise), so opening a property directly
+    cannot bypass the plan's area limit."""
+    detail = listing_svc.get_listing_detail(db, listing_id)
+    if detail is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    agent_plan_svc.ensure_listing_in_plan(db, broker_id, listing_id)
+    detail["cover_image_url"] = listing_svc.fetch_cover_map(db, [listing_id]).get(listing_id)
+    return detail
+
+
+@router.get("/listings/{listing_id}/similar", response_model=list[schemas.ListingCard])
+def get_broker_similar(
+    listing_id: int,
+    db: Session = Depends(get_db),
+    broker_id: int = Depends(require_broker),
+    limit: int = Query(default=5, ge=1, le=5),
+):
+    """Similar listings for agents, restricted to the caller's covered areas."""
+    agent_plan_svc.ensure_listing_in_plan(db, broker_id, listing_id)
+    cards = listing_svc.find_similar(db, listing_id, limit=100)
+    if cards is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    allowed = set(broker_svc.area_postcode_ids(db, broker_id))
+    ids = [c["listing_id"] for c in cards]
+    in_area = {
+        int(lid)
+        for lid, pid in db.query(PropertyListing.id, PhysicalProperty.postcode_id)
+        .join(PhysicalProperty, PhysicalProperty.id == PropertyListing.physical_property_id)
+        .filter(PropertyListing.id.in_(ids or [0]))
+        if int(pid) in allowed
+    }
+    return [c for c in cards if c["listing_id"] in in_area][:limit]

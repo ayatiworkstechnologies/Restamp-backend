@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .. import schemas
 from ..db import get_db
-from ..deps import require_buyer
+from ..deps import require_buyer, require_buyer_or_agent
 from ..services import listings as listing_svc
 from ..services import call_events as call_svc
 from ..services import buyer_plans as plan_svc
@@ -19,8 +19,20 @@ from ..services import enquiries as enquiry_svc
 from ..services import saved as saved_svc
 from ..services import visits as visit_svc
 from ..services import viewed as viewed_svc
+from ..services import users_roles
+from ..services import agent_plans as agent_plan_svc
 
 router = APIRouter(prefix="/buyer", tags=["buyer"])
+
+
+def _agent_area_gate(db: Session, user_id: int, listing_id: int) -> str | None:
+    """Agents (BROKER) may act only on listings inside their plan's areas
+    (free trial: one area) -> 402 AGENT_AREA_NOT_IN_PLAN otherwise. Buyers
+    are never area-restricted. Returns the caller's current role."""
+    role = users_roles.get_current_role(db, user_id)
+    if role == "BROKER":
+        agent_plan_svc.ensure_listing_in_plan(db, user_id, listing_id)
+    return role
 
 Deal = Literal["BUY", "RESALE", "RENT", "LEASE"]
 PropType = Literal["APARTMENT", "VILLA", "HOUSE", "COMMERCIAL", "PLOT", "AGRICULTURAL_LAND"]
@@ -97,30 +109,38 @@ def get_similar(
     return cards
 
 
-@router.post("/listings/{listing_id}/contact", response_model=schemas.ContactRevealOut)
+@router.post("/listings/{listing_id}/contact", response_model=schemas.ListingContactRevealOut)
 def reveal_listing_contact(
     listing_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     # Buyer-plan lead quota: a NEW property beyond the plan's limit is
     # refused with 402 BUYER_PLAN_REQUIRED before anything is revealed.
     # The 402 carries only the last 4 digits of the owner's number (teaser);
     # an invisible/uncontactable listing still answers 404 first.
     owner_id, owner_phone = contact_svc.find_owner(db, listing_id)
+    role = _agent_area_gate(db, buyer_id, listing_id)
+    # The owner's public-safe name (same rule as the public listing detail:
+    # never phone-based) so the contact sheet names the real owner.
+    owner_name = listing_svc._safe_owner_name(db, owner_id)
     if owner_id == buyer_id:
         # Owner (switched to buyer mode) viewing their OWN listing: it's their
         # own number — no lead, no audit, no quota (create_enquiry would 422).
-        return schemas.ContactRevealOut(phone=owner_phone)
-    plan_svc.ensure_can_reveal(db, buyer_id, listing_id, phone_last4=owner_phone[-4:])
+        return schemas.ListingContactRevealOut(phone=owner_phone, owner_name=owner_name, own_listing=True)
+    if role != "BROKER":
+        # Buyers: 3 free owner numbers, then a buyer plan. Agents have no
+        # reveal limit; their limit is the areas in their plan (gate above).
+        plan_svc.ensure_can_reveal(db, buyer_id, listing_id, phone_last4=owner_phone[-4:])
     phone, _audit = contact_svc.reveal_contact(db, buyer_id, listing_id)
     # P3 leads MVP: a successful reveal guarantees exactly one ACTIVE lead
     # (NEW enquiry) for this buyer+listing. Reuses the existing row on
     # repeats (idempotent 200 path), so unique lead counts never inflate
     # while every reveal still keeps its own audit record above.
-    enquiry_svc.create_enquiry(db, buyer_id, listing_id, None)
+    # The lead keeps the revealer's role, so an agent's reveal is an Agent lead.
+    enquiry_svc.create_enquiry(db, buyer_id, listing_id, None, source_role=role or "BUYER")
     db.commit()
-    return schemas.ContactRevealOut(phone=phone)
+    return schemas.ListingContactRevealOut(phone=phone, owner_name=owner_name)
 
 
 @router.get("/plans")
@@ -154,11 +174,16 @@ def subscribe_buyer_plan(
 def create_buyer_enquiry(
     body: schemas.EnquiryCreate,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     if body.property_listing_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
-    enquiry, created = enquiry_svc.create_enquiry(db, buyer_id, body.property_listing_id, body.message)
+    # The sender's role (BUYER or BROKER) is recorded on a new lead so the
+    # owner can see whether a buyer or an agent sent it.
+    role = _agent_area_gate(db, buyer_id, body.property_listing_id)
+    enquiry, created = enquiry_svc.create_enquiry(
+        db, buyer_id, body.property_listing_id, body.message, source_role=role or "BUYER"
+    )
     db.commit()
     if not created:
         # Existing active enquiry: any new distinct message was appended to
@@ -175,7 +200,7 @@ def create_buyer_enquiry(
 @router.get("/enquiries", response_model=schemas.EnquiriesResponse)
 def list_buyer_enquiries(
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
     status: Literal["NEW", "CONTACTED", "CLOSED"] | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -188,7 +213,7 @@ def list_buyer_enquiries(
 def get_buyer_enquiry(
     enquiry_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     return enquiry_svc.get_enquiry(db, buyer_id, enquiry_id)
 
@@ -197,8 +222,9 @@ def get_buyer_enquiry(
 def save_buyer_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
+    _agent_area_gate(db, buyer_id, listing_id)
     card, created = saved_svc.save_listing(db, buyer_id, listing_id)
     db.commit()
     if not created:
@@ -212,7 +238,7 @@ def save_buyer_listing(
 @router.get("/saved", response_model=schemas.ListingsResponse)
 def list_buyer_saved(
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
@@ -224,7 +250,7 @@ def list_buyer_saved(
 def unsave_buyer_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     if saved_svc.unsave_listing(db, buyer_id, listing_id):
         db.commit()
@@ -235,18 +261,23 @@ def unsave_buyer_listing(
 def schedule_buyer_visit(
     body: schemas.VisitCreate,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     """Schedule a visit on a verified, available listing (lands REQUESTED).
 
     The scheduled time must be in the future. Returns 404 for invisible
-    listings or diverged ownership, 422 for past times or self-visits.
+    listings or diverged ownership, 422 for past times, self-visits, or
+    when the owner has closed the buyer's lead on it ("Lead is closed" —
+    a new enquiry opens a fresh lead).
     """
     if body.property_listing_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
+    role = _agent_area_gate(db, buyer_id, body.property_listing_id)
     try:
+        # The requester's role lets owners tell agent visits apart.
         visit = visit_svc.create_buyer_visit(
-            db, buyer_id, body.property_listing_id, body.scheduled_at, body.note
+            db, buyer_id, body.property_listing_id, body.scheduled_at, body.note,
+            source_role=role or "BUYER",
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
@@ -257,7 +288,7 @@ def schedule_buyer_visit(
 @router.get("/visits", response_model=schemas.VisitsResponse)
 def list_buyer_visits(
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
     status: Literal["REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -271,7 +302,7 @@ def list_buyer_visits(
 def get_buyer_visit(
     visit_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     """One own visit; 404 when missing or owned by someone else."""
     return visit_svc.get_buyer_visit(db, buyer_id, visit_id)
@@ -282,12 +313,13 @@ def update_buyer_visit(
     visit_id: int,
     body: schemas.VisitUpdate,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     """Reschedule and/or confirm/decline/cancel own visit per the state
     rules (buyers confirm/decline owner-proposed visits, reschedule
     requested/confirmed times, cancel open visits). 404 when not owned,
-    422 for invalid moves or past times."""
+    422 for invalid moves, past times, or a visit whose lead the owner has
+    closed ("Lead is closed")."""
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(
@@ -308,7 +340,7 @@ def update_buyer_visit(
 def record_viewed(
     listing_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     """Record that the caller viewed a property listing detail.
 
@@ -332,6 +364,7 @@ def record_viewed(
     )
     if visible is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    _agent_area_gate(db, buyer_id, listing_id)
 
     vp = viewed_svc.record_view(db, buyer_id, listing_id)
     db.commit()
@@ -341,7 +374,7 @@ def record_viewed(
 @router.get("/viewed", response_model=schemas.ViewedPropertiesResponse)
 def list_buyer_viewed(
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
@@ -357,12 +390,14 @@ def list_buyer_viewed(
 def record_call_event(
     listing_id: int,
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
 ):
     """Record that the caller TAPPED a Call button for this listing (not that
     a call happened). 404 unless the listing is publicly visible. A repeat
     within 60 s returns the existing event with 200 (no new row)."""
-    event, created = call_svc.record_call_tap(db, buyer_id, listing_id)
+    # Agents tap the same button; the tapper's role lets owners tell agent calls apart.
+    role = _agent_area_gate(db, buyer_id, listing_id)
+    event, created = call_svc.record_call_tap(db, buyer_id, listing_id, source_role=role or "BUYER")
     db.commit()
     if not created:
         return JSONResponse(
@@ -375,7 +410,7 @@ def record_call_event(
 @router.get("/call-events", response_model=schemas.CallEventsResponse)
 def list_call_events(
     db: Session = Depends(get_db),
-    buyer_id: int = Depends(require_buyer),
+    buyer_id: int = Depends(require_buyer_or_agent),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):

@@ -1407,6 +1407,41 @@ class AdminStaffRoleIn(BaseModel):
     admin_role: AdminRole
 
 
+# --- Agent plans + admin-managed agent localities ----------------------------------
+
+class AgentPlanStatusOut(BaseModel):
+    """GET /broker/plan shape. Plan fields are null when has_plan is false."""
+
+    has_plan: bool
+    plan_code: str | None = None
+    plan_id: str | None = None
+    plan_name: str | None = None
+    price_paise: int | None = None
+    locality_limit: int | None = None
+    start_date: datetime | None = None
+    valid_until: datetime | None = None
+    localities: list[str] = Field(default_factory=list)
+    localities_remaining: int | None = None
+    is_trial: bool = False
+
+
+class AgentPlanLocalitiesOut(AgentPlanStatusOut):
+    """POST /broker/plan/localities: the plan after the add, plus what was
+    added (canonical names), what is unknown and what an admin disabled."""
+
+    added_localities: list[str]
+    unmatched_localities: list[str]
+    unavailable_localities: list[str]
+
+
+class AgentTrialIn(BaseModel):
+    locality: str = Field(min_length=1, max_length=255)
+
+
+class AgentLocalitiesIn(BaseModel):
+    localities: list[str] = Field(default_factory=list, max_length=50)
+
+
 class AdminAgentLocalityRow(BaseModel):
     locality_id: int
     name: str
@@ -1432,3 +1467,29 @@ class AdminAgentLocalityOut(BaseModel):
     locality_id: int
     name: str
     agent_enabled: bool
+
+
+class AdminAgentCoverageRow(BaseModel):
+    postcode_id: int
+    pincode: str
+    locality_id: int
+    locality: str
+    city: str
+    expires_at: datetime | None = None
+    agent_enabled: bool
+
+
+class AdminAgentCoverageOut(BaseModel):
+    user_id: int
+    plan: AgentPlanStatusOut
+    coverage: list[AdminAgentCoverageRow]
+
+
+class AdminAgentAssignIn(BaseModel):
+    localities: list[str] = Field(min_length=1, max_length=50)
+
+
+class AdminAgentAssignOut(AdminAgentCoverageOut):
+    added_localities: list[str]
+    unmatched_localities: list[str]
+    unavailable_localities: list[str]
