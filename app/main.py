@@ -18,6 +18,7 @@ from .routers import broker as broker_router
 from .routers import buyer as buyer_router
 from .routers import health as health_router
 from .routers import owner as owner_router
+from .routers import reva as reva_router
 from .routers import users as users_router
 from .services import storage as storage_svc
 from .worker import worker_lifespan
@@ -170,6 +171,7 @@ def create_app() -> FastAPI:
     app.include_router(owner_router.router)
     app.include_router(broker_router.router)
     app.include_router(admin_router.router)
+    app.include_router(reva_router.router)
 
     # Servable uploaded listing photos (local-dev storage; see storage.py).
     # Never a source directory — RESTAMP_MEDIA_ROOT lives outside the repo.

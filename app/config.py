@@ -163,6 +163,17 @@ class Settings:
     # grant no access — every endpoint keeps its own authentication).
     DOCS_ENABLED: bool = _get("RESTAMP_DOCS_ENABLED", "0") == "1"
 
+    # Reva AI Chatbot configuration (optional external LLM; falls back to verified demo/FAQ mode).
+    OPENAI_API_KEY: str = _get("OPENAI_API_KEY", "")
+    OPENAI_MODEL: str = _get("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_TRANSCRIBE_MODEL: str = _get("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe")
+
+    # Agaram 2.5B (Murai-Labs Tamil-English LLM: github.com/Murai-Labs/Agaram2.5b)
+    AGARAM_ENDPOINT: str = _get("AGARAM_ENDPOINT", "")
+    AGARAM_MODEL_NAME: str = _get("AGARAM_MODEL_NAME", "murai-labs/agaram-2.5b-instruct")
+    AGARAM_API_KEY: str = _get("AGARAM_API_KEY", _get("HF_TOKEN", _get("HUGGINGFACE_API_KEY", "")))
+    AGARAM_ENABLED: bool = _get("AGARAM_ENABLED", "1") == "1"
+
 
 settings = Settings()
 
