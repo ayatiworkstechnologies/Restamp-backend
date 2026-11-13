@@ -1,3 +1,4 @@
+from __future__ import annotations
 """RESTAMP Buyer V1 — saved/wishlist persistence (approved decision document only).
 
 Minimal normalized table: buyer -> saved listing. No notes/folders/categories/metadata.

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """RESTAMP Phase 4 — backend authorization (never trust frontend role checks).
 
 - Authentication (who you are) comes from app.security; this module decides

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Liveness + readiness probes."""
 from fastapi import APIRouter
 
