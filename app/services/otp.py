@@ -52,7 +52,7 @@ from typing import Callable
 
 from fastapi import HTTPException, status
 
-from ..config import otp_display_permitted, otp_test_display_permitted, settings
+from ..config import otp_display_permitted, settings
 
 NOT_CONNECTED_503 = "OTP delivery is not configured. Try again later."
 
@@ -140,7 +140,7 @@ class OTPService:
         read it from the test-only delivery stand-in installed as
         `self.delivery` (never from an API response).
 
-        In the explicitly restricted local/internal TESTING display mode
+        In the explicitly restricted local-development display mode
         (_display_active), returns the generated code for the API response
         to display. No SMS is sent there and the delivery seam is bypassed;
         all lifecycle rules (rate caps, expiry, single use, attempt caps)
@@ -156,9 +156,9 @@ class OTPService:
         with self._lock:
             self._ensure_not_blocked(phone)
             self._ensure_ip_not_blocked(ip)
-            # Display for local development, or for a configured internal
-            # tester (server-config phone AND network, see config.py).
-            display = self._display_active() or otp_test_display_permitted(phone, ip)
+            # Local-development display only (env flag + development
+            # RESTAMP_ENV); never in production.
+            display = self._display_active()
             if not display:
                 self._ensure_delivery_connected()
             now = time.time()

@@ -23,8 +23,8 @@ Nothing is sent and the delivery seam is bypassed while active. Safeguards:
   `app/config.py`) **refuses to boot** with the flag enabled. There is no
   production override.
 - Display mode substitutes delivery only — every lifecycle rule is
-  unchanged: per-phone (5/hr) and per-IP (30/hr) request caps, 5 wrong-code
-  attempts, 300s expiry, single-use verification, 900s blocks.
+  unchanged: per-phone (10/hr) and per-IP (60/hr) request caps, 5 wrong-code
+  attempts, 300s expiry, single-use verification, 600s blocks.
 
 ### Local setup
 
@@ -72,39 +72,27 @@ curl -s -X POST http://localhost:8000/auth/otp/verify \
 
 Notes:
 
-- Repeating the request more than 5 times in an hour for the same phone
-  returns 429 (per-phone cap). Use a different number between tests or
+- Repeating the request more than 10 times in an hour for the same phone
+  returns 429 (per-phone cap, `RESTAMP_OTP_MAX_REQUESTS_PER_HOUR`). Use a different number between tests or
   tune `RESTAMP_OTP_MAX_REQUESTS_PER_HOUR` locally only.
-- Wrong codes: 5 attempts then the phone is blocked for 900s.
+- Wrong codes: 5 attempts then the phone is blocked for 600s.
 - With display mode off in a local process, requests fail closed with the
   same generic 503 as production.
 
 Everything else unchanged:
 
 - `RESTAMP_OTP_DISPLAY_MODE` must stay `0` in production (startup refuses
-  `1` outright). Production logs never contain a code, and responses contain
-  one only for a configured internal tester (next point).
-- Restricted internal tester display (off by default, server config only):
-  `RESTAMP_OTP_TEST_DISPLAY=1` + `RESTAMP_OTP_TEST_PHONES` (comma-separated
-  dedicated staff `+91` test numbers, max 20) + `RESTAMP_OTP_TEST_ALLOWED_CIDRS`
-  (office/VPN egress ranges, IPv4 /24 or narrower, IPv6 /48 or narrower).
-  `/auth/otp/request` adds `debug_code` only when the phone is listed AND the
-  client IP is inside a listed range; everyone else gets the normal response
-  (503 while no SMS provider is connected). Request bodies, query strings and
-  client-sent headers cannot enable it. Production startup refuses an
-  incomplete or over-broad configuration and logs only counts. Behind a
-  proxy, `RESTAMP_TRUST_PROXY=1` and the proxy must append the real client
-  address to `X-Forwarded-For`. Code length, expiry, single use, attempt and
-  rate limits are unchanged. Tests: `tests/test_otp_internal_test_display.py`.
-- With no SMS provider attached, public `POST /auth/otp/request` returns a
-  generic 503 until real SMS delivery is implemented and wired behind
-  `OTPService.delivery` (`render.yaml` notes: a code change is required —
-  there is no dashboard-only toggle).
+  `1` outright). Production never returns a code in a response or a log.
+- No SMS provider is integrated. With nothing attached to
+  `OTPService.delivery`, `POST /auth/otp/request` returns a generic 503 and
+  production startup logs a warning. Phone OTP login in production needs a
+  real SMS provider implemented in code first.
 - `RESTAMP_ENV=demo` is no longer a supported environment anywhere; startup
   refuses it, like any unset or unknown `RESTAMP_ENV`.
 - Auth tests: `pytest tests/test_otp_delivery.py tests/test_otp_display_mode.py
   tests/test_otp_demo_mode.py tests/test_concurrency.py tests/test_auth_production.py
-  tests/test_phase1_security.py tests/test_production_hardening.py` (requires
+  tests/test_phase1_security.py tests/test_production_hardening.py
+  tests/test_otp_core_contract.py` (requires
   the local DB at Alembic head).
 
 ## Running the test suite (local `restamp_test`)
@@ -142,7 +130,6 @@ RESTAMP_ENV=production                      # required; unset/unknown values are
 RESTAMP_DATABASE_URL=<real URL>             # the built-in placeholder is refused
 RESTAMP_JWT_SECRET=<random, 32+ chars>      # weak/placeholder secrets are refused
 RESTAMP_OTP_DISPLAY_MODE=0                  # "1" is refused; there is no override
-RESTAMP_OTP_TEST_DISPLAY=0                  # optional internal-tester display; see above
 RESTAMP_GOOGLE_DEV_MODE=0                   # "1" is refused
 RESTAMP_CORS_ORIGINS=https://restamp.in,https://www.restamp.in,https://restamp-alpha.vercel.app,https://restamp-app.vercel.app
 ```
@@ -155,6 +142,7 @@ RESTAMP_CORS_ORIGINS=https://restamp.in,https://www.restamp.in,https://restamp-a
   `RESTAMP_GOOGLE_CLIENT_ID`.
 - A development `RESTAMP_ENV` with a non-local database is refused (a
   deployment that forgot `RESTAMP_ENV=production`).
-- With no SMS provider connected, `POST /auth/otp/request` returns 503 in
-  production; OTP codes are never returned in responses.
+- No SMS provider is integrated, so `POST /auth/otp/request` returns 503 in
+  production and startup logs a warning. OTP codes are never returned in
+  production responses.
 - Tests: `pytest tests/test_production_hardening.py`.
