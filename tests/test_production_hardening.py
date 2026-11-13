@@ -1,53 +1,46 @@
-"""Production hardening C1–C3 (replaces the removed OTP production override).
+"""Production hardening C1–C3 (fixed-OTP edition).
 
-C1 — OTP codes never leave a production process:
-- RESTAMP_OTP_DISPLAY_IN_PRODUCTION no longer exists (setting, env var and
-  code path); display mode is honoured only in an explicit development env;
-- production startup refuses RESTAMP_OTP_DISPLAY_MODE=1; at request time the
-  service never returns a code and the auth router independently drops one;
-- with no SMS delivery connected, production fails closed (503, no code);
-- expiry, single use, attempt caps and request caps are unchanged.
+C1 — the fixed testing OTP never works in a production process:
+- one fixed code (app/services/otp.py TEST_OTP) is accepted only where
+  otp_display_permitted() is true (explicit development env or staging);
+- production startup refuses the obsolete RESTAMP_OTP_DISPLAY_MODE flag;
+  at request time the service fails closed (503 / verify=False) and the
+  auth router independently drops any code from a response;
+- the removed random-code pipeline (generation, hashing, expiry, attempt
+  caps, request caps, delivery seam) is gone: the corresponding settings
+  and code paths no longer exist.
 C2 — production CORS is exactly RESTAMP_CORS_ORIGINS: listed origins get
   credentialed CORS, everything else (localhost, LAN, look-alike or
   unlisted domains) gets none; invalid lists refuse startup; development
-  keeps its local defaults and localhost/LAN regex.
+  keeps its local defaults and localhost/LAN regex; staging refuses to
+  serve the public site while the testing OTP is active.
 C3 — RESTAMP_ENV is required and alone decides production; unsafe startup
   configurations are refused with messages naming settings, never values.
 No database writes persist (rollback-isolated client), no network, no SMS vendor.
 """
 import logging
-import re
-import time
 
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import config as config_module
-from app.config import is_production, is_valid_production_origin, otp_display_permitted, validate_security_config
-from app.services.otp import OTPService, otp_service
-from tests.conftest import captured_otp_code
+from app.config import is_production, is_staging, is_valid_production_origin, otp_display_permitted, validate_security_config
 
 APPROVED = "https://restamp-alpha.vercel.app,https://restamp-app.vercel.app,https://restamp.in,https://www.restamp.in"
-NOT_CONNECTED_503 = "OTP delivery is not configured. Try again later."
 STRONG = "z" * 40
 
 
 def _production(monkeypatch, **overrides) -> None:
     """A valid production configuration; overrides win."""
     s = config_module.settings
-    values = dict(ENV="production", JWT_SECRET=STRONG, OTP_DISPLAY_MODE=False, GOOGLE_DEV_MODE=False,
+    values = dict(ENV="production", JWT_SECRET=STRONG, GOOGLE_DEV_MODE=False,
                   GOOGLE_ENABLED=False, GOOGLE_CLIENT_ID="", CORS_ORIGINS=APPROVED)
     values.update(overrides)
     for key, value in values.items():
         monkeypatch.setattr(s, key, value)
 
 
-def _wrong(code: str) -> str:
-    return f"{(int(code) + 1) % 10**6:06d}"
-
-
-# --- C1: the production override is gone ----------------------------------------
+# --- C1: the fixed testing OTP is environment-gated ------------------------------
 
 def test_production_override_setting_no_longer_exists():
     assert not hasattr(config_module.settings, "OTP_DISPLAY_IN_PRODUCTION")
@@ -57,124 +50,47 @@ def test_production_override_setting_no_longer_exists():
     assert hits == []
 
 
-def test_display_only_permitted_in_explicit_development(monkeypatch):
+def test_display_only_permitted_in_explicit_development_or_staging(monkeypatch):
     for env, permitted in (("local", True), ("development", True), ("test", True), ("dev", True),
-                           ("production", False), ("prod", False), ("staging", False), ("", False), ("demo", False)):
+                           ("staging", True), ("production", False), ("prod", False),
+                           ("", False), ("demo", False)):
         monkeypatch.setattr(config_module.settings, "ENV", env)
         assert otp_display_permitted() is permitted, env
 
 
-def test_production_startup_refuses_display_mode(monkeypatch, caplog):
-    _production(monkeypatch, OTP_DISPLAY_MODE=True)
+def test_staging_is_production_classified_but_display_permitted(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ENV", "staging")
+    assert is_staging() is True and is_production() is True
+    assert otp_display_permitted() is True
+
+
+def test_production_startup_refuses_the_obsolete_display_flag(monkeypatch, caplog):
+    _production(monkeypatch)
+    monkeypatch.setenv("RESTAMP_OTP_DISPLAY_MODE", "1")
     with caplog.at_level(logging.WARNING, logger="restamp.config"):
         with pytest.raises(RuntimeError, match="RESTAMP_OTP_DISPLAY_MODE") as info:
             validate_security_config()
     assert STRONG not in str(info.value)
 
 
-def test_production_service_never_returns_a_code_even_with_display_flag(monkeypatch):
-    _production(monkeypatch, OTP_DISPLAY_MODE=True)  # forced on, bypassing startup
-    inbox = {}
-    svc = OTPService()
-    svc.delivery = lambda phone, code: inbox.__setitem__(phone, code)
-    assert svc.request_code("+919876543240") is None  # nothing returned...
-    assert re.fullmatch(r"\d{6}", inbox["+919876543240"])  # ...it went to delivery only
-
-
-@pytest.mark.parametrize("display", [True, False])
-def test_production_without_delivery_fails_closed(monkeypatch, display):
-    _production(monkeypatch, OTP_DISPLAY_MODE=display)
-    svc = OTPService()
-    with pytest.raises(HTTPException) as info:
-        svc.request_code("+919876543241")
-    assert info.value.status_code == 503 and info.value.detail == NOT_CONNECTED_503
-
-
-def test_production_endpoint_never_exposes_a_code(client, monkeypatch):
-    c, _ = client
-    _production(monkeypatch, OTP_DISPLAY_MODE=True)
-    phone = "+919876543242"
-    r = c.post("/auth/otp/request", json={"phone": phone})
-    assert r.status_code == 200 and set(r.json()) == {"message"}
-    code = captured_otp_code(phone)  # delivered through the (test) SMS seam only
-    assert code not in r.text
-
-
-def test_production_router_drops_a_code_even_if_the_service_returned_one(client, monkeypatch):
-    """Defence in depth: the router re-checks production on its own."""
-    c, _ = client
+def test_production_still_boots_without_the_obsolete_flag(monkeypatch):
     _production(monkeypatch)
-    monkeypatch.setattr(otp_service, "request_code", lambda phone, ip=None: "424242")
-    r = c.post("/auth/otp/request", json={"phone": "+919876543243"})
-    assert r.status_code == 200 and r.json() == {"message": "If the number is valid, an OTP was sent."}
-    assert "424242" not in r.text
+    monkeypatch.setenv("RESTAMP_OTP_DISPLAY_MODE", "0")
+    validate_security_config()
 
 
-def test_production_endpoint_fails_closed_without_delivery(client, monkeypatch):
-    c, _ = client
-    _production(monkeypatch, OTP_DISPLAY_MODE=True)
-    monkeypatch.setattr(otp_service, "delivery", None)
-    r = c.post("/auth/otp/request", json={"phone": "+919876543244"})
-    assert r.status_code == 503 and r.json() == {"detail": NOT_CONNECTED_503}
-    assert "debug_code" not in r.text
+def test_staging_startup_refuses_public_site_origins(monkeypatch):
+    _production(monkeypatch, ENV="staging")
+    with pytest.raises(RuntimeError, match="public site"):
+        validate_security_config()
 
 
-def test_development_display_mode_still_works(client, monkeypatch):
-    c, _ = client
-    monkeypatch.setattr(config_module.settings, "OTP_DISPLAY_MODE", True)
-    monkeypatch.setattr(otp_service, "delivery", None)
-    phone = "+919876543245"
-    r = c.post("/auth/otp/request", json={"phone": phone})
-    assert r.status_code == 200 and re.fullmatch(r"\d{6}", r.json()["debug_code"])
-    assert c.post("/auth/otp/verify", json={"phone": phone, "code": r.json()["debug_code"]}).status_code == 200
-
-
-def test_production_login_lifecycle_preserved(client, monkeypatch):
-    """Delivered code verifies once; wrong and reused codes are refused."""
-    c, _ = client
-    _production(monkeypatch)
-    phone = "+919876543246"
-    assert c.post("/auth/otp/request", json={"phone": phone}).status_code == 200
-    code = captured_otp_code(phone)
-    assert c.post("/auth/otp/verify", json={"phone": phone, "code": _wrong(code)}).status_code == 401
-    ok = c.post("/auth/otp/verify", json={"phone": phone, "code": code})
-    assert ok.status_code == 200 and ok.json()["access_token"]
-    assert c.post("/auth/otp/verify", json={"phone": phone, "code": code}).status_code == 401
-
-
-def test_production_expiry_attempt_and_request_caps_preserved(monkeypatch):
-    _production(monkeypatch)
-    monkeypatch.setattr(config_module.settings, "OTP_TTL_SECONDS", 300)
-    monkeypatch.setattr(config_module.settings, "OTP_MAX_VERIFY_ATTEMPTS", 3)
-    monkeypatch.setattr(config_module.settings, "OTP_MAX_REQUESTS_PER_HOUR", 2)
-    inbox = {}
-    svc = OTPService()
-    svc.delivery = lambda phone, code: inbox.__setitem__(phone, code)
-    # expiry
-    phone = "+919876543247"
-    svc.request_code(phone)
-    now = time.time()
-    monkeypatch.setattr(time, "time", lambda: now + 301)
-    assert svc.verify_code(phone, inbox[phone]) is False
-    monkeypatch.setattr(time, "time", lambda: now)
-    # attempt cap: the guess that reaches the cap blocks; the right code is then refused too
-    phone = "+919876543248"
-    svc.request_code(phone)
-    for _ in range(2):
-        assert svc.verify_code(phone, _wrong(inbox[phone])) is False
-    with pytest.raises(HTTPException) as info:
-        svc.verify_code(phone, _wrong(inbox[phone]))
-    assert info.value.status_code == 429
-    with pytest.raises(HTTPException) as info:
-        svc.verify_code(phone, inbox[phone])
-    assert info.value.status_code == 429
-    # request cap per phone
-    phone = "+919876543249"
-    svc.request_code(phone)
-    svc.request_code(phone)
-    with pytest.raises(HTTPException) as info:
-        svc.request_code(phone)
-    assert info.value.status_code == 429
+def test_staging_startup_passes_with_test_site_origins(monkeypatch, caplog):
+    _production(monkeypatch, ENV="staging",
+                CORS_ORIGINS="https://restamp-alpha.vercel.app,https://restamp-app.vercel.app")
+    with caplog.at_level(logging.WARNING, logger="restamp.config"):
+        validate_security_config()
+    assert "fixed testing OTP is active" in caplog.text
 
 
 # --- C2: production CORS ----------------------------------------------------------
@@ -283,7 +199,11 @@ def test_development_envs_with_local_db_start(monkeypatch, env):
 def test_production_is_decided_by_env_even_with_a_local_database(monkeypatch, env):
     """The single-server deployment (MySQL on localhost) is production when
     RESTAMP_ENV says so — the database host plays no part."""
-    _production(monkeypatch, ENV=env)
+    # Staging must never list the public site (the fixed testing OTP is
+    # active there), so its valid origin list is the test-site pair.
+    origins = ("https://restamp-alpha.vercel.app,https://restamp-app.vercel.app"
+               if env.lower() == "staging" else APPROVED)
+    _production(monkeypatch, ENV=env, CORS_ORIGINS=origins)
     monkeypatch.setattr(config_module.settings, "DATABASE_URL",
                         "mysql+pymysql://u:p@localhost/restamp?unix_socket=/var/run/mysqld/mysqld.sock")
     assert is_production() is True

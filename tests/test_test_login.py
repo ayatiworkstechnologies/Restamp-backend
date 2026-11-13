@@ -19,10 +19,11 @@ Verified here:
   depth); a stray `code` field in an OTP request body is schema-
   rejected — a six-digit guess can never authenticate or register an
   account, and the login path creates nothing;
-- production stays fail-closed exactly as before: RESTAMP_OTP_DISPLAY_
-  MODE=1 is refused at startup, the process boots cleanly with no
-  demo/suffix variables, and OTP requests fail closed (generic 503 or
-  the test delivery stand-in) — never a fabricated success.
+- production stays fail-closed exactly as before: the obsolete
+  RESTAMP_OTP_DISPLAY_MODE=1 flag is refused at startup, the process
+  boots cleanly with no demo/suffix variables, and production OTP
+  requests fail closed (generic 503) with every code rejected — never a
+  fabricated success.
 
 Endpoint tests use the rollback-isolated `client` fixture on the local
 restamp_dev database. No secrets are printed.
@@ -188,16 +189,14 @@ def test_verify_with_arbitrary_code_cannot_register_or_authenticate(
 
 
 def test_normal_otp_flow_still_authenticates(client):
-    """The real flow still works end-to-end on the OTP endpoints: request
-    (via the test SMS stand-in) → real verification → token → /auth/me.
-    This is the restored, supported login production will use once an SMS
-    provider is attached."""
+    """The simplified flow still works end-to-end on the OTP endpoints:
+    request (returns the fixed testing code as debug_code locally) →
+    verification → token → /auth/me."""
     c, _ = client
     phone = "+919850000007"
     req = c.post("/auth/otp/request", json={"phone": phone})
     assert req.status_code == 200
-    # The client fixture installs the TestSMSInbox delivery; read the code
-    # it captured (never printed), exactly as the other OTP suites do.
+    # The code the backend issues (TEST_OTP) — never printed anywhere.
     code = captured_otp_code(phone)
     ver = c.post("/auth/otp/verify", json={"phone": phone, "code": code})
     assert ver.status_code == 200
@@ -222,7 +221,6 @@ def _prod(monkeypatch, **overrides):
     monkeypatch.setattr(config_module.settings, "GOOGLE_CLIENT_ID", "")
     # Production requires explicit browser origins (RESTAMP_CORS_ORIGINS).
     monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "https://restamp.in")
-    monkeypatch.setattr(config_module.settings, "OTP_DISPLAY_MODE", False)
     monkeypatch.setattr(
         config_module.settings,
         "DATABASE_URL",
@@ -240,8 +238,9 @@ def test_production_boots_cleanly_without_demo_variables(monkeypatch):
 
 
 def test_production_display_mode_refusal_intact(monkeypatch):
-    """The display-mode production refusal is untouched by the removal."""
-    _prod(monkeypatch, OTP_DISPLAY_MODE=True)
+    """The obsolete display flag is still refused at production startup."""
+    _prod(monkeypatch)
+    monkeypatch.setenv("RESTAMP_OTP_DISPLAY_MODE", "1")
     with pytest.raises(RuntimeError) as e:
         validate_security_config()
     assert "RESTAMP_OTP_DISPLAY_MODE" in str(e.value)

@@ -48,7 +48,6 @@ from sqlalchemy.orm import Session
 from app import db as db_module
 from app.db import engine
 from app.main import create_app
-from app.services.otp import otp_service
 
 
 # --- Disposable-database safety guard (test-only) ---------------------------
@@ -184,7 +183,6 @@ def _guard_test_database():
 
 @pytest.fixture()
 def client():
-    otp_service.reset()
     conn = engine.connect()
     trans = conn.begin()
     # Join the test Session into the outer transaction via SAVEPOINTs
@@ -211,12 +209,6 @@ def client():
     app = create_app()
     app.dependency_overrides[db_module.get_db] = _override
     with TestClient(app) as c:
-        # Production code ships with NO OTP delivery connected (requests fail
-        # closed). Install the TEST-ONLY recording stand-in for the phone's
-        # SMS inbox as the delivery seam, so tests can read the delivered
-        # code the way a real phone would — at the delivery boundary, never
-        # from an API response.
-        otp_service.delivery = TestSMSInbox()
         # Helpers that only receive the client allocate pincodes on this
         # test's session (fresh_pincode).
         c.test_session = session
@@ -224,36 +216,20 @@ def client():
     session.close()
     trans.rollback()
     conn.close()
-    otp_service.delivery = None
-    otp_service.reset()
-
-
-class TestSMSInbox:
-    """TEST-ONLY delivery stand-in for the phone's SMS inbox (never app code).
-
-    Production has no delivery connected; tests install this callable as
-    `otp_service.delivery` to emulate a delivered SMS. Codes leave the server
-    exclusively through the delivery boundary — API responses never contain
-    them. Tests read the delivered code via captured_otp_code(), emulating
-    the user reading their SMS.
-    """
-
-    def __init__(self) -> None:
-        self.codes: dict[str, str] = {}
-
-    def __call__(self, phone: str, code: str) -> None:
-        self.codes[phone] = code
 
 
 def captured_otp_code(phone: str) -> str:
-    """The OTP most recently delivered to `phone` by the test SMS inbox."""
-    delivery = otp_service.delivery
-    code = getattr(delivery, "codes", {}).get(phone)
-    assert code, (
-        f"no captured OTP code for {phone}: the client fixture must have "
-        "installed the TestSMSInbox delivery before the OTP request"
-    )
-    return code
+    """The code the backend issues for `phone` under the simplified OTP.
+
+    One fixed testing code (app/services.otp.TEST_OTP) exists for every
+    number in local/staging, so the value does not depend on the request;
+    keeping this helper preserves the call sites that emulate "the user
+    reads their SMS". Tests that assert the display contract instead read
+    `debug_code` straight from the /auth/otp/request response.
+    """
+    from app.services.otp import TEST_OTP
+
+    return TEST_OTP
 
 
 def auth_header(token: str) -> dict:
@@ -263,8 +239,9 @@ def auth_header(token: str) -> dict:
 def register_phone(client, phone: str) -> dict:
     """Full OTP request+verify cycle; returns the TokenOut body.
 
-    The request response discloses no code ({message} only); the code comes
-    from the test SMS inbox installed by the client fixture.
+    The local request response carries the fixed testing code as
+    `debug_code`; the code used for verification comes from
+    captured_otp_code() (the same TEST_OTP), so both paths stay covered.
     """
     r = client.post("/auth/otp/request", json={"phone": phone})
     assert r.status_code == 200, r.text

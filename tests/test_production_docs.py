@@ -4,26 +4,28 @@
   served (standard FastAPI docs); the schema lists the API routes.
 - Production without the opt-in: all three stay 404 (previous behaviour).
 - Enabling docs changes no access rule: protected endpoints still answer
-  401/403 without valid credentials, OTP still never returns a code, and the
-  schema contains no secret.
+  401/403 without valid credentials, OTP still never returns a code in
+  production (the request endpoint fails closed 503), and the schema
+  contains no secret.
 No database writes (requests that reach the DB use the rollback client).
 """
 import pytest
 from fastapi.testclient import TestClient
 
 from app import config as config_module
-from app.services.otp import otp_service
 from tests.conftest import auth_header, register_phone
 
 STRONG = "z" * 40
 DOC_PATHS = ("/docs", "/redoc", "/openapi.json")
 
 
-def _production(monkeypatch, docs: bool) -> None:
+def _production(monkeypatch, docs: bool, **overrides) -> None:
     s = config_module.settings
-    for key, value in dict(ENV="production", JWT_SECRET=STRONG, OTP_DISPLAY_MODE=False, GOOGLE_DEV_MODE=False,
-                           GOOGLE_ENABLED=False, GOOGLE_CLIENT_ID="", CORS_ORIGINS="https://restamp.in",
-                           DOCS_ENABLED=docs).items():
+    values = dict(ENV="production", JWT_SECRET=STRONG, GOOGLE_DEV_MODE=False,
+                  GOOGLE_ENABLED=False, GOOGLE_CLIENT_ID="", CORS_ORIGINS="https://restamp.in",
+                  DOCS_ENABLED=docs)
+    values.update(overrides)
+    for key, value in values.items():
         monkeypatch.setattr(s, key, value)
 
 
@@ -82,10 +84,18 @@ def test_protected_endpoints_still_require_authentication(monkeypatch, method, p
 
 
 def test_role_rules_unchanged_with_docs_enabled(client, monkeypatch):
-    """A signed-in buyer is still refused owner/admin endpoints."""
+    """A signed-in buyer is still refused owner/admin endpoints.
+
+    The session is issued while the process is local (phone OTP login is
+    fail-closed 503 in production, so it can never mint a token there) and
+    stays valid after the production flip because the JWT secret is the
+    same the whole test: role authorization is unchanged by docs or env.
+    """
     c, _ = client
-    _production(monkeypatch, docs=True)  # before login: tokens are signed with the production secret
     h = auth_header(register_phone(c, "+919876543290")["access_token"])
+    # Same JWT secret throughout, so the local-issued token stays valid
+    # after the production flip (only the docs/env behaviour changes).
+    _production(monkeypatch, docs=True, JWT_SECRET="phase4-test-secret")
     assert c.get("/owner/listings", headers=h).status_code == 403
     assert c.get("/admin/ping", headers=h).status_code in (403, 404)
     assert c.get("/buyer/saved", headers=h).status_code == 200
@@ -94,9 +104,8 @@ def test_role_rules_unchanged_with_docs_enabled(client, monkeypatch):
 def test_otp_still_never_returns_a_code_in_production(client, monkeypatch):
     c, _ = client
     _production(monkeypatch, docs=True)
-    monkeypatch.setattr(otp_service, "delivery", None)
     r = c.post("/auth/otp/request", json={"phone": "+919876543291"})
-    assert r.status_code == 503 and "debug_code" not in r.text
+    assert r.status_code == 503 and "debug_code" not in r.text and "349086" not in r.text
 
 
 def test_local_development_docs_unchanged(monkeypatch):

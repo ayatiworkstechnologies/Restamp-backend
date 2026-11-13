@@ -153,7 +153,6 @@ def test_production_with_dev_prefix_warns_not_raises(monkeypatch, caplog):
     monkeypatch.setattr(config_module.settings, "JWT_SECRET", "z" * 40)
     monkeypatch.setattr(config_module.settings, "GOOGLE_DEV_MODE", False)
     monkeypatch.setattr(config_module.settings, "GOOGLE_ENABLED", False)
-    monkeypatch.setattr(config_module.settings, "OTP_DISPLAY_MODE", False)
     monkeypatch.setattr(config_module.settings, "CORS_ORIGINS", "https://app.example.com")
     monkeypatch.setattr(config_module.settings, "CLOUDINARY_CLOUD_NAME", CLOUD)
     monkeypatch.setattr(config_module.settings, "DEV_MEDIA_URL_PREFIXES", "https://secret-dev-host.test/")

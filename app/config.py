@@ -48,51 +48,17 @@ class Settings:
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = _get_int("RESTAMP_JWT_EXPIRE_MINUTES", 30)
 
-    # Phone OTP behaviour.
-    OTP_LENGTH: int = 6
-    OTP_TTL_SECONDS: int = _get_int("RESTAMP_OTP_TTL_SECONDS", 300)
-    # Code requests per phone per ROLLING hour. Rejects only the excess
-    # request (no block); a successful login clears the phone's window, so
-    # re-logins after token expiry never accumulate into a lockout.
-    OTP_MAX_REQUESTS_PER_HOUR: int = _get_int("RESTAMP_OTP_MAX_REQUESTS_PER_HOUR", 10)
-    # Wrong guesses allowed against ONE code before it is invalidated.
-    OTP_MAX_VERIFY_ATTEMPTS: int = _get_int("RESTAMP_OTP_MAX_VERIFY_ATTEMPTS", 5)
-    # Fixed block after too many wrong codes (per code or per IP). Attempts
-    # made while blocked are refused without extending it.
-    OTP_BLOCK_SECONDS: int = _get_int("RESTAMP_OTP_BLOCK_SECONDS", 600)
-    # NOTE — SMS delivery: no SMS provider is integrated (see
-    # app/services/otp.py). With no delivery attached to OTPService.delivery,
-    # OTP requests fail closed with a generic 503 (production also logs a
-    # startup warning). There are no SMS environment variables.
-    # LOCAL-DEVELOPMENT DISPLAY — the ONLY way an OTP is ever returned in a
-    # response. When this is "1"
-    # in a development environment (RESTAMP_ENV=local/development/dev/test),
-    # the OTP request response INCLUDES the backend-selected code
-    # ("debug_code") so developers can log in without SMS delivery; the
-    # delivery seam is bypassed while the mode is active and no SMS is sent.
-    # Production can never show a code: validate_security_config() refuses
-    # production startup with this flag on, the OTP service re-checks
-    # is_production() on every request, and the auth router drops any code
-    # in production. There is no production override.
-    OTP_DISPLAY_MODE: bool = _get("RESTAMP_OTP_DISPLAY_MODE", "0") == "1"
-    # Per-IP abuse protection (in-memory, per process — see otp.py).
-    # These bound total OTP request/verify-failure volume from a single
-    # client IP across all phones, so rotating phones does not bypass
-    # the per-phone caps. Tunable via env; defaults allow normal
-    # NAT sharing while stopping bulk abuse.
-    OTP_MAX_REQUESTS_PER_HOUR_PER_IP: int = _get_int(
-        "RESTAMP_OTP_MAX_REQUESTS_PER_HOUR_PER_IP", 60
-    )
-    OTP_MAX_VERIFY_ATTEMPTS_PER_IP: int = _get_int(
-        "RESTAMP_OTP_MAX_VERIFY_ATTEMPTS_PER_IP", 30
-    )
-    # When "1", the OTP per-IP throttling in app/routers/auth.py derives the
-    # client IP from the rightmost X-Forwarded-For entry added by the platform
-    # proxy (e.g. Render), instead of treating every client as the proxy IP.
-    # Default "0" keeps today's socket-peer behavior (recommended wherever
-    # requests do NOT arrive through a trusted reverse proxy; clients could
-    # otherwise fake the header and evade per-IP caps).
-    TRUST_PROXY: bool = _get("RESTAMP_TRUST_PROXY", "0") == "1"
+    # Phone OTP: the simplified login uses ONE fixed testing code
+    # (app/services/otp.py TEST_OTP = "349086"), accepted only where
+    # otp_display_permitted() is true (local/development/dev/test or
+    # staging) and returned by /auth/otp/request as `debug_code` there.
+    # Production/prod fails closed at request time (503 on the request
+    # endpoint, every verify rejected). There are NO OTP environment
+    # variables: the removed RESTAMP_OTP_TTL_SECONDS/_MAX_*_/*_BLOCK_*
+    # rate-limit settings and RESTAMP_OTP_DISPLAY_MODE are not read
+    # anywhere, and validate_security_config refuses a production boot
+    # with the obsolete display flag still set (a leftover testing
+    # configuration must be cleaned up, not silently ignored).
 
     # Google verification. Real verification needs GOOGLE_CLIENT_ID and a real
     # verifier; dev mode accepts only synthetic "dev:<subject>" tokens.
@@ -166,6 +132,15 @@ settings = Settings()
 _log = logging.getLogger("restamp.config")
 
 _PROD_ENVS = {"production", "prod", "staging"}
+# The one production-classified environment where the fixed testing OTP is
+# still usable (testers log in with the published code; every other
+# production hardening rule applies unchanged).
+_STAGING_ENV = "staging"
+# The public website. A staging backend must never serve it: the fixed
+# testing OTP is always active in staging, so the site pointing at a
+# staging backend would let anyone log in as any phone number
+# (validate_security_config refuses that combination).
+_PUBLIC_SITE_ORIGINS = {"https://restamp.in", "https://www.restamp.in"}
 _DEV_ENVS = {"local", "development", "dev", "test"}
 # The built-in placeholder DATABASE_URL (never valid outside a laptop).
 _DEFAULT_DATABASE_URL = "mysql+pymysql://user:pass@localhost/restamp"
@@ -233,11 +208,19 @@ def area_seeding_enabled() -> bool:
     return bool(settings.AREA_SEEDING_ENABLED) and not is_production()
 
 
+def is_staging() -> bool:
+    """True only for RESTAMP_ENV=staging (production-classified otherwise)."""
+    return _env() == _STAGING_ENV
+
+
 def otp_display_permitted() -> bool:
-    """Whether the OTP display mode may be active in this process: only in
-    an explicit development environment, never in production (no override).
-    Re-evaluated per request by the OTP service and the auth router."""
-    return is_development()
+    """Whether the fixed testing OTP may be used in this process: only in
+    an explicit development environment or RESTAMP_ENV=staging, never for
+    production/prod (no override, no environment variable can widen it).
+    Re-evaluated per request by the OTP service and the auth router; it is
+    the single environment gate for both returning the code (`debug_code`)
+    and accepting it at verification."""
+    return is_development() or is_staging()
 
 
 def is_jwt_secret_strong(secret: str | None) -> bool:
@@ -309,15 +292,21 @@ def validate_security_config() -> None:
     Production (RESTAMP_ENV=production/prod/staging) also refuses:
     - RESTAMP_DATABASE_URL unset (the built-in placeholder);
     - a missing, weak (<32 chars) or placeholder RESTAMP_JWT_SECRET;
-    - RESTAMP_OTP_DISPLAY_MODE=1 (OTP codes are never returned in
-      production; there is no override);
+    - the obsolete RESTAMP_OTP_DISPLAY_MODE=1 (the flag was removed with
+      the simplified OTP login; a production environment still carrying it
+      is a leftover testing configuration);
     - RESTAMP_GOOGLE_DEV_MODE=1, or RESTAMP_GOOGLE_ENABLED=1 without a real
       RESTAMP_GOOGLE_CLIENT_ID;
     - RESTAMP_CORS_ORIGINS empty, containing "*", or containing anything
       other than exact public https origins (no localhost/LAN, no paths).
+    Staging additionally refuses RESTAMP_CORS_ORIGINS listing the public
+    site (https://restamp.in, https://www.restamp.in): the fixed testing
+    OTP is always active there, so a staging backend must never serve the
+    public site; staging also logs a startup warning that the testing OTP
+    is active.
     SMS delivery is not a startup failure (that would take the whole API
-    down): production logs a warning that OTP login is unavailable, and OTP
-    requests fail closed with a generic 503 at request time.
+    down): production logs a warning that OTP login is unavailable, and
+    OTP requests fail closed with a generic 503 at request time.
     Messages name only the setting, never its value.
     """
     env = _env()
@@ -357,11 +346,18 @@ def validate_security_config() -> None:
             "Insecure production configuration: RESTAMP_JWT_SECRET must be "
             "set to a strong random value at least 32 characters long."
         )
-    if settings.OTP_DISPLAY_MODE:
+    if os.environ.get("RESTAMP_OTP_DISPLAY_MODE", "").strip() == "1":
+        # Obsolete flag from the removed display-mode OTP: it is inert
+        # (nothing reads it), but a production environment still carrying
+        # it signals a leftover testing configuration. Refuse to boot so
+        # the testing mechanism can never be assumed active on a real
+        # deployment; the fixed OTP is environment-gated (local/staging)
+        # and has no production switch.
         raise RuntimeError(
-            "Insecure production configuration: RESTAMP_OTP_DISPLAY_MODE must "
-            "be '0' in production (OTP codes must never be returned in API "
-            "responses)."
+            "Insecure production configuration: RESTAMP_OTP_DISPLAY_MODE was "
+            "removed with the simplified OTP login. Delete it from the "
+            "environment; the fixed testing OTP is environment-gated "
+            "(local/staging only) and cannot be switched on in production."
         )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
@@ -389,6 +385,24 @@ def validate_security_config() -> None:
             "Insecure production configuration: RESTAMP_CORS_ORIGINS must contain "
             "only exact public https origins (scheme and host, no path, no "
             "wildcard, no localhost or private-network hosts)."
+        )
+    if is_staging():
+        # The fixed testing OTP is ALWAYS active in staging (there is no
+        # flag): anyone who can reach this backend can log in as any phone
+        # number with the published testing code. A staging process must
+        # therefore never serve the public site — refuse that combination
+        # and say so loudly at startup.
+        if _PUBLIC_SITE_ORIGINS & set(cors):
+            raise RuntimeError(
+                "Insecure staging configuration: RESTAMP_CORS_ORIGINS must "
+                "not list the public site (https://restamp.in or "
+                "https://www.restamp.in) while the fixed testing OTP is "
+                "active. Point the public site at a production backend."
+            )
+        _log.warning(
+            "RESTAMP_ENV=staging: the fixed testing OTP is active — every "
+            "phone number can log in with the published testing code. Never "
+            "point real users at this deployment."
         )
     # Photo-upload storage: NOT a hard failure (that would be a behavior
     # change requiring an explicit product decision). When production has no

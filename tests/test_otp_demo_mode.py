@@ -1,30 +1,23 @@
 """No-demo regression lock: the demo OTP login and the OTP_DEBUG disclosure
-path are fully removed from the codebase. Authentication is real-SMS OTP
-only — a code is generated server-side with Python `secrets`, delivered
-only through the (not-yet-connected) delivery seam, and in EVERY shipped
-configuration the code is never returned, logged, or displayed. The single
-exception is the explicitly restricted internal-testing display mode
-(RESTAMP_OTP_DISPLAY_MODE="1" in a non-production-classified process;
-impossible in production), which is specified and tested separately in
-tests/test_otp_display_mode.py — there disclosure is part of the
-deliberate, gated internal-testing contract, not a debug/demo fallback.
+path are fully removed from the codebase, and the simplified login has one
+fixed testing code only.
 
-Guards:
+Authentication is the fixed testing OTP (app/services/otp.py TEST_OTP),
+accepted only where otp_display_permitted() is true (local/development/
+dev/test or staging). Guards verified here:
+
 - RESTAMP_ENV=demo is no longer a mode: startup refuses it unconditionally
   (regardless of environment classification, at the config gate AND at the
   real lifespan startup path);
 - the removed symbols cannot return implicitly: no OTP_DEBUG /
   OTP_DEMO_MODE / OTP_DEMO_PHONES settings, no DEMO_OTPS /
-  demo_login_active in the service;
-- the ordinary strict path is the ONLY path: the request response is
-  exactly {message}, the provider-delivered code verifies consumed-once,
-  and the former predefined demo codes are never accepted — even with the
-  legacy RESTAMP_OTP_* environment variables set (they are inert now).
-  (RESTAMP_OTP_DISPLAY_MODE stays off throughout this suite; the display
-  contract is exercised in tests/test_otp_display_mode.py.)
+  demo_login_active in the service, no OTPService class or delivery seam;
+- the fixed-OTP path is the ONLY path: local/staging accepts exactly the
+  fixed code, and the former predefined demo codes are never accepted —
+  even with the legacy RESTAMP_OTP_* environment variables set (they are
+  inert now).
 
-No database writes; no network calls (the delivery stand-in is a test-only
-recording hook; no real SMS is sent).
+No database writes persist; no network calls, no SMS.
 """
 import asyncio
 
@@ -34,17 +27,17 @@ from fastapi import FastAPI
 from app import config as config_module
 from app.config import is_production, validate_security_config
 from app.services import otp as otp_module
-from app.services.otp import OTPService
-from tests.conftest import TestSMSInbox, captured_otp_code
+from app.services.otp import TEST_OTP
+from tests.conftest import captured_otp_code
 
 LEGACY_DEMO_CODES = ("297569", "109745", "583214")  # former DEMO_OTPS members
-REQUEST_200 = {"message": "If the number is valid, an OTP was sent."}
+REQUEST_OK = {"message": "If the number is valid, an OTP was sent.", "debug_code": TEST_OTP}
 
 
 # --- the removed machinery is gone -------------------------------------------
 
 def test_removed_symbols_and_settings_are_absent():
-    for name in ("DEMO_OTPS", "demo_login_active"):
+    for name in ("DEMO_OTPS", "demo_login_active", "OTPService"):
         assert not hasattr(otp_module, name), name
     for name in (
         "OTP_DEBUG", "OTP_DEMO_MODE", "OTP_DEMO_PHONES",
@@ -100,19 +93,12 @@ def test_env_demo_refused_at_real_lifespan_startup(monkeypatch):
         asyncio.run(_drain())
 
 
-# --- the strict path is the ONLY path ------------------------------------------
+# --- the fixed-OTP path is the ONLY path ----------------------------------------
 
-def test_service_never_returns_codes_and_legacy_codes_fail():
-    svc = OTPService()
-    inbox = TestSMSInbox()
-    svc.delivery = inbox
-    phone = "+916550009002"
-    assert svc.request_code(phone) is None  # codes are never returned...
-    code = inbox.codes[phone]  # ...but are delivered via the provider (SMS)
+def test_fixed_code_verifies_and_legacy_codes_fail():
+    assert otp_module.verify_code("+916550009002", TEST_OTP) is True
     for legacy in LEGACY_DEMO_CODES:
-        assert svc.verify_code(phone, legacy) is False
-    assert svc.verify_code(phone, code) is True  # only the delivered code
-    assert svc.verify_code(phone, code) is False  # consumed once
+        assert otp_module.verify_code("+916550009002", legacy) is False
 
 
 def test_legacy_env_flags_are_inert_and_contract_preserved(client, monkeypatch):
@@ -125,8 +111,8 @@ def test_legacy_env_flags_are_inert_and_contract_preserved(client, monkeypatch):
     phone = "+916550009001"
     r = c.post("/auth/otp/request", json={"phone": phone})
     assert r.status_code == 200, r.text
-    assert r.json() == REQUEST_200  # NO debug_code, ever
-    for attempt, wrong in enumerate(("000000", *LEGACY_DEMO_CODES), 1):
+    assert r.json() == REQUEST_OK  # exactly {message, debug_code: fixed}
+    for wrong in ("000000", *LEGACY_DEMO_CODES):
         bad = c.post("/auth/otp/verify", json={"phone": phone, "code": wrong})
         assert bad.status_code == 401, bad.text
     ok = c.post("/auth/otp/verify", json={"phone": phone, "code": captured_otp_code(phone)})

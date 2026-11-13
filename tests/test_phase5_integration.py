@@ -10,7 +10,6 @@ import time
 import pytest
 from sqlalchemy import text
 
-from app.config import settings
 from app.db import engine
 from tests.conftest import auth_header, captured_otp_code, make_postcode, register_phone
 from tests.frontend_client import ApiError, FrontendClient, map_error
@@ -69,28 +68,19 @@ def test_frontend_http_error_mapping(fx):
 # --- Step 4: authentication E2E --------------------------------------------------
 
 
-def test_e2e_otp_full_path_with_expiry_and_limits(fx):
-    fc, session = fx
+def test_e2e_otp_full_path(fx):
+    """Request → fixed code → verify → session, plus wrong-code rejection."""
+    fc, _ = fx
     phone = "+917000000003"
     fc.request_otp(phone)
     code = captured_otp_code(phone)
     assert fc.login_phone(phone, code)["role"] == "BUYER"
-    # Expired OTP is rejected (white-box expiry, local test only).
-    from app.services.otp import otp_service
-
-    fc.request_otp("+917000000004")
-    code2 = captured_otp_code("+917000000004")
-    otp_service._codes["+917000000004"].expires_at = 0.0
+    # Wrong codes are rejected (401 → login screen); the right code keeps
+    # working (no consumed-once state, no lockout counters).
     with pytest.raises(ApiError) as e:
-        fc.login_phone("+917000000004", code2)
+        fc.login_phone(phone, "000000")
     assert e.value.kind == "login"
-    # Abuse path: request flood is throttled.
-    flood = "+917000000005"
-    for _ in range(settings.OTP_MAX_REQUESTS_PER_HOUR):
-        fc.request_otp(flood)
-    with pytest.raises(ApiError) as e:
-        fc.request_otp(flood)
-    assert e.value.kind == "retry_later"
+    assert fc.login_phone(phone, code)["user_id"]
 
 
 def test_e2e_tampered_token_rejected(fx):
@@ -333,9 +323,12 @@ def test_phase7_e2e_buyer_profile_owner_flow(client):
     c, session = client
     phone = "+918000000001"
 
-    # 1. New user registration via OTP (response is message-only: no code)
+    # 1. New user registration via OTP (local contract: message + fixed code)
     code_req = c.post("/auth/otp/request", json={"phone": phone}).json()
-    assert code_req == {"message": "If the number is valid, an OTP was sent."}
+    assert code_req == {
+        "message": "If the number is valid, an OTP was sent.",
+        "debug_code": "349086",
+    }
 
     tok = c.post("/auth/otp/verify", json={"phone": phone, "code": captured_otp_code(phone)}).json()
     token = tok["access_token"]

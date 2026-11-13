@@ -68,16 +68,17 @@ async def lifespan(app: FastAPI):
     except RuntimeError as exc:
         log.error("Insecure production configuration: %s", exc)
         raise
-    # OTP delivery: no SMS provider is integrated (see app/services/otp.py).
-    # OTP requests fail closed at request time with a generic 503 while
-    # OTPService.delivery is empty. Production says so loudly at startup
-    # instead of failing the whole API (browsing does not need OTP).
-    from .services.otp import otp_service
-
-    if is_production() and otp_service.delivery is None:
+    # Phone OTP: no SMS provider is integrated, and the fixed testing OTP
+    # (app/services/otp.py TEST_OTP) is environment-gated to local/staging.
+    # Production therefore has no working phone-OTP login: the request
+    # endpoint fails closed with a generic 503 and every verify is
+    # rejected. Say so loudly at startup instead of failing the whole API
+    # (browsing does not need OTP).
+    if is_production():
         log.warning(
-            "OTP SMS delivery is not configured: phone OTP login is unavailable "
-            "in production and POST /auth/otp/request returns 503."
+            "Phone OTP login is unavailable in production (no SMS provider "
+            "is integrated): POST /auth/otp/request returns 503 and every "
+            "code is rejected."
         )
     if is_production() and settings.DOCS_ENABLED:
         log.warning("RESTAMP_DOCS_ENABLED=1: /docs, /redoc and /openapi.json are public in production.")

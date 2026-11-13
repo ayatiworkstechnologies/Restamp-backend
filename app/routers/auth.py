@@ -5,56 +5,19 @@ successful verification (standard OTP registration), default role BUYER.
 Google: unknown identities NEVER auto-create (404 GOOGLE_UNKNOWN); the client
 must onboard through an approved flow before the Google identity can be linked.
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
-from ..config import is_production, settings
+from ..config import otp_display_permitted
 from ..db import get_db
 from ..models import AuthIdentity
 from ..security import create_access_token, ensure_active_user, get_current_user
 from ..services import google as google_svc
 from ..services import users_roles
-from ..services.otp import otp_service
+from ..services import otp as otp_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-def _client_ip(request: Request | None) -> str | None:
-    """Best-effort client IP for per-IP OTP throttling (never logged).
-
-    Default (RESTAMP_TRUST_PROXY unset or "0"): the socket peer host — the
-    same value this helper always returned. When RESTAMP_TRUST_PROXY=1
-    (deployed behind the platform's own reverse proxy, e.g. Render) and the
-    peer is NOT loopback, the peer is treated as a trusted proxy and the
-    RIGHTMOST X-Forwarded-For entry becomes the client IP: it is the only
-    value the trusted hop appended, while earlier entries are
-    client-controlled and deliberately ignored. A missing, empty, or
-    malformed header falls back to the peer, and the header is ignored
-    entirely for loopback peers so local dev behavior is unchanged. The
-    derived value is used only as an in-memory rate-limit comparison key;
-    it is never logged.
-    """
-    try:
-        if request is None:
-            return None
-        peer = None
-        if request.client is not None:
-            peer = (request.client.host or "").strip() or None
-        if peer is None:
-            return None
-        if (
-            not settings.TRUST_PROXY
-            or peer in ("127.0.0.1", "::1", "localhost")
-        ):
-            return peer
-        forwarded = (request.headers.get("x-forwarded-for") or "").strip()
-        if not forwarded:
-            return peer
-        candidate = forwarded.split(",")[-1].strip()
-        return candidate or peer
-    except Exception:
-        return None
 
 
 def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
@@ -69,32 +32,41 @@ def _token_for(db: Session, user_id: int) -> schemas.TokenOut:
 
 
 @router.post("/otp/request")
-def otp_request(body: schemas.OTPRequest, request: Request):
-    """Request an OTP. Indian mobiles only schemas gate; never logged.
+def otp_request(body: schemas.OTPRequest):
+    """Request the login OTP. Indian mobiles only (schemas gate); never logged.
 
-    Normal mode: no code leaves the server — delivery happens only through
-    the (currently unconnected) delivery seam, and the response shape is
-    constant ({message}). Local-development display mode (see
-    app/services/otp.py _display_active: env flag + explicit development
-    RESTAMP_ENV, refused at production startup): the backend-selected code
-    is added to the response so the frontend can display it. Production
-    never returns a code.
+    The simplified flow has one fixed testing code (app/services/otp.py
+    TEST_OTP): local/staging processes return it in the response as
+    `debug_code` so the login screen can show it; production/prod (and
+    unset/unknown RESTAMP_ENV) fail closed with a generic 503 before
+    anything else, so no OTP is ever returned there. The display guard is
+    re-checked here independently of the service: a production process
+    never puts a code in a response, whatever the service returned.
     """
-    ip = _client_ip(request)
-    code = otp_service.request_code(body.phone, ip=ip)
+    code = otp_service.request_code(body.phone)
     resp = {"message": "If the number is valid, an OTP was sent."}
-    # Second, independent guard: a production process never puts a code in
-    # a response, whatever the OTP service returned.
-    if code is not None and not is_production():
+    # Second, independent guard: only a local/staging process puts a code
+    # in a response, whatever the OTP service returned.
+    if code is not None and otp_display_permitted():
         resp["debug_code"] = code
     return resp
 
 
 @router.post("/otp/verify", response_model=schemas.TokenOut)
-def otp_verify(body: schemas.OTPVerify, request: Request, db: Session = Depends(get_db)):
-    if not otp_service.verify_code(body.phone, body.code, ip=_client_ip(request)):
+def otp_verify(body: schemas.OTPVerify, db: Session = Depends(get_db)):
+    """Verify the code and authenticate the requested phone account.
+
+    The fixed testing OTP is accepted only in local/staging; every other
+    code — and every code at all in production — is a 401 with the static
+    detail (no state, no counters, no lockout). On success the account
+    resolution is unchanged: the existing user for the phone identity is
+    authenticated, a first-time number is registered (BUYER, display name
+    = phone), and the normal JWT/session pipeline issues the token
+    (ensure_active_user + role lookup included).
+    """
+    if not otp_service.verify_code(body.phone, body.code):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired code"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid code"
         )
     user = users_roles.find_user_by_identity(db, "phone", body.phone)
     if user is None:

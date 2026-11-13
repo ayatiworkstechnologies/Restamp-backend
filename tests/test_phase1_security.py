@@ -1,10 +1,11 @@
-"""Phase 1 security regression: JWT/dev-flag guards, OTP per-IP caps, POST /users.
+"""Phase 1 security regression: JWT/dev-flag guards, POST /users, OTP contract.
 
 Unit tests (no DB) run first and never touch shared data. Client tests use
-the rollback-isolated `client` fixture on local restamp_dev only.
+the rollback-isolated `client` fixture on local restamp_dev only. The OTP
+per-IP caps and the proxy client-IP helper were removed with the simplified
+OTP (no per-IP state exists anymore).
 """
 import pytest
-from fastapi import HTTPException, Request
 from sqlalchemy import text
 
 from app import config as config_module
@@ -14,9 +15,7 @@ from app.config import (
     is_production,
     validate_security_config,
 )
-from app.routers.auth import _client_ip
-from app.services.otp import OTPService
-from tests.conftest import TestSMSInbox, auth_header, register_phone
+from tests.conftest import auth_header, register_phone
 
 
 # --- Unit: production detection (no DB) -------------------------------------
@@ -96,69 +95,6 @@ def test_validate_errors_never_contain_secret(monkeypatch):
     assert sentinel[:10] not in str(info.value)
 
 
-# --- Unit: OTP per-phone preserved + per-IP added (no DB) -------------------
-
-def test_otp_per_phone_cap_preserved():
-    svc = OTPService()
-    svc.delivery = TestSMSInbox()
-    phone = "+916900000101"
-    for _ in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR):
-        svc.request_code(phone)
-    with pytest.raises(HTTPException) as e:
-        svc.request_code(phone)
-    assert e.value.status_code == 429
-
-
-def test_otp_per_ip_request_cap_across_phones():
-    svc = OTPService()
-    svc.delivery = TestSMSInbox()
-    ip = "10.9.9.1"
-    for i in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR_PER_IP):
-        svc.request_code(f"+91690010{i:04d}", ip=ip)
-    with pytest.raises(HTTPException) as e:
-        svc.request_code("+916900999999", ip=ip)
-    assert e.value.status_code == 429
-    # Different IP unaffected.
-    svc.request_code("+916900999998", ip="10.9.9.2")
-
-
-def test_otp_phone_rotation_still_bounded_by_ip(monkeypatch):
-    svc = OTPService()
-    svc.delivery = TestSMSInbox()
-    monkeypatch.setattr(config_module.settings, "OTP_MAX_VERIFY_ATTEMPTS_PER_IP", 5)
-    ip = "10.9.9.3"
-    tripped = False
-    for i in range(6):
-        phone = f"+91690020{i:04d}"
-        svc.request_code(phone, ip=ip)
-        try:
-            svc.verify_code(phone, "000000", ip=ip)
-        except HTTPException as e:
-            assert e.status_code == 429
-            tripped = True
-            break
-    assert tripped is True
-
-
-def test_otp_reset_clears_ip_state():
-    svc = OTPService()
-    svc.delivery = TestSMSInbox()
-    ip = "10.9.9.4"
-    for i in range(config_module.settings.OTP_MAX_REQUESTS_PER_HOUR_PER_IP):
-        svc.request_code(f"+91690030{i:04d}", ip=ip)
-    svc.reset()
-    svc.request_code("+916900999997", ip=ip)  # no longer blocked
-
-
-def test_otp_backward_compat_no_ip():
-    svc = OTPService()
-    inbox = TestSMSInbox()
-    svc.delivery = inbox
-    assert svc.request_code("+916900000102") is None  # codes are never returned
-    code = inbox.codes["+916900000102"]  # read the SMS via the test inbox
-    assert svc.verify_code("+916900000102", code) is True
-
-
 # --- Integration: POST /users disabled, OTP + profile preserved (restamp_dev rollback) ---
 
 def test_post_users_disabled_no_creation(client):
@@ -196,8 +132,12 @@ def test_otp_request_verify_contract_preserved(client):
     c, _ = client
     r = c.post("/auth/otp/request", json={"phone": "+916000000303"})
     assert r.status_code == 200
-    # Constant body, zero disclosure: no debug_code can exist in responses.
-    assert r.json() == {"message": "If the number is valid, an OTP was sent."}
+    # Local/staging: the fixed testing code is disclosed to the client on
+    # purpose (the login screen shows it); production never discloses one.
+    assert r.json() == {
+        "message": "If the number is valid, an OTP was sent.",
+        "debug_code": "349086",
+    }
     bad = c.post("/auth/otp/verify", json={"phone": "+916000000303", "code": "000000"})
     assert bad.status_code == 401
 
@@ -231,64 +171,6 @@ def test_lifespan_fails_when_db_unreachable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Database unreachable"):
         asyncio.run(_drain())
-
-
-# --- Phase 1 hardening batch: proxy client IP, env detection, docs, media ----
-
-def _client_ip_request(peer: str | None, xff: bytes | None = None) -> Request:
-    """Build a Request from a raw ASGI scope (no server, no DB)."""
-    headers = [(b"host", b"restamp-backend.onrender.com")]
-    if xff is not None:
-        headers.append((b"x-forwarded-for", xff))
-    scope: dict = {"type": "http", "headers": headers}
-    if peer is not None:
-        scope["client"] = (peer, 51234)
-    return Request(scope)
-
-
-# Unchanged default semantics: the socket peer is the per-IP key; the
-# header is ignored unless RESTAMP_TRUST_PROXY=1.
-def test_client_ip_default_mode_ignores_forwarded(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", False)
-    r = _client_ip_request("203.0.113.7", b"198.51.100.9, 10.0.0.5")
-    assert _client_ip(r) == "203.0.113.7"
-
-
-def test_client_ip_trusted_proxy_uses_rightmost_hop(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
-    r = _client_ip_request("203.0.113.1", b"198.51.100.9, 10.0.0.5")
-    # Rightmost = appended by the trusted platform proxy (unspoofable by
-    # the client itself); earlier entries are attacker-visible and ignored.
-    assert _client_ip(r) == "10.0.0.5"
-
-
-def test_client_ip_trusted_proxy_single_hop(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
-    r = _client_ip_request("203.0.113.1", b"198.51.100.9")
-    assert _client_ip(r) == "198.51.100.9"
-
-
-def test_client_ip_trusted_proxy_without_header_falls_back(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
-    assert _client_ip(_client_ip_request("203.0.113.1")) == "203.0.113.1"
-
-
-def test_client_ip_trusted_proxy_loopback_peer_ignores_header(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
-    r = _client_ip_request("127.0.0.1", b"8.8.8.8")
-    assert _client_ip(r) == "127.0.0.1"
-
-
-def test_client_ip_trusted_proxy_blank_forwarded_entries(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", True)
-    assert _client_ip(_client_ip_request("203.0.113.1", b"   ")) == "203.0.113.1"
-    assert _client_ip(_client_ip_request("203.0.113.1", b"  , ")) == "203.0.113.1"
-
-
-def test_client_ip_missing_client_is_none(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "TRUST_PROXY", False)
-    assert _client_ip(_client_ip_request(None)) is None
-    assert _client_ip(None) is None
 
 
 # Strict URL parsing: a loopback SUBSTRING can no longer make a remote host
