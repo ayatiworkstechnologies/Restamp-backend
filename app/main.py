@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     # Phase 1 hardening: fail fast in production when the JWT secret is
     # missing/weak or dev auth modes are enabled. Messages are
     # non-sensitive (setting names only, never values).
-    from .config import is_production, validate_security_config
+    from .config import fixed_otp_in_production, is_production, validate_security_config
 
     try:
         validate_security_config()
@@ -73,8 +73,10 @@ async def lifespan(app: FastAPI):
     # Production therefore has no working phone-OTP login: the request
     # endpoint fails closed with a generic 503 and every verify is
     # rejected. Say so loudly at startup instead of failing the whole API
-    # (browsing does not need OTP).
-    if is_production():
+    # (browsing does not need OTP). With the explicit production opt-in
+    # (RESTAMP_PRODUCTION_FIXED_OTP=1) validate_security_config has already
+    # logged its own warning instead.
+    if is_production() and not fixed_otp_in_production():
         log.warning(
             "Phone OTP login is unavailable in production (no SMS provider "
             "is integrated): POST /auth/otp/request returns 503 and every "

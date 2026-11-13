@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 from .. import deps, schemas
 from ..db import get_db
 from ..models import AuthIdentity, BrokerPostcodeAccessCurrent
-from ..security import get_current_user, get_current_user_id
+from ..security import (
+    get_current_user,
+    get_current_user_id,
+    get_session_amr,
+    is_fixed_otp_session,
+)
 from ..services import users_roles
 
 router = APIRouter(tags=["users"])
@@ -39,8 +44,13 @@ def get_user(
     user_id: int,
     db: Session = Depends(get_db),
     caller: int = Depends(get_current_user_id),
+    amr: str | None = Depends(get_session_amr),
 ):
-    if caller != user_id and not users_roles.is_admin(db, caller):
+    # Reading another user's record is an admin capability; a fixed-OTP
+    # session never has it, even when the account is an admin.
+    if caller != user_id and (
+        is_fixed_otp_session(amr) or not users_roles.is_admin(db, caller)
+    ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     user = users_roles.get_user(db, user_id)
     return schemas.UserOut(

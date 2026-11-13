@@ -22,12 +22,24 @@ Where the fixed code works:
   the request endpoint returns a generic **503** (no SMS provider exists, so
   nothing can be sent) and **every** code — including `349086` — is rejected
   with 401. No OTP is ever returned in a production response or log.
+- `production`/`prod` with the explicit opt-in
+  `RESTAMP_PRODUCTION_FIXED_OTP=1` (exact value `"1"`; `true`/`yes` do not
+  count): the request endpoint returns the generic **200** message with **no**
+  `debug_code`, and `349086` is accepted. **Anyone can then sign in as any
+  ordinary (non-admin) phone account.** Restrictions: an existing admin
+  account is refused with the same 401 as a wrong code; the token carries
+  `amr: "fixed_otp"`, and such a session gets 403 on every admin endpoint
+  (even if the account is made admin later), on reading another user's
+  record, and on `POST /auth/google/link`. Startup logs a warning. JWT,
+  CORS, Google and every other production check are unchanged.
 
 Safeguards:
 
 - The gate is the environment alone (`otp_display_permitted()` in
   `app/config.py`), re-checked on every request by the OTP service and again
-  by the auth router. No environment variable can widen it.
+  by the auth router. No environment variable can widen display. Acceptance
+  (never display) can additionally be enabled in production only through
+  `RESTAMP_PRODUCTION_FIXED_OTP=1` (`fixed_otp_permitted()`).
 - Production startup (`validate_security_config`) refuses to boot while the
   obsolete `RESTAMP_OTP_DISPLAY_MODE=1` is still set (a leftover testing
   configuration must be cleaned up, not silently ignored).
@@ -82,7 +94,8 @@ curl -s -X POST http://localhost:8000/auth/otp/verify \
 
 Notes:
 
-- There are no OTP environment variables any more. The removed
+- The only OTP environment variable is the production opt-in
+  `RESTAMP_PRODUCTION_FIXED_OTP` (exact `"1"`; see above). The removed
   `RESTAMP_OTP_TTL_SECONDS`, `RESTAMP_OTP_MAX_*`, `RESTAMP_OTP_BLOCK_SECONDS`
   and `RESTAMP_OTP_DISPLAY_MODE` are inert; production refuses the last one.
 - `RESTAMP_ENV=demo` is not a supported environment anywhere; startup

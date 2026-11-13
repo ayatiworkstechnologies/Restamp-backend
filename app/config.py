@@ -49,16 +49,27 @@ class Settings:
     JWT_EXPIRE_MINUTES: int = _get_int("RESTAMP_JWT_EXPIRE_MINUTES", 30)
 
     # Phone OTP: the simplified login uses ONE fixed testing code
-    # (app/services/otp.py TEST_OTP = "349086"), accepted only where
-    # otp_display_permitted() is true (local/development/dev/test or
-    # staging) and returned by /auth/otp/request as `debug_code` there.
+    # (app/services/otp.py TEST_OTP = "349086"), accepted and returned by
+    # /auth/otp/request as `debug_code` where otp_display_permitted() is
+    # true (local/development/dev/test or staging).
     # Production/prod fails closed at request time (503 on the request
-    # endpoint, every verify rejected). There are NO OTP environment
-    # variables: the removed RESTAMP_OTP_TTL_SECONDS/_MAX_*_/*_BLOCK_*
-    # rate-limit settings and RESTAMP_OTP_DISPLAY_MODE are not read
+    # endpoint, every verify rejected) unless the explicit opt-in below is
+    # set; that opt-in is the ONLY OTP environment variable. The removed
+    # RESTAMP_OTP_TTL_SECONDS/_MAX_*_/*_BLOCK_* rate-limit settings and
+    # RESTAMP_OTP_DISPLAY_MODE are not read
     # anywhere, and validate_security_config refuses a production boot
     # with the obsolete display flag still set (a leftover testing
     # configuration must be cleaned up, not silently ignored).
+    #
+    # Explicit PRODUCTION opt-in for the same fixed code (owner decision,
+    # no SMS provider exists). Read as the raw string: only the exact value
+    # "1" enables it (fixed_otp_in_production) — "true", "yes", " 1" and
+    # every other value leave production failing closed. When enabled,
+    # production accepts TEST_OTP at verification but never returns it
+    # (otp_display_permitted() is unchanged), refuses it for admin accounts,
+    # and marks the resulting session amr=fixed_otp, which can never reach
+    # admin endpoints or link a Google identity.
+    PRODUCTION_FIXED_OTP: str = _get("RESTAMP_PRODUCTION_FIXED_OTP", "0")
 
     # Google verification. Real verification needs GOOGLE_CLIENT_ID and a real
     # verifier; dev mode accepts only synthetic "dev:<subject>" tokens.
@@ -214,13 +225,38 @@ def is_staging() -> bool:
 
 
 def otp_display_permitted() -> bool:
-    """Whether the fixed testing OTP may be used in this process: only in
-    an explicit development environment or RESTAMP_ENV=staging, never for
+    """Whether the fixed OTP may be DISPLAYED (`debug_code`): only in an
+    explicit development environment or RESTAMP_ENV=staging, never for
     production/prod (no override, no environment variable can widen it).
-    Re-evaluated per request by the OTP service and the auth router; it is
-    the single environment gate for both returning the code (`debug_code`)
-    and accepting it at verification."""
+    Re-evaluated per request by the OTP service and the auth router.
+    Acceptance at verification uses fixed_otp_permitted(), which adds only
+    the explicit production opt-in."""
     return is_development() or is_staging()
+
+
+# The production environment names that may opt in to the fixed OTP.
+# Staging is deliberately excluded: it already has the testing OTP through
+# otp_display_permitted(), with its own public-site CORS guard.
+_FIXED_OTP_PROD_ENVS = {"production", "prod"}
+
+
+def fixed_otp_in_production() -> bool:
+    """True only for RESTAMP_ENV=production/prod with RESTAMP_PRODUCTION_FIXED_OTP
+    set to exactly "1" (no truthy-string parsing, no whitespace tolerance).
+
+    Re-evaluated per request, never latched. Callers use it to switch on the
+    production-only restrictions that go with the opt-in: no code in any
+    response, admin accounts refused, and the amr=fixed_otp session marker.
+    """
+    return _env() in _FIXED_OTP_PROD_ENVS and settings.PRODUCTION_FIXED_OTP == "1"
+
+
+def fixed_otp_permitted() -> bool:
+    """Whether the fixed OTP may be ACCEPTED at verification: the existing
+    local/staging gate, or the explicit production opt-in. Display stays
+    governed by otp_display_permitted() alone, so production never returns
+    the code."""
+    return otp_display_permitted() or fixed_otp_in_production()
 
 
 def is_jwt_secret_strong(secret: str | None) -> bool:
@@ -303,10 +339,12 @@ def validate_security_config() -> None:
     site (https://restamp.in, https://www.restamp.in): the fixed testing
     OTP is always active there, so a staging backend must never serve the
     public site; staging also logs a startup warning that the testing OTP
-    is active.
+    is active. Production with RESTAMP_PRODUCTION_FIXED_OTP=1 passes every
+    check above unchanged and then logs a startup warning.
     SMS delivery is not a startup failure (that would take the whole API
-    down): production logs a warning that OTP login is unavailable, and
-    OTP requests fail closed with a generic 503 at request time.
+    down): without the opt-in, production logs a warning that OTP login is
+    unavailable, and OTP requests fail closed with a generic 503 at
+    request time.
     Messages name only the setting, never its value.
     """
     env = _env()
@@ -351,13 +389,13 @@ def validate_security_config() -> None:
         # (nothing reads it), but a production environment still carrying
         # it signals a leftover testing configuration. Refuse to boot so
         # the testing mechanism can never be assumed active on a real
-        # deployment; the fixed OTP is environment-gated (local/staging)
-        # and has no production switch.
+        # deployment. Production never displays the code; acceptance is
+        # controlled only by RESTAMP_PRODUCTION_FIXED_OTP.
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_OTP_DISPLAY_MODE was "
             "removed with the simplified OTP login. Delete it from the "
-            "environment; the fixed testing OTP is environment-gated "
-            "(local/staging only) and cannot be switched on in production."
+            "environment; production never displays OTP codes (fixed-OTP "
+            "acceptance is controlled only by RESTAMP_PRODUCTION_FIXED_OTP)."
         )
     if settings.GOOGLE_DEV_MODE:
         raise RuntimeError(
@@ -403,6 +441,15 @@ def validate_security_config() -> None:
             "RESTAMP_ENV=staging: the fixed testing OTP is active — every "
             "phone number can log in with the published testing code. Never "
             "point real users at this deployment."
+        )
+    if fixed_otp_in_production():
+        # Not a refusal (an explicit owner opt-in), but never silent. All the
+        # production checks above still ran and passed before this point.
+        _log.warning(
+            "RESTAMP_PRODUCTION_FIXED_OTP=1: the fixed OTP is accepted in "
+            "production. Anyone can sign in as any ordinary (non-admin) phone "
+            "account. Admin accounts are refused and fixed-OTP sessions cannot "
+            "use admin endpoints or link Google."
         )
     # Photo-upload storage: NOT a hard failure (that would be a behavior
     # change requiring an explicit product decision). When production has no

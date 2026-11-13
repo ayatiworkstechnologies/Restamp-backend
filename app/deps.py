@@ -10,7 +10,13 @@ from sqlalchemy.orm import Session
 
 from .db import get_db
 from .models import PhysicalProperty
-from .security import ensure_active_user, get_current_user, get_current_user_id
+from .security import (
+    ensure_active_user,
+    get_current_user,
+    get_current_user_id,
+    get_session_amr,
+    is_fixed_otp_session,
+)
 from .services import admin_rbac, users_roles
 
 
@@ -43,7 +49,20 @@ require_owner = require_role("OWNER")
 require_broker = require_role("BROKER")
 
 
-def require_admin(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+def _refuse_fixed_otp_session(amr: str | None) -> None:
+    """Fixed-OTP sessions are ordinary-user sessions only: same static 403
+    as a non-admin, checked BEFORE the admin lookup so the response never
+    depends on whether the account is an admin."""
+    if is_fixed_otp_session(amr):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def require_admin(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+    amr: str | None = Depends(get_session_amr),
+) -> int:
+    _refuse_fixed_otp_session(amr)
     ensure_active_user(db, user_id)
     if not users_roles.is_admin(db, user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
@@ -58,12 +77,18 @@ def require_admin_permission(permission: str):
     then the role's permission set decides. An unknown role has no
     permissions (fail closed). Non-admins get the same static 403 as
     require_admin, so the endpoint's permission name is only ever shown to
-    admins.
+    admins. A fixed-OTP session (amr=fixed_otp) gets that same 403 even if
+    the account was granted admin after the session was issued.
     """
     if permission not in admin_rbac.PERMISSIONS:  # programming error, not a request error
         raise ValueError(f"Unknown admin permission: {permission}")
 
-    def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+    def _check(
+        db: Session = Depends(get_db),
+        user_id: int = Depends(get_current_user_id),
+        amr: str | None = Depends(get_session_amr),
+    ) -> int:
+        _refuse_fixed_otp_session(amr)
         ensure_active_user(db, user_id)
         admin_role = users_roles.get_admin_role(db, user_id)
         if admin_role is None:
