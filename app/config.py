@@ -104,6 +104,12 @@ class Settings:
     CLOUDINARY_API_KEY: str = _get("CLOUDINARY_API_KEY", "")
     CLOUDINARY_API_SECRET: str = _get("CLOUDINARY_API_SECRET", "")
     CLOUDINARY_FOLDER: str = _get("CLOUDINARY_FOLDER", "restamp")
+    # PRODUCTION ONLY: explicit opt-in that lets a local frontend call a
+    # production-classified backend. Only the exact value "1" enables it, and
+    # it then allows EXACTLY the fixed origins in PRODUCTION_LOCAL_DEV_ORIGINS
+    # (below) — never other ports, hosts or a regex.
+    # Default "0" (disabled): production allows only RESTAMP_CORS_ORIGINS.
+    CORS_ALLOW_LOCALHOST_IN_PRODUCTION: bool = _get("RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION", "0") == "1"
     # DEVELOPMENT ONLY: comma-separated exact base-URL prefixes (each ending
     # in "/") that client-supplied listing photo URLs may also start with,
     # e.g. a local media server. Ignored entirely in production (see
@@ -275,6 +281,19 @@ def is_jwt_secret_strong(secret: str | None) -> bool:
     return True
 
 
+# The ONLY local origins a production-classified backend may allow, and only
+# with RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1: the website dev server
+# (Next.js :3000) and Expo web (:8081). Fixed in code on purpose: no
+# environment value can widen this to other ports, 127.0.0.1, LAN hosts or
+# external origins.
+PRODUCTION_LOCAL_DEV_ORIGINS: tuple[str, ...] = ("http://localhost:3000", "http://localhost:8081")
+
+
+def production_local_dev_origins() -> list[str]:
+    """The local origins production allows: the fixed pair when opted in, else none."""
+    return list(PRODUCTION_LOCAL_DEV_ORIGINS) if settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION else []
+
+
 def parse_cors_origins(raw: str | None) -> list[str]:
     """RESTAMP_CORS_ORIGINS as a list of exact origins (comma-separated, trimmed)."""
     return [o.strip() for o in (raw or "").split(",") if o.strip()]
@@ -423,6 +442,17 @@ def validate_security_config() -> None:
             "Insecure production configuration: RESTAMP_CORS_ORIGINS must contain "
             "only exact public https origins (scheme and host, no path, no "
             "wildcard, no localhost or private-network hosts)."
+        )
+    # Local frontend origins (explicit opt-in). The allowed set is fixed in
+    # code (PRODUCTION_LOCAL_DEV_ORIGINS), so there is nothing to validate —
+    # but never silently: say which origins are open (fixed values only).
+    if settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION:
+        _log.warning(
+            "RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1: browser origins %s "
+            "may call this production backend (credentialed CORS). CORS is not "
+            "authentication: every endpoint still requires its normal "
+            "authentication and authorization.",
+            ", ".join(PRODUCTION_LOCAL_DEV_ORIGINS),
         )
     if is_staging():
         # The fixed testing OTP is ALWAYS active in staging (there is no
