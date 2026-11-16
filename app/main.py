@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import is_production, parse_cors_origins, settings
+from .config import is_production, parse_cors_origins, production_local_dev_origins, settings
 from .db import check_db
 from .routers import admin as admin_router
 from .routers import auth as auth_router
@@ -28,6 +28,9 @@ log = logging.getLogger("restamp")
 # Allowed browser origins (native apps are unaffected by CORS).
 # - Production: ONLY the exact origins in RESTAMP_CORS_ORIGINS (validated at
 #   startup: exact public https origins, never "*", never localhost/LAN).
+#   Opt-in exception: RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 adds
+#   EXACTLY http://localhost:3000 and http://localhost:8081
+#   (config.PRODUCTION_LOCAL_DEV_ORIGINS) — no regex, no other port or host.
 # - Development: RESTAMP_CORS_ORIGINS if set, else these local defaults
 #   (Expo web :8081, classic :19006), plus any localhost / private-LAN origin
 #   (_DEV_ORIGIN_REGEX) for on-device testing.
@@ -51,8 +54,13 @@ def _cors_settings() -> dict:
     configured = parse_cors_origins(settings.CORS_ORIGINS)
     if is_production():
         # Exactly the configured origins; never a regex, never "*" (an
-        # invalid list is refused at startup by validate_security_config).
-        return {"allow_origins": [o for o in configured if o != "*"], "allow_origin_regex": None}
+        # invalid list is refused at startup by validate_security_config),
+        # plus — only with RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 — the
+        # two fixed local origins.
+        allow_origins = list(dict.fromkeys(
+            [o for o in configured if o != "*"] + production_local_dev_origins()
+        ))
+        return {"allow_origins": allow_origins, "allow_origin_regex": None}
     return {"allow_origins": configured or _DEFAULT_LOCAL_ORIGINS, "allow_origin_regex": _DEV_ORIGIN_REGEX}
 
 
