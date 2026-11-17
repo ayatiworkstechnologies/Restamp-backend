@@ -144,6 +144,7 @@ def google_link(
     return schemas.MeOut(
         id=user.id,
         display_name=user.display_name,
+        email=user.email,
         role=users_roles.get_current_role(db, user.id),
         providers=providers,
         is_admin=users_roles.is_admin(db, user.id),
@@ -159,6 +160,7 @@ def me(db: Session = Depends(get_db), user=Depends(get_current_user)):
     return schemas.MeOut(
         id=user.id,
         display_name=user.display_name,
+        email=user.email,
         role=users_roles.get_current_role(db, user.id),
         providers=providers,
         is_admin=users_roles.is_admin(db, user.id),

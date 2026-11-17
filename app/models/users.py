@@ -9,6 +9,7 @@ class User(Base):
     id = Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True, nullable=False)
     display_name = Column(String(255), nullable=False)
     avatar_url = Column(String(500), nullable=True)
+    email = Column(String(255), nullable=True)
     status = Column(Enum("active","suspended","closed"), nullable=False, server_default="active")
     created_at = Column(DateTime, server_default=func.current_timestamp(), nullable=False)
     updated_at = Column(mysql.TIMESTAMP(), server_default=text('CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'), nullable=False)
