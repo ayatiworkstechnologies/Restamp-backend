@@ -17,7 +17,10 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column('users', sa.Column('email', sa.String(255), nullable=True))
+    # Skip when the app's startup guard already added it.
+    cols = {c["name"] for c in sa.inspect(op.get_bind()).get_columns("users")}
+    if "email" not in cols:
+        op.add_column('users', sa.Column('email', sa.String(255), nullable=True))
 
 
 def downgrade():

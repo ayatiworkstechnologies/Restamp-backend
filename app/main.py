@@ -64,6 +64,21 @@ def _cors_settings() -> dict:
     return {"allow_origins": configured or _DEFAULT_LOCAL_ORIGINS, "allow_origin_regex": _DEV_ORIGIN_REGEX}
 
 
+def _ensure_users_email_column() -> None:
+    from sqlalchemy import inspect, text
+    from .db import engine
+
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("users")}
+        if "email" in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(255) NULL"))
+        log.warning("Added missing users.email column (migration m3n4o5p6q7r8).")
+    except Exception as exc:  # never block startup on this guard
+        log.error("Could not ensure users.email column: %s", exc.__class__.__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Phase 1 hardening: fail fast in production when the JWT secret is
@@ -103,6 +118,11 @@ async def lifespan(app: FastAPI):
     if not check_db():
         log.error("Database unreachable at startup.")
         raise RuntimeError("Database unreachable at startup.")
+
+    # Additive schema guard: Render does not run Alembic on deploy, so add
+    # the nullable users.email column (migration m3n4o5p6q7r8) when the
+    # database is missing it. Idempotent; never drops or rewrites data.
+    _ensure_users_email_column()
 
     # Start background worker for automatic property verification
     async with worker_lifespan():
