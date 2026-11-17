@@ -184,3 +184,24 @@ def subscribe_my_owner_plan(
     result = owner_plan_svc.subscribe_simulated(db, caller, plan_id)
     db.commit()
     return result
+
+
+@router.get("/users/me/dealer-plan")
+def get_my_dealer_plan(
+    db: Session = Depends(get_db),
+    caller: int = Depends(get_current_user_id),
+):
+    """The caller's active dealer plan ({"active": false} when none)."""
+    return owner_plan_svc.status_for(db, caller, "dealer")
+
+
+@router.post("/users/me/dealer-plan/{plan_id}/subscribe")
+def subscribe_my_dealer_plan(
+    plan_id: str,
+    db: Session = Depends(get_db),
+    caller: int = Depends(get_current_user_id),
+):
+    """Activate a dealer plan. PAYMENT IS SIMULATED — no money is charged."""
+    result = owner_plan_svc.subscribe_simulated(db, caller, plan_id, "dealer")
+    db.commit()
+    return result

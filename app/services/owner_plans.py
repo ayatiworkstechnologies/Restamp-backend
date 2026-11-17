@@ -43,18 +43,35 @@ BY_APP_ID = {p.app_id: p for p in PLANS}
 BY_CODE = {p.code: p for p in PLANS}
 CODES = tuple(BY_CODE)
 
+# Dealer plans: a dealer posts properties through the owner listing system,
+# but holds its own plan (saved separately, never replaces the owner plan).
+DEALER_PLANS = (
+    OwnerPlan("RESTAMP_DEALER_STARTER", "dealer-starter", "Dealer Starter", 199900, 30, 10),
+    OwnerPlan("RESTAMP_DEALER_GROWTH", "dealer-growth", "Dealer Growth", 499900, 60, 30),
+    OwnerPlan("RESTAMP_DEALER_PRO", "dealer-pro", "Dealer Pro", 999900, 90, 75),
+    OwnerPlan("RESTAMP_DEALER_UNLIMITED", "dealer-unlimited", "Dealer Unlimited", 1999900, 180, None),
+)
+DEALER_BY_APP_ID = {p.app_id: p for p in DEALER_PLANS}
+DEALER_BY_CODE = {p.code: p for p in DEALER_PLANS}
+DEALER_CODES = tuple(DEALER_BY_CODE)
+
+_CATALOGUES = {
+    "owner": (BY_APP_ID, BY_CODE, CODES, "Owner plan"),
+    "dealer": (DEALER_BY_APP_ID, DEALER_BY_CODE, DEALER_CODES, "Dealer plan"),
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
 
-def _plan_row(db: Session, plan: OwnerPlan) -> Plan:
+def _plan_row(db: Session, plan: OwnerPlan, label: str = "Owner plan") -> Plan:
     row = db.query(Plan).filter(Plan.code == plan.code).first()
     if row is None:
         row = Plan(
             code=plan.code,
             name=plan.name,
-            description="Owner plan",
+            description=label,
             price_paise=plan.price_paise,
             duration_days=plan.duration_days,
             status="ACTIVE",
@@ -67,8 +84,9 @@ def _plan_row(db: Session, plan: OwnerPlan) -> Plan:
     return row
 
 
-def status_for(db: Session, user_id: int) -> dict:
-    """The user's active, unexpired owner plan (active=False when none)."""
+def status_for(db: Session, user_id: int, kind: str = "owner") -> dict:
+    """The user's active, unexpired owner/dealer plan (active=False when none)."""
+    _, by_code, codes, _ = _CATALOGUES[kind]
     now = _now()
     row = (
         db.query(Subscription, Plan.code)
@@ -76,7 +94,7 @@ def status_for(db: Session, user_id: int) -> dict:
         .filter(
             Subscription.user_id == user_id,
             Subscription.status == "ACTIVE",
-            Plan.code.in_(CODES),
+            Plan.code.in_(codes),
             (Subscription.end_date.is_(None)) | (Subscription.end_date > now),
         )
         .order_by(Subscription.start_date.desc(), Subscription.id.desc())
@@ -85,7 +103,7 @@ def status_for(db: Session, user_id: int) -> dict:
     if row is None:
         return {"active": False}
     sub, code = row
-    plan = BY_CODE[code]
+    plan = by_code[code]
     return {
         "active": True,
         "plan_id": plan.app_id,
@@ -99,12 +117,13 @@ def status_for(db: Session, user_id: int) -> dict:
     }
 
 
-def subscribe_simulated(db: Session, user_id: int, app_id: str) -> dict:
+def subscribe_simulated(db: Session, user_id: int, app_id: str, kind: str = "owner") -> dict:
     """Activate an owner plan with a SIMULATED payment (no money is charged)."""
-    plan = BY_APP_ID.get(app_id) or BY_CODE.get(app_id)
+    by_app_id, by_code, codes, label = _CATALOGUES[kind]
+    plan = by_app_id.get(app_id) or by_code.get(app_id)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    row = _plan_row(db, plan)
+    row = _plan_row(db, plan, label)
     now = _now()
     payment = Payment(
         user_id=user_id,
@@ -126,7 +145,7 @@ def subscribe_simulated(db: Session, user_id: int, app_id: str) -> dict:
         .filter(
             Subscription.user_id == user_id,
             Subscription.status == "ACTIVE",
-            Subscription.plan_id.in_(db.query(Plan.id).filter(Plan.code.in_(CODES)).scalar_subquery()),
+            Subscription.plan_id.in_(db.query(Plan.id).filter(Plan.code.in_(codes)).scalar_subquery()),
         )
         .update({Subscription.status: "EXPIRED"}, synchronize_session=False)
     )
@@ -141,7 +160,7 @@ def subscribe_simulated(db: Session, user_id: int, app_id: str) -> dict:
         )
     )
     db.flush()
-    result = status_for(db, user_id)
+    result = status_for(db, user_id, kind)
     result["transaction_id"] = payment.provider_payment_id
     result["simulated"] = True
     return result
