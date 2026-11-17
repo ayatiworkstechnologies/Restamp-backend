@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from ..models import ContactRevealAudit, Payment, Plan, Subscription
+from ..models import ContactRevealAudit, Payment, Plan, PropertyListing, Subscription
 
 
 @dataclass(frozen=True)
@@ -121,9 +121,30 @@ def _revealed_ids(db: Session, buyer_id: int, since: datetime) -> set[int]:
     return {r[0] for r in rows}
 
 
+def _revealed_owner_ids(db: Session, buyer_id: int, since: datetime) -> set[int]:
+    """Distinct OWNERS (one phone number each) whose number the buyer revealed
+    in the window. The same owner's number on several properties counts once."""
+    rows = (
+        db.query(PropertyListing.user_id)
+        .join(ContactRevealAudit, ContactRevealAudit.property_listing_id == PropertyListing.id)
+        .filter(
+            ContactRevealAudit.user_id == buyer_id,
+            ContactRevealAudit.revealed_at >= since,
+        )
+        .distinct()
+        .all()
+    )
+    return {int(r[0]) for r in rows if r[0] is not None}
+
+
+def _listing_owner_id(db: Session, listing_id: int) -> int | None:
+    row = db.query(PropertyListing.user_id).filter(PropertyListing.id == listing_id).first()
+    return int(row[0]) if row and row[0] is not None else None
+
+
 def status_for(db: Session, buyer_id: int) -> dict:
     plan, start, end, _sub = _window(db, buyer_id)
-    used = len(_revealed_ids(db, buyer_id, start))
+    used = len(_revealed_owner_ids(db, buyer_id, start))
     limit = plan.lead_limit
     return {
         "plan_code": plan.code,
@@ -139,16 +160,22 @@ def status_for(db: Session, buyer_id: int) -> dict:
 def ensure_can_reveal(
     db: Session, buyer_id: int, listing_id: int, phone_last4: str | None = None
 ) -> None:
-    """Raise 402 BUYER_PLAN_REQUIRED when revealing a NEW property exceeds the quota.
+    """Raise 402 BUYER_PLAN_REQUIRED when revealing a NEW owner number exceeds the quota.
+
+    The quota counts distinct owner numbers: another property of an owner
+    whose number was already revealed in this window is free.
 
     The 402 may carry `phone_last4` (masked teaser) — never the full number.
     """
     plan, start, _end, _sub = _window(db, buyer_id)
     if plan.lead_limit is None:
         return
-    revealed = _revealed_ids(db, buyer_id, start)
-    if listing_id in revealed:
+    if listing_id in _revealed_ids(db, buyer_id, start):
         return  # already counted in this window — re-reveal is free
+    revealed = _revealed_owner_ids(db, buyer_id, start)
+    owner_id = _listing_owner_id(db, listing_id)
+    if owner_id is not None and owner_id in revealed:
+        return  # same owner number already revealed — no extra lead used
     if len(revealed) >= plan.lead_limit:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,

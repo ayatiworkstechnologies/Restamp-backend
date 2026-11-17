@@ -39,14 +39,37 @@ def require_role(*allowed: str, detail: str | None = None):
     return _check
 
 
+def _role_or_dealer(*allowed: str, detail: str | None = None):
+    """Like require_role, but an OWNER-mode account holding Dealer area
+    access also passes: dealers post as OWNER and use agent area features
+    (owner properties in their chosen areas, owner numbers) without
+    switching roles."""
+    def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+        ensure_active_user(db, user_id)
+        role = users_roles.get_current_role(db, user_id)
+        if role in allowed:
+            return user_id
+        if role == "OWNER":
+            from .services import agent_plans as agent_plan_svc
+
+            if agent_plan_svc.has_dealer_access(db, user_id):
+                return user_id
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=detail or f"{'/'.join(allowed)} role required",
+        )
+
+    return _check
+
+
 require_buyer = require_role("BUYER")
 # Buyer activity (wishlist, enquiries, visits, viewed, call taps, owner
 # contact) is shared by buyers and agents (BROKER): an agent connects with
 # owners exactly like a buyer, on their own account. The 403 text stays
 # "BUYER role required" so an OWNER-mode account still knows what to switch to.
-require_buyer_or_agent = require_role("BUYER", "BROKER", detail="BUYER role required")
+require_buyer_or_agent = _role_or_dealer("BUYER", "BROKER", detail="BUYER role required")
 require_owner = require_role("OWNER")
-require_broker = require_role("BROKER")
+require_broker = _role_or_dealer("BROKER")
 
 
 def _refuse_fixed_otp_session(amr: str | None) -> None:

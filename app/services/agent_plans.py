@@ -89,7 +89,17 @@ BY_KEY = {**{p.code: p for p in PLANS}, **{p.app_id: p for p in PLANS}}
 # Started once per account with start_trial; never purchasable through
 # subscribe_simulated, and upgrading to a paid tier replaces it.
 TRIAL = AgentPlan("RESTAMP_AGENT_TRIAL", "agent-trial", "Agent Free Trial", 0, None, 1)
-BY_CODE = {p.code: p for p in (*PLANS, TRIAL)}
+
+# Area access included with a Dealer plan (granted by grant_dealer_access,
+# never purchasable here). Price 0: the dealer payment covers it.
+DEALER_ACCESS = {
+    "dealer-starter": AgentPlan("RESTAMP_DEALER_AREAS_STARTER", "dealer-starter", "Dealer Starter", 0, 30, 5),
+    "dealer-growth": AgentPlan("RESTAMP_DEALER_AREAS_GROWTH", "dealer-growth", "Dealer Growth", 0, 60, 10),
+    "dealer-pro": AgentPlan("RESTAMP_DEALER_AREAS_PRO", "dealer-pro", "Dealer Pro", 0, 90, 15),
+    "dealer-unlimited": AgentPlan("RESTAMP_DEALER_AREAS_UNLIMITED", "dealer-unlimited", "Dealer Unlimited", 0, 180, 25),
+}
+DEALER_ACCESS_CODES = frozenset(p.code for p in DEALER_ACCESS.values())
+BY_CODE = {p.code: p for p in (*PLANS, TRIAL, *DEALER_ACCESS.values())}
 CODES = tuple(BY_CODE)
 
 AREA_REQUIRED_CODE = "AGENT_AREA_NOT_IN_PLAN"
@@ -192,6 +202,7 @@ def status_for(db: Session, user_id: int) -> dict:
         "start_date": sub.start_date,
         "valid_until": sub.end_date,
         "is_trial": plan.code == TRIAL.code,
+        "is_dealer": plan.code in DEALER_ACCESS_CODES,
         "localities": localities,
         "localities_remaining": max(0, plan.locality_limit - len(localities)),
     }
@@ -581,3 +592,49 @@ def ensure_listing_in_plan(db: Session, user_id: int, listing_id: int) -> None:
             "is_trial": bool(active is not None and active[1].code == TRIAL.code),
         },
     )
+
+
+def grant_dealer_access(db: Session, user_id: int, dealer_app_id: str, payment_id: int, end) -> None:
+    """Give a dealer the area access included with their Dealer plan.
+
+    Areas start empty; the dealer picks them with add_localities (same
+    limit rules as agents). An active paid agent plan or an earlier dealer
+    access with MORE areas is kept untouched. The current role is not
+    changed: dealers post properties as OWNER.
+    """
+    access = DEALER_ACCESS.get(dealer_app_id)
+    if access is None:
+        return
+    current = _active(db, user_id)
+    if current is not None and current[1].locality_limit >= access.locality_limit and current[1].code != TRIAL.code:
+        return
+    row = _plan_row(db, access)
+    now = _now()
+    # Keep already-chosen areas: only the plan row changes, coverage stays
+    # (it is re-checked against the new limit on the next add).
+    (
+        db.query(Subscription)
+        .filter(
+            Subscription.user_id == user_id,
+            Subscription.status == "ACTIVE",
+            Subscription.plan_id.in_(db.query(Plan.id).filter(Plan.code.in_(CODES)).scalar_subquery()),
+        )
+        .update({Subscription.status: "EXPIRED"}, synchronize_session=False)
+    )
+    db.add(
+        Subscription(
+            user_id=user_id,
+            plan_id=row.id,
+            payment_id=payment_id,
+            start_date=now,
+            end_date=end,
+            status="ACTIVE",
+        )
+    )
+    db.flush()
+
+
+def has_dealer_access(db: Session, user_id: int) -> bool:
+    """True when the caller's active area plan came with a Dealer plan."""
+    active = _active(db, user_id)
+    return active is not None and active[1].code in DEALER_ACCESS_CODES

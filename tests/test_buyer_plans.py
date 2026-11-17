@@ -106,3 +106,31 @@ def test_owner_viewing_own_listing_gets_number_without_lead_or_quota(client):
     assert enquiry_count(session, uid, lid) == 0
     assert audit_count(session, uid, lid) == 0
     assert c.get("/buyer/plan", headers=h).json()["leads_used"] == 0
+
+
+def test_same_owner_number_on_several_properties_counts_once(client):
+    """The free quota counts distinct OWNER numbers: another property of an
+    owner already revealed is free, so 3 owners stay within FREE."""
+    c, session = client
+    buyer = fresh_buyer(c)
+    h = auth_header(buyer["access_token"])
+    lid_a, owner_a, _ = seed_owner_listing(session)
+    lid_a2, _, _ = seed_owner_listing(session)
+    # Give the second listing (and its physical property) to owner A.
+    session.execute(text("UPDATE property_listings SET user_id=:o WHERE id=:l"), {"o": owner_a, "l": lid_a2})
+    session.execute(
+        text("UPDATE physical_properties pp JOIN property_listings pl ON pl.physical_property_id = pp.id "
+             "SET pp.user_id=:o WHERE pl.id=:l"),
+        {"o": owner_a, "l": lid_a2},
+    )
+    session.commit()
+    lid_b = seed_owner_listing(session)[0]
+    lid_c = seed_owner_listing(session)[0]
+    lid_d = seed_owner_listing(session)[0]
+
+    for lid in (lid_a, lid_a2, lid_b, lid_c):
+        assert _reveal(c, h, lid).status_code == 200
+    plan = c.get("/buyer/plan", headers=h).json()
+    assert plan["leads_used"] == 3 and plan["leads_remaining"] == 0
+    # A 4th distinct owner needs a buyer plan.
+    assert _reveal(c, h, lid_d).status_code == 402

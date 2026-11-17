@@ -160,6 +160,14 @@ def subscribe_simulated(db: Session, user_id: int, app_id: str, kind: str = "own
         )
     )
     db.flush()
+    if kind == "dealer":
+        # A Dealer plan includes area access (agent-style browsing and
+        # owner numbers in chosen areas), expiring with the dealer plan.
+        from . import agent_plans as agent_plan_svc
+
+        agent_plan_svc.grant_dealer_access(
+            db, user_id, plan.app_id, payment.id, now + timedelta(days=plan.duration_days)
+        )
     result = status_for(db, user_id, kind)
     result["transaction_id"] = payment.provider_payment_id
     result["simulated"] = True

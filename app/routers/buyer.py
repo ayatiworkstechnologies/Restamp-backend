@@ -30,6 +30,9 @@ def _agent_area_gate(db: Session, user_id: int, listing_id: int) -> str | None:
     (free trial: one area) -> 402 AGENT_AREA_NOT_IN_PLAN otherwise. Buyers
     are never area-restricted. Returns the caller's current role."""
     role = users_roles.get_current_role(db, user_id)
+    if role == "OWNER" and agent_plan_svc.has_dealer_access(db, user_id):
+        # Dealers act like agents here (area-limited, no buyer quota).
+        role = "BROKER"
     if role == "BROKER":
         agent_plan_svc.ensure_listing_in_plan(db, user_id, listing_id)
     return role
