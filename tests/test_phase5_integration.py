@@ -273,7 +273,7 @@ def test_regression_foundation_intact(client):
     } - {"alembic_version"}
     # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
     # + refresh_tokens (Phase 6): refresh token table for session management
-    assert len(tables) == 56  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + enquiry_messages, lead_notes (j0k1l2m3n4o5), locality_aliases (k1l2m3n4o5p6), notifications (m3n4o5p6q7r8); + rate_limit_windows (o5p6q7r8s9t0), push_devices/push_outbox/push_preferences (o5p6q7r8s9t1)
+    assert len(tables) == 56  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + enquiry_messages, lead_notes (j0k1l2m3n4o5), locality_aliases (k1l2m3n4o5p6), notifications (m4n5o6p7q8r9); + rate_limit_windows (o5p6q7r8s9t0), push_devices/push_outbox/push_preferences (o5p6q7r8s9t1)
     assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "property_visits" in tables

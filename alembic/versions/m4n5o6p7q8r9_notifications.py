@@ -1,7 +1,11 @@
 """RESTAMP in-app notifications table (notification system, Phase 1).
 
-Revision ID: m3n4o5p6q7r8
-Revises: l2m3n4o5p6q7
+Revision ID: m4n5o6p7q8r9
+Revises: m3n4o5p6q7r8
+
+Re-identified during the M1 origin reconciliation (2026-11-21): this
+migration was first written as 'm3n4o5p6q7r8', an id origin/main already
+uses for user_email. It now follows user_email in the single linear chain.
 Create Date: 2026-11-14
 
 ADDITIVE ONLY. Creates the new `notifications` table; no existing table,
@@ -22,8 +26,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
 
 # revision identifiers, used by Alembic.
-revision = 'm3n4o5p6q7r8'
-down_revision = 'l2m3n4o5p6q7'
+revision = 'm4n5o6p7q8r9'
+down_revision = 'm3n4o5p6q7r8'
 branch_labels = None
 depends_on = None
 

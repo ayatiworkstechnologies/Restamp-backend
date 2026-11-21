@@ -1,4 +1,4 @@
-"""In-app notifications (Phase 1 of the notification system; migration m3n4o5p6q7r8).
+"""In-app notifications (Phase 1 of the notification system; migration m4n5o6p7q8r9).
 
 One row per recipient per qualifying business event. Ownership is the single
 `user_id` column: every read/update/delete is scoped by it (another user's row

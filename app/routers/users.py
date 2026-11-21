@@ -64,7 +64,14 @@ def update_my_profile(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    updated = users_roles.update_user_display_name(db, user.id, body.display_name)
+    if body.display_name is None and body.email is None:
+        raise HTTPException(status_code=422, detail="Nothing to update")
+    if body.display_name is not None:
+        updated = users_roles.update_user_display_name(db, user.id, body.display_name)
+    else:
+        updated = users_roles.get_user(db, user.id)
+    if body.email is not None:
+        updated.email = body.email or None
     db.commit()
     db.refresh(updated)
     providers = [
@@ -74,6 +81,7 @@ def update_my_profile(
     return schemas.MeOut(
         id=updated.id,
         display_name=updated.display_name,
+        email=updated.email,
         role=users_roles.get_current_role(db, updated.id),
         providers=providers,
         is_admin=users_roles.is_admin(db, updated.id),

@@ -29,11 +29,29 @@ class UserOut(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    display_name: str = Field(min_length=1, max_length=255)
+    # Both optional so a client can update just one; at least one required
+    # (enforced in the router). email "" clears it.
+    display_name: str | None = Field(default=None, min_length=1, max_length=255)
+    email: str | None = Field(default=None, max_length=255)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        trimmed = v.strip()
+        if not trimmed:
+            return ""
+        import re as _re
+        if not _re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", trimmed):
+            raise ValueError("email is not a valid address")
+        return trimmed.lower()
 
     @field_validator("display_name")
     @classmethod
-    def validate_display_name(cls, v: str) -> str:
+    def validate_display_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         trimmed = v.strip()
         if not trimmed:
             raise ValueError("display_name cannot be empty or whitespace-only")
@@ -128,6 +146,7 @@ class PosterTypeConvertOut(BaseModel):
 class MeOut(BaseModel):
     id: int
     display_name: str
+    email: str | None = None
     role: str | None
     providers: list[str]
     is_admin: bool

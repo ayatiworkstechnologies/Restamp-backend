@@ -1,7 +1,7 @@
 """RESTAMP email notifications: address + verification + outbox (notification system, Phase 3).
 
 Revision ID: n4o5p6q7r8s9
-Revises: m3n4o5p6q7r8
+Revises: m4n5o6p7q8r9
 Create Date: 2026-11-15
 
 ADDITIVE ONLY. Creates three new tables; no existing table, column or row is
@@ -30,7 +30,7 @@ from sqlalchemy.dialects import mysql
 
 # revision identifiers, used by Alembic.
 revision = 'n4o5p6q7r8s9'
-down_revision = 'm3n4o5p6q7r8'
+down_revision = 'm4n5o6p7q8r9'
 branch_labels = None
 depends_on = None
 

@@ -17,7 +17,7 @@ def test_table_count_is_29():
     # Viewed history (h8i9j0k1l2m3): + viewed_properties.
     # Messages/notes (j0k1l2m3n4o5): + enquiry_messages, lead_notes.
     # Agent locality catalog (k1l2m3n4o5p6): + locality_aliases.
-    # Notifications (m3n4o5p6q7r8): + notifications.
+    # Notifications (m4n5o6p7q8r9): + notifications.
     # Email (n4o5p6q7r8s9): + user_emails, email_verification_codes, email_outbox.
     # Rate limiting (o5p6q7r8s9t0): + rate_limit_windows.
     # Push notifications (o5p6q7r8s9t1): + push_devices, push_outbox, push_preferences.
@@ -119,7 +119,7 @@ def test_forbidden_schema_absent():
     # approved RENT design (Task 7); only a bare `phone` column stays forbidden.
     col_names = {c.name for tbl in MD.tables.values() for c in tbl.columns}
     assert "phone" not in col_names
-    assert "saved_properties" in MD.tables and len(MD.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + notifications (m3n4o5p6q7r8), 3 email tables (n4o5p6q7r8s9); + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
+    assert "saved_properties" in MD.tables and len(MD.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + notifications (m4n5o6p7q8r9), 3 email tables (n4o5p6q7r8s9); + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
     for tbl in MD.tables.values():
         for c in tbl.columns:
             assert type(c.type).__name__ != "Numeric"  # no DECIMAL money

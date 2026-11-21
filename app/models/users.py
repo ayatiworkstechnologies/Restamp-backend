@@ -9,6 +9,7 @@ class User(Base):
     id = Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True, nullable=False)
     display_name = Column(String(255), nullable=False)
     avatar_url = Column(String(500), nullable=True)
+    email = Column(String(255), nullable=True)
     status = Column(Enum("active","suspended","closed"), nullable=False, server_default="active")
     # Exclusive poster capability (NULL = Buyer only). Never set by a mode
     # switch; see services/capabilities.py and migration r8s9t0u1v2w3.

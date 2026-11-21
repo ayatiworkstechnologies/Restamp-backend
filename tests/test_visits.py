@@ -364,4 +364,4 @@ def test_visits_table_matches_model_and_head(client):
         _expected_heads()[0]
     from app.models import Base
     assert "property_visits" in Base.metadata.tables
-    assert len(Base.metadata.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + locality_aliases (k1l2m3n4o5p6), notifications (m3n4o5p6q7r8); + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
+    assert len(Base.metadata.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + locality_aliases (k1l2m3n4o5p6), notifications (m4n5o6p7q8r9); + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
