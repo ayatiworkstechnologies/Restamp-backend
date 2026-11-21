@@ -21,7 +21,7 @@ import time
 
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone
+from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, register_phone
 
 _SEQ = {"n": 0}
 
@@ -31,6 +31,7 @@ def _owner(c):
     out = register_phone(c, f"+9198{_SEQ['n']:08d}")
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 
@@ -105,7 +106,7 @@ def test_only_the_explicit_verify_transition_advances_the_listing(client):
     token = _owner(c)
     lid = _create(c, token)["listing_id"]
 
-    r = c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token))
+    r = admin_verify(c, lid)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["verification_status"] == "VERIFIED"
@@ -167,7 +168,7 @@ def test_publishing_requires_a_verified_listing(client):
     assert _state(session, lid) == ("PENDING", "CLOSED")
 
     # After the explicit verification the publish succeeds.
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     r = c.post(f"/owner/listings/{lid}/publish", headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["listing_status"] == "AVAILABLE"

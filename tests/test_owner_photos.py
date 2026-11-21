@@ -10,7 +10,7 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, fresh_pincode
+from tests.conftest import grant_posting_plan_for_user, auth_header, fresh_pincode
 
 PNG_1PX = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
@@ -71,6 +71,8 @@ def _setup_owner(c, session, phone: str, role: str = "OWNER") -> str:
             "INSERT INTO role_history (user_id, role) VALUES (:u, :r)"),
             {"u": uid, "r": role})
         session.commit()
+    if role in ("OWNER", "BROKER"):
+        grant_posting_plan_for_user(session, uid, role)  # real paid plan
     token, _ = create_access_token(uid, role)
     return token
 

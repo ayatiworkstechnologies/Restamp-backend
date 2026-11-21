@@ -125,7 +125,7 @@ def test_close_cancels_a_requested_visit(client):
     assert closed.status_code == 200 and closed.json()["status"] == "CLOSED"
     assert _status(c, s, vid) == "CANCELLED"
     audit = _audits(session, "LEAD_VISITS_CANCELLED", s["lead"])
-    assert audit == [({"enquiry_id": s["lead"], "visits": [{"id": vid, "status": "REQUESTED"}]},
+    assert audit == [({"enquiry_id": s["lead"], "visits": [{"id": vid, "status": "PENDING"}]},
                       {"enquiry_id": s["lead"], "visits": [{"id": vid, "status": "CANCELLED"}]})]
 
 
@@ -138,13 +138,13 @@ def test_close_cancels_a_proposed_visit(client):
     assert _status(c, s, vid) == "CANCELLED"
 
 
-def test_close_cancels_a_confirmed_and_rescheduled_visit(client):
+def test_close_cancels_a_confirmed_visit(client):
     c, _ = client
     s = _setup(c)
     vid = _request(c, s)
     assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=s["oh"]).status_code == 200
-    moved = c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(9)}, headers=s["oh"])
-    assert moved.status_code == 200 and moved.json()["rescheduled_at"] is not None
+    # Strict Phase 5: a confirmed visit cannot be rescheduled first.
+    assert c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(9)}, headers=s["oh"]).status_code == 422
     assert c.patch(f"/owner/leads/{s['lead']}", json={"status": "CLOSED", "closing_reason": "Rented"},
                    headers=s["oh"]).status_code == 200
     row = c.get(f"/buyer/visits/{vid}", headers=s["bh"]).json()
@@ -168,12 +168,12 @@ def test_close_keeps_historical_visits_and_cancels_only_the_active_one(client):
     assert c.patch(f"/owner/visits/{done}", json={"status": "CONFIRMED"}, headers=s["oh"]).status_code == 200
     assert c.patch(f"/owner/visits/{done}", json={"status": "COMPLETED"}, headers=s["oh"]).status_code == 200
     declined = _request(c, s, days=4)
-    assert c.patch(f"/owner/visits/{declined}", json={"status": "DECLINED"}, headers=s["oh"]).status_code == 200
+    assert c.patch(f"/owner/visits/{declined}", json={"status": "REJECTED"}, headers=s["oh"]).status_code == 200
     active = _request(c, s, days=5)
     assert c.patch(f"/owner/visits/{active}", json={"status": "CONFIRMED"}, headers=s["oh"]).status_code == 200
     assert c.patch(f"/owner/leads/{s['lead']}", json=_CLOSE, headers=s["oh"]).status_code == 200
     assert (_status(c, s, done), _status(c, s, declined), _status(c, s, active)) == (
-        "COMPLETED", "DECLINED", "CANCELLED")
+        "COMPLETED", "REJECTED", "CANCELLED")
     # History stays readable on both sides (lists included).
     assert {done, declined, active} <= {v["id"] for v in c.get("/buyer/visits", headers=s["bh"]).json()["items"]}
     owner_rows = c.get("/owner/visits", params={"property_listing_id": s["lid"]}, headers=s["oh"]).json()["items"]
@@ -193,7 +193,7 @@ def test_close_leaves_other_buyers_visits_alone(client):
                     headers=oh2).json()["id"]
     assert c.patch(f"/owner/leads/{s['lead']}", json=_CLOSE, headers=s["oh"]).status_code == 200
     assert _status(c, s, mine) == "CANCELLED"
-    assert c.get(f"/buyer/visits/{theirs}", headers=oh2).json()["status"] == "REQUESTED"
+    assert c.get(f"/buyer/visits/{theirs}", headers=oh2).json()["status"] == "PENDING"
 
 
 def test_close_and_visit_cancel_are_one_transaction(client, monkeypatch):
@@ -210,11 +210,11 @@ def test_close_and_visit_cancel_are_one_transaction(client, monkeypatch):
     assert c.patch(f"/owner/leads/{s['lead']}", json=_CLOSE, headers=s["oh"]).status_code == 422
     monkeypatch.setattr(visit_svc, "close_visits_for_lead", real)
     session.expire_all()
-    # Neither half landed: the lead is still open and active, the visit still REQUESTED.
+    # Neither half landed: the lead is still open and active, the visit still PENDING.
     assert c.get(f"/owner/leads/{s['lead']}", headers=s["oh"]).json()["status"] == "NEW"
     assert session.execute(text("SELECT COUNT(*) FROM active_enquiries WHERE enquiry_id=:e"),
                            {"e": s["lead"]}).scalar() == 1
-    assert _status(c, s, vid) == "REQUESTED"
+    assert _status(c, s, vid) == "PENDING"
     assert _audits(session, "LEAD_CLOSED", s["lead"]) == []
 
 
@@ -281,7 +281,8 @@ def test_new_enquiry_opens_a_fresh_lead_that_can_schedule_again(client):
     again = c.post("/buyer/enquiries", json={"property_listing_id": s["lid"]}, headers=s["bh"])
     assert again.status_code == 201 and again.json()["id"] != s["lead"]
     vid = _propose(c, s)
-    assert c.patch(f"/buyer/visits/{vid}", json={"status": "CONFIRMED"}, headers=s["bh"]).status_code == 200
+    # Strict Phase 5: the poster confirms their proposal (the buyer cannot).
+    assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=s["oh"]).status_code == 200
     # The old lead and its visit stay closed history.
     assert _status(c, s, old) == "CANCELLED"
     assert c.patch(f"/owner/leads/{s['lead']}", json=_CLOSE, headers=s["oh"]).status_code == 422

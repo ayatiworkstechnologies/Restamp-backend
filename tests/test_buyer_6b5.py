@@ -63,7 +63,10 @@ def test_create_gates(client):
     tok = buyer_token(c, "+916300000002")
     h = auth_header(tok)
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
-    assert c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=h).status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode.
+    # (a separate listing, so the no-rows check below stays about refusals)
+    own_mode_lid = seed_listing(session)
+    assert c.post("/buyer/enquiries", json={"property_listing_id": own_mode_lid}, headers=h).status_code == 201
     buyer = buyer_token(c, "+916300000003")
     hb = auth_header(buyer)
     bad_ids = []

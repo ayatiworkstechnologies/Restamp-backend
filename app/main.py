@@ -10,14 +10,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import is_production, parse_cors_origins, settings
-from .db import check_db
+from .config import is_production, parse_cors_origins, production_local_dev_origins, settings
+from .db import check_db, check_db_schema
 from .routers import admin as admin_router
 from .routers import auth as auth_router
 from .routers import broker as broker_router
 from .routers import buyer as buyer_router
+from .routers import email as email_router
 from .routers import health as health_router
+from .routers import notifications as notifications_router
 from .routers import owner as owner_router
+from .routers import payments as payments_router
+from .routers import subscriptions as subscriptions_router
+from .routers import push as push_router
 from .routers import reva as reva_router
 from .routers import users as users_router
 from .services import storage as storage_svc
@@ -28,9 +33,14 @@ log = logging.getLogger("restamp")
 # Allowed browser origins (native apps are unaffected by CORS).
 # - Production: ONLY the exact origins in RESTAMP_CORS_ORIGINS (validated at
 #   startup: exact public https origins, never "*", never localhost/LAN).
+#   Opt-in exception: RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 adds
+#   EXACTLY http://localhost:3000 and http://localhost:8081
+#   (config.PRODUCTION_LOCAL_DEV_ORIGINS) — no regex, no other port or host;
+#   RESTAMP_CORS_DEV_ORIGINS is ignored in production.
 # - Development: RESTAMP_CORS_ORIGINS if set, else these local defaults
-#   (Expo web :8081, classic :19006), plus any localhost / private-LAN origin
-#   (_DEV_ORIGIN_REGEX) for on-device testing.
+#   (Expo web :8081, classic :19006), plus any origins in
+#   RESTAMP_CORS_DEV_ORIGINS, plus any localhost / private-LAN origin
+#   matching _DEV_ORIGIN_REGEX for on-device testing.
 # Credentials are allowed only for those explicitly listed/matched origins.
 _DEFAULT_LOCAL_ORIGINS = [
     "http://localhost:8081",
@@ -42,7 +52,7 @@ _DEFAULT_LOCAL_ORIGINS = [
 
 _DEV_ORIGIN_REGEX = (
     r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|"
-    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$"
+    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+)(:\d+)?$"
 )
 
 
@@ -51,9 +61,21 @@ def _cors_settings() -> dict:
     configured = parse_cors_origins(settings.CORS_ORIGINS)
     if is_production():
         # Exactly the configured origins; never a regex, never "*" (an
-        # invalid list is refused at startup by validate_security_config).
-        return {"allow_origins": [o for o in configured if o != "*"], "allow_origin_regex": None}
-    return {"allow_origins": configured or _DEFAULT_LOCAL_ORIGINS, "allow_origin_regex": _DEV_ORIGIN_REGEX}
+        # invalid list is refused at startup by validate_security_config),
+        # plus — only with RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 — the
+        # two fixed local origins. RESTAMP_CORS_DEV_ORIGINS is ignored here.
+        allow_origins = list(dict.fromkeys(
+            [o for o in configured if o != "*"] + production_local_dev_origins()
+        ))
+        return {"allow_origins": allow_origins, "allow_origin_regex": None}
+    # Non-production: start with explicit CORS_ORIGINS or built-in defaults,
+    # then add any DEV_CORS_ORIGINS, then allow the regex for local LAN.
+    configured = parse_cors_origins(settings.CORS_ORIGINS)
+    dev_extra = parse_cors_origins(settings.DEV_CORS_ORIGINS)
+    allow_origins = list(dict.fromkeys(
+        (configured or _DEFAULT_LOCAL_ORIGINS) + dev_extra
+    ))
+    return {"allow_origins": allow_origins, "allow_origin_regex": _DEV_ORIGIN_REGEX}
 
 
 @asynccontextmanager
@@ -95,6 +117,15 @@ async def lifespan(app: FastAPI):
     if not check_db():
         log.error("Database unreachable at startup.")
         raise RuntimeError("Database unreachable at startup.")
+
+    # Fail fast when the database schema is behind this codebase's migrations
+    # (added after the contact/enquiry 500s): a missing migration used to
+    # surface only as HTTP 500 on the endpoints whose ORM models read newer
+    # columns while everything else worked. One read-only alembic_version
+    # SELECT; the deploy refuses to serve with the remedy in the logs.
+    if not check_db_schema():
+        log.error("Database schema is not at the expected migration head.")
+        raise RuntimeError("Database schema is out of date at startup.")
 
     # Start background worker for automatic property verification
     async with worker_lifespan():
@@ -147,7 +178,12 @@ def create_app() -> FastAPI:
     @app.exception_handler(HTTPException)
     async def http_error(_: Request, exc: HTTPException):
         # Safe error responses: status + message only, never internals/secrets.
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        # Headers (e.g. Retry-After from the Reva rate limiter) pass through.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=getattr(exc, "headers", None),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, exc: RequestValidationError):
@@ -174,6 +210,34 @@ def create_app() -> FastAPI:
             log.exception("media nosniff middleware error")
         return response
 
+    # Public AI endpoints get a transport-level body cap BEFORE any parsing:
+    # chat JSON stays tiny, audio uploads match the 8 MB application cap
+    # (plus multipart overhead), and the payment webhook body is tiny. Limits
+    # are read at request time (tests patch settings; the value is not
+    # latched at startup). A missing Content-Length (chunked upload) cannot
+    # be cheaply measured here; the endpoint-level checks still bound it.
+    @app.middleware("http")
+    async def _endpoint_body_caps(request: Request, call_next):
+        path = request.url.path
+        limits = (
+            ("/chat", settings.CHAT_MAX_BODY_BYTES),
+            ("/transcribe", settings.TRANSCRIBE_MAX_BODY_BYTES),
+            ("/payments/webhook", 65_536),
+        )
+        for prefix, limit in limits:
+            if path == prefix or path.startswith(prefix + "/"):
+                length = request.headers.get("content-length")
+                try:
+                    if length is not None and int(length) > limit:
+                        return JSONResponse(
+                            status_code=413,
+                            content={"detail": "Request body too large"},
+                        )
+                except ValueError:
+                    pass
+                break
+        return await call_next(request)
+
     app.include_router(health_router.router)
     app.include_router(auth_router.router)
     app.include_router(users_router.router)
@@ -182,6 +246,11 @@ def create_app() -> FastAPI:
     app.include_router(broker_router.router)
     app.include_router(admin_router.router)
     app.include_router(reva_router.router)
+    app.include_router(notifications_router.router)
+    app.include_router(email_router.router)
+    app.include_router(push_router.router)
+    app.include_router(payments_router.router)
+    app.include_router(subscriptions_router.router)
 
     # Servable uploaded listing photos (local-dev storage; see storage.py).
     # Never a source directory — RESTAMP_MEDIA_ROOT lives outside the repo.

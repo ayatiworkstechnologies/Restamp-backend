@@ -300,3 +300,98 @@ def check_db() -> bool:
         except Exception:  # diagnostics must never change the outcome
             log.error("Database check failed: %s", type(exc).__name__)
         return False
+
+
+def _project_schema_heads() -> tuple[str, ...]:
+    """Alembic head revision ids from this codebase's migration files only
+    (no database connection). Empty/oversized results mean the project layout
+    or migration graph is broken; callers fail closed on anything but one head.
+    """
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cfg = Config(os.path.join(root, "alembic.ini"))
+        return tuple(ScriptDirectory.from_config(cfg).get_heads())
+    except Exception:
+        return ()
+
+
+def _project_schema_revisions() -> tuple[str, ...]:
+    """Every revision id defined by this codebase's migration files."""
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cfg = Config(os.path.join(root, "alembic.ini"))
+        return tuple(r.revision for r in ScriptDirectory.from_config(cfg).walk_revisions())
+    except Exception:
+        return ()
+
+
+def check_db_schema() -> bool:
+    """Startup schema check: the connected database must sit exactly at this
+    codebase's single Alembic head (one alembic_version row, a revision this
+    codebase defines).
+
+    Schema drift used to surface only as HTTP 500 on the endpoints whose ORM
+    models read newer columns (e.g. ``enquiries.source_role``) while every
+    other endpoint kept working — invisible until a user hit the failing
+    screen. This check reads one row and fails closed at startup instead:
+    the deploy stays down with the remedy in the logs rather than serving
+    partial functionality. Read-only (one SELECT on ``alembic_version``);
+    it never migrates, creates, or writes. Messages name revision ids and
+    the remedy only — never credentials or hosts.
+    """
+    heads = _project_schema_heads()
+    if len(heads) != 1:
+        log.error(
+            "Database schema check failed: expected exactly one Alembic head "
+            "in this codebase's migrations, found %s.",
+            len(heads),
+        )
+        return False
+    head = heads[0]
+    try:
+        db: Session = SessionLocal()
+        try:
+            rows = db.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+        finally:
+            db.close()
+    except Exception as exc:
+        try:
+            log.error("Database schema check failed: %s", _describe_db_error(exc))
+        except Exception:  # diagnostics must never change the outcome
+            log.error("Database schema check failed: %s", type(exc).__name__)
+        return False
+    versions = [str(row[0]) for row in rows]
+    if len(versions) != 1:
+        log.error(
+            "Database schema check failed: expected exactly one alembic_version "
+            "row, found %s. Connect the service to one database and run "
+            "`alembic upgrade head` if it has never been migrated.",
+            len(versions),
+        )
+        return False
+    version = versions[0]
+    if version == head:
+        return True
+    if version not in _project_schema_revisions():
+        log.error(
+            "Database schema check failed: the database is at revision '%s', "
+            "which this codebase's migrations do not define. This deployment "
+            "is older than the database; deploy matching code before serving.",
+            version,
+        )
+        return False
+    log.error(
+        "Database schema check failed: the database is behind the application "
+        "code (database at '%s', code expects '%s'). Endpoints whose models "
+        "use newer columns will return HTTP 500 until the schema is migrated: "
+        "run `alembic upgrade head` against this database, then restart.",
+        version,
+        head,
+    )
+    return False

@@ -1,19 +1,23 @@
 """RESTAMP property visits — buyer/owner scheduled viewings.
 
-States: REQUESTED (buyer-initiated, awaiting owner), PROPOSED (owner-
-initiated, awaiting buyer), CONFIRMED, DECLINED, CANCELLED, COMPLETED.
+Lifecycle: strict Phase 5 (owner-approved). Every new visit — a buyer
+request (initiator BUYER) or an owner/dealer proposal (initiator OWNER) —
+starts PENDING.
 
 Actor rules (enforced here, never in the frontend):
-- REQUESTED -> CONFIRMED/DECLINED: owner only; -> CANCELLED: either;
-  time edits: buyer only, except the owner's counter-proposal: an owner
-  time change (no status in the same request) moves the visit to PROPOSED
-  at the new time, so the buyer must confirm it — the owner can never set
-  a time the buyer has not agreed to.
-- PROPOSED -> CONFIRMED/DECLINED: buyer only; -> CANCELLED: either;
-  time edits: owner only.
-- CONFIRMED -> COMPLETED: owner only; -> CANCELLED or time edit: either.
-- DECLINED/CANCELLED/COMPLETED are terminal; same-state repeats are
-  idempotent no-ops. Anything else raises ValueError (-> 422).
+- PENDING -> CONFIRMED / REJECTED: the listing's poster (owner or dealer)
+  only, for every pending visit, including the poster's own proposal.
+  PENDING -> CANCELLED: either party (a buyer withdraws a request or turns
+  down a proposal by cancelling it).
+- CONFIRMED -> COMPLETED: poster only; CONFIRMED -> CANCELLED: either.
+- REJECTED / DECLINED / CANCELLED / COMPLETED are terminal.
+- No time or note edits on any visit: the proposer can never edit a
+  submitted proposal, and confirmed/rejected visits are immutable. A new
+  time is a new proposal (reject or cancel, then create another).
+- Same-state repeats are idempotent no-ops (no write, no notification).
+  Anything else raises ValueError (-> 422).
+- Legacy rows created before Phase 5 (REQUESTED / PROPOSED) follow the same
+  rules as PENDING; DECLINED stays a valid terminal state for them.
 
 Creation rules: the listing must be VERIFIED + AVAILABLE with consistent
 dual ownership columns; scheduled_at must be in the future; buyers cannot
@@ -24,14 +28,16 @@ live (closed, removed, unverified) gets a 422 naming that reason — leads
 outlive their listing, and a bare 404 there read as "lead not found". A
 listing the caller does not own stays 404 (no existence leak). Responses carry no phones. Names (D6): the buyer's
 chosen name and the owner's public name, null when there is none — never a
-phone-number default. rescheduled_at (D3) is set when an accepted change
-moves the time and cleared when an accepted change moves the status; the
-shared `note` may be edited by whoever may edit the time in the current
-status ("" clears it).
+phone-number default. rescheduled_at (D3) is cleared by every status change
+(time edits no longer exist, so it is only ever set on legacy rows).
+
+Timestamps: scheduled_at/created_at/updated_at are stored as naive UTC
+(whole seconds) and returned as explicit UTC ("...Z"), so a client can
+never read them as local time.
 
 Closed leads (D5): a visit belongs to the lead (enquiry) of the same
 listing + buyer + owner; the newest such enquiry is the current lead.
-Closing a lead cancels its active visits (REQUESTED/PROPOSED/CONFIRMED ->
+Closing a lead cancels its active visits (PENDING/REQUESTED/PROPOSED/CONFIRMED ->
 CANCELLED) in the same transaction (close_visits_for_lead). While that lead
 stays closed, neither party may create or change a visit for the pair: 422
 LEAD_CLOSED_DETAIL, after the usual 404 scope checks (no existence leak).
@@ -47,6 +53,7 @@ from sqlalchemy.orm import Session
 
 from ..models import ActivityLog, ContactRevealAudit, Enquiry, PhysicalProperty, PropertyListing
 from ..models.visits import PropertyVisit
+from . import notifications as notification_svc
 
 LEAD_CLOSED_DETAIL = "Lead is closed"
 
@@ -57,7 +64,11 @@ LEAD_CLOSED_DETAIL = "Lead is closed"
 # owner proposals, have no requester role (null), never a guessed one.
 VISIT_REQUEST_ACTION = "VISIT_REQUESTED"
 ENTITY_VISIT = "property_visit"
-_ACTIVE_STATUSES = ("REQUESTED", "PROPOSED", "CONFIRMED")
+# Open visits (a lead close cancels these). PENDING is the Phase 5 initial
+# state; REQUESTED/PROPOSED remain for rows created before it.
+_ACTIVE_STATUSES = ("PENDING", "REQUESTED", "PROPOSED", "CONFIRMED")
+# Awaiting the poster's decision (one per buyer+listing+initiator at a time).
+_PENDING_STATUSES = ("PENDING", "REQUESTED", "PROPOSED")
 
 
 def _lead_closed(
@@ -118,7 +129,14 @@ def close_visits_for_lead(db: Session, enquiry: Enquiry) -> list[tuple[int, str]
 
 
 def _utcnow_naive() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    """Naive UTC, whole seconds: DATETIME keeps no fractions (MySQL would
+    round them), so the value returned is exactly the value stored."""
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
+def _utc_out(value: datetime | None) -> datetime | None:
+    """Stored naive UTC -> explicit UTC for the API (serialized with "Z")."""
+    return value.replace(tzinfo=timezone.utc) if value is not None else None
 
 
 def _normalize_scheduled_at(value: datetime) -> datetime:
@@ -182,7 +200,7 @@ def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
             "owner_user_id": visit.owner_user_id,
             "buyer_display_name": names.get(int(visit.buyer_user_id)),
             "owner_display_name": names.get(int(visit.owner_user_id)),
-            "scheduled_at": visit.scheduled_at,
+            "scheduled_at": _utc_out(visit.scheduled_at),
             "status": visit.status,
             "initiator": visit.initiator,
             "requester_role": roles.get(int(visit.id)),
@@ -195,11 +213,9 @@ def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
                 "locality": li["locality"],
                 "city": li["city"],
             },
-            "created_at": visit.created_at,
-            "updated_at": visit.updated_at,
-            "rescheduled_at": (
-                visit.rescheduled_at.replace(tzinfo=timezone.utc) if visit.rescheduled_at else None
-            ),
+            "created_at": _utc_out(visit.created_at),
+            "updated_at": _utc_out(visit.updated_at),
+            "rescheduled_at": _utc_out(visit.rescheduled_at),
         })
     return out
 
@@ -256,7 +272,7 @@ def create_buyer_visit(
         buyer_user_id=buyer_id,
         owner_user_id=owner_id,
         scheduled_at=moment,
-        status="REQUESTED",
+        status="PENDING",
         initiator="BUYER",
         note=note,
         created_at=_utcnow_naive(),
@@ -270,6 +286,12 @@ def create_buyer_visit(
         details={"source_role": source_role, "listing_id": int(listing_id)},
     ))
     db.flush()
+    notification_svc.notify_safely(
+        db, "VISIT_REQUESTED",
+        recipient_id=owner_id, actor_id=buyer_id, entity_id=visit.id,
+        listing_id=listing_id, when=visit.scheduled_at,
+        dedupe_key=f"visit:{visit.id}:REQUESTED",
+    )
     db.refresh(visit)
     return _snapshot(db, visit)
 
@@ -321,7 +343,7 @@ def _has_active_visit_for_buyer_listing(
         .filter(
             PropertyVisit.property_listing_id == listing_id,
             PropertyVisit.buyer_user_id == buyer_id,
-            PropertyVisit.status.in_(("PROPOSED", "REQUESTED")),
+            PropertyVisit.status.in_(_PENDING_STATUSES),
         )
     )
     if initiator is not None:
@@ -372,7 +394,7 @@ def create_owner_visit(
         buyer_user_id=buyer_user_id,
         owner_user_id=owner_id,
         scheduled_at=moment,
-        status="PROPOSED",
+        status="PENDING",
         initiator="OWNER",
         note=note,
         created_at=_utcnow_naive(),
@@ -380,6 +402,12 @@ def create_owner_visit(
     )
     db.add(visit)
     db.flush()
+    notification_svc.notify_safely(
+        db, "VISIT_PROPOSED",
+        recipient_id=buyer_user_id, actor_id=owner_id, entity_id=visit.id,
+        listing_id=listing_id, when=visit.scheduled_at,
+        dedupe_key=f"visit:{visit.id}:PROPOSED",
+    )
     db.refresh(visit)
     return _snapshot(db, visit)
 
@@ -454,31 +482,45 @@ def get_owner_visit(db: Session, owner_id: int, visit_id: int) -> dict:
     return _snapshot(db, visit)
 
 
-# Allowed (status, actor) moves; time edits are gated separately below.
-# "either" = the visit's buyer or owner; otherwise the named party only.
+# Allowed (status, actor) moves. "either" = the visit's buyer or owner;
+# otherwise the named party only. Strict Phase 5 (see module docstring):
+# the poster alone confirms/rejects a pending visit; either party may cancel
+# an open one; there are no back edges, so each status is reached at most
+# once per visit (the notification dedupe keys rely on that).
 _ALLOWED = {
-    ("REQUESTED", "REQUESTED"): ("buyer",),
+    ("PENDING", "CONFIRMED"): ("owner",),
+    ("PENDING", "REJECTED"): ("owner",),
+    ("PENDING", "CANCELLED"): ("either",),
+    # Legacy rows (created before Phase 5) follow the same authority.
     ("REQUESTED", "CONFIRMED"): ("owner",),
+    ("REQUESTED", "REJECTED"): ("owner",),
     ("REQUESTED", "DECLINED"): ("owner",),
     ("REQUESTED", "CANCELLED"): ("either",),
-    ("PROPOSED", "PROPOSED"): ("owner",),
-    ("PROPOSED", "CONFIRMED"): ("buyer",),
-    ("PROPOSED", "DECLINED"): ("buyer",),
+    ("PROPOSED", "CONFIRMED"): ("owner",),
+    ("PROPOSED", "REJECTED"): ("owner",),
+    ("PROPOSED", "DECLINED"): ("owner",),
     ("PROPOSED", "CANCELLED"): ("either",),
+    # Confirmed: schedule immutable; it can only end.
     ("CONFIRMED", "CONFIRMED"): ("either",),
     ("CONFIRMED", "CANCELLED"): ("either",),
     ("CONFIRMED", "COMPLETED"): ("owner",),
+    # Terminal states: same-state repeats only (idempotent no-ops).
+    ("REJECTED", "REJECTED"): ("either",),
     ("DECLINED", "DECLINED"): ("either",),
     ("CANCELLED", "CANCELLED"): ("either",),
     ("COMPLETED", "COMPLETED"): ("either",),
 }
 
-# Who may move the clock in each status (time-only edits keep status).
-_TIME_EDITORS = {
-    "REQUESTED": ("buyer",),
-    "PROPOSED": ("owner",),
-    "CONFIRMED": ("either",),
-}
+_NOTIFIED_STATUSES = ("CONFIRMED", "REJECTED", "DECLINED", "CANCELLED")
+
+
+def _is_proposer(visit: PropertyVisit, actor: str) -> bool:
+    """The party that submitted the visit: the buyer for a buyer request,
+    the poster for a poster proposal (from the stored initiator, never the
+    client)."""
+    return (actor == "buyer" and visit.initiator == "BUYER") or (
+        actor == "owner" and visit.initiator == "OWNER"
+    )
 
 
 def transition_visit(
@@ -490,12 +532,16 @@ def transition_visit(
     to_status: str | None = None,
     note: str | None = None,
 ) -> dict:
-    """Apply a reschedule, note edit and/or status transition with actor enforcement.
+    """Apply a status transition with actor enforcement (strict Phase 5).
 
     Scope: buyers see only buyer_user_id == self, owners only
-    owner_user_id == self (else 404). Invalid moves raise ValueError
-    (-> 422). Same-state repeats are idempotent (time updated when
-    supplied and permitted). Flushes; the caller commits.
+    owner_user_id == self (else 404, no existence leak). The visit row is
+    locked (SELECT ... FOR UPDATE) so concurrent transitions serialize: the
+    second one sees the first one's result and is judged against it.
+    Time/note edits are always refused (422): the proposer may not edit a
+    submitted proposal and nobody may edit a confirmed or rejected one.
+    Same-state repeats change nothing (no write, no notification). Invalid
+    moves raise ValueError (-> 422). Flushes; the caller commits.
     """
     if actor not in ("buyer", "owner"):
         raise ValueError("unknown actor")
@@ -512,83 +558,47 @@ def transition_visit(
         raise ValueError(LEAD_CLOSED_DETAIL)
 
     original_status = visit.status
-    next_moment = None
-    # Owner counter-proposal on a buyer request: a time change alone (never
-    # combined with a status move) re-opens the visit as PROPOSED.
-    counter_proposal = (
-        actor == "owner"
-        and original_status == "REQUESTED"
-        and scheduled_at is not None
-        and to_status is None
-    )
+    if scheduled_at is not None or note is not None:
+        if _is_proposer(visit, actor) and original_status in _PENDING_STATUSES:
+            raise ValueError("The proposer cannot edit a submitted visit proposal")
+        raise ValueError(f"A {original_status} visit cannot be rescheduled or edited")
+    if to_status is None:  # pragma: no cover - the request schema requires a field
+        raise ValueError("status is required")
 
-    if to_status is not None:
-        allowed = _ALLOWED.get((original_status, to_status))
-        if allowed is None:
-            raise ValueError(
-                f"Cannot move visit from {original_status} to {to_status}"
-            )
-        if "either" not in allowed and actor not in allowed:
-            raise ValueError(
-                f"Only {allowed[0]} may move visit from {original_status} to {to_status}"
-            )
+    allowed = _ALLOWED.get((original_status, to_status))
+    if allowed is None:
+        raise ValueError(f"Cannot move visit from {original_status} to {to_status}")
+    if "either" not in allowed and actor not in allowed:
+        raise ValueError(f"Only the {allowed[0]} may move visit from {original_status} to {to_status}")
+    if to_status == original_status:
+        return _snapshot(db, visit)  # idempotent repeat: nothing written
 
-    if scheduled_at is not None:
-        # Time-edit authority is defined by the visit's current state, not the
-        # state being requested in the same request. Checking after applying
-        # to_status lets a confirming party smuggle in a time change.
-        editors = _TIME_EDITORS.get(original_status)
-        if editors is None:
-            raise ValueError(f"Cannot reschedule a {original_status} visit")
-        if not counter_proposal and "either" not in editors and actor not in editors:
-            raise ValueError(
-                f"Only {editors[0]} may reschedule a {original_status} visit"
-            )
-        next_moment = _normalize_scheduled_at(scheduled_at)
-        # Lock the parent listing row to serialize competing reschedule
-        # requests for the same buyer+listing pair.
-        db.query(PropertyListing.id).filter(
-            PropertyListing.id == visit.property_listing_id
-        ).with_for_update().first()
-        if _has_active_visit_for_buyer_listing(
-            db,
-            visit.property_listing_id,
-            visit.buyer_user_id,
-            initiator=visit.initiator,
-            exclude_visit_id=visit.id,
-        ):
-            raise ValueError(
-                "A conflicting visit already exists for this buyer on this listing"
-            )
-
-    if note is not None:
-        # The shared note follows time-edit authority in the CURRENT status.
-        editors = _TIME_EDITORS.get(original_status)
-        if editors is None:
-            raise ValueError(f"Cannot edit the note of a {original_status} visit")
-        # A counter-proposal may carry the owner's note with the new time; a
-        # note-only owner edit of a buyer request is still refused.
-        if not counter_proposal and "either" not in editors and actor not in editors:
-            raise ValueError(f"Only {editors[0]} may edit the note of a {original_status} visit")
-
-    now = _utcnow_naive()
-    if next_moment is not None:
-        if next_moment != visit.scheduled_at:
-            visit.rescheduled_at = now.replace(microsecond=0)
-        visit.scheduled_at = next_moment
-    if to_status is not None:
-        if to_status != original_status:
-            visit.rescheduled_at = None  # a status change ends the "Rescheduled" display state
-        visit.status = to_status
-    if counter_proposal:
-        # Now awaiting the buyer's reply, like any owner proposal (status
-        # change, so the "Rescheduled" display state is cleared too).
-        visit.status = "PROPOSED"
-        visit.rescheduled_at = None
-    if note is not None:
-        visit.note = note.strip() or None
-
-    visit.updated_at = now
+    visit.status = to_status
+    visit.rescheduled_at = None  # a status change ends the "Rescheduled" display state
+    visit.updated_at = _utcnow_naive()  # created_at is never touched
     db.flush()
+    if to_status in _NOTIFIED_STATUSES:
+        _notify_other_party(db, visit, actor, actor_id)
     db.refresh(visit)
     return _snapshot(db, visit)
+
+
+def _notify_other_party(db: Session, visit: PropertyVisit, actor: str, actor_id: int) -> None:
+    """Tell the OTHER party about a real status change (never the actor).
+
+    Each status is reachable at most once per visit (_ALLOWED has no back
+    edges), so ``visit:{id}:{status}`` dedupes retries. COMPLETED is silent.
+    Lead-close cancellations never come through here (close_visits_for_lead),
+    so a close sends one lead notification only. When the poster confirms or
+    rejects their own proposal, the buyer is the one told.
+    """
+    if actor == "buyer":
+        recipient_id, audience = visit.owner_user_id, "OWNER"
+    else:
+        recipient_id, audience = visit.buyer_user_id, "BUYER"
+    notification_svc.notify_safely(
+        db, f"VISIT_{visit.status}", audience=audience,
+        recipient_id=recipient_id, actor_id=actor_id, entity_id=visit.id,
+        listing_id=visit.property_listing_id, when=visit.scheduled_at,
+        dedupe_key=f"visit:{visit.id}:{visit.status}",
+    )

@@ -39,7 +39,9 @@ def test_save_gates_and_duplicates(client):
     tok = register_phone(c, "+916400000002")
     h = auth_header(tok["access_token"])
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
-    assert c.post(f"/buyer/saved/{lid}", headers=h).status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode.
+    # (a separate listing, so the per-listing count below is unaffected)
+    assert c.post(f"/buyer/saved/{seed_listing(session)}", headers=h).status_code == 201
     hb = buyer(c, "+916400000003")
     for kwargs in ({"verification": "PENDING"}, {"status": "SOLD"}):
         bad = seed_listing(session, **kwargs)

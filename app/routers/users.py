@@ -16,7 +16,7 @@ from ..security import (
     get_session_amr,
     is_fixed_otp_session,
 )
-from ..services import users_roles
+from ..services import capabilities, users_roles
 
 router = APIRouter(tags=["users"])
 
@@ -77,6 +77,7 @@ def update_my_profile(
         role=users_roles.get_current_role(db, updated.id),
         providers=providers,
         is_admin=users_roles.is_admin(db, updated.id),
+        capabilities=capabilities.capabilities(db, updated.id),
     )
 
 
@@ -89,9 +90,17 @@ def my_role(db: Session = Depends(get_db), user=Depends(get_current_user)):
 def set_my_role(
     body: schemas.RoleSet, db: Session = Depends(get_db), user=Depends(get_current_user)
 ):
-    role = users_roles.set_current_role(db, user.id, body.role)
+    # Mode switch only: grants no capability, and an Owner account can never
+    # enter Dealer mode (or vice versa) -> 409 POSTER_TYPE_CONFLICT.
+    role = capabilities.switch_mode(db, user.id, body.role)
     db.commit()
     return schemas.RoleOut(user_id=user.id, role=role)
+
+
+@router.get("/users/me/capabilities", response_model=schemas.CapabilitiesOut)
+def my_capabilities(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """What this account may do, as the backend enforces it (read-only)."""
+    return capabilities.capabilities(db, user.id)
 
 
 @router.get("/users/me/history")

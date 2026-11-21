@@ -8,7 +8,7 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, fresh_pincode, register_phone
+from tests.conftest import grant_test_posting_plan, auth_header, fresh_pincode, register_phone
 from tests.test_owner_photos import JPEG_BYTES, PNG_1PX, _mock_cloud
 
 
@@ -16,6 +16,7 @@ def _setup_owner_with_phone(client, phone: str) -> str:
     token_out = register_phone(client, phone)
     token = token_out["access_token"]
     r = client.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(client, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 

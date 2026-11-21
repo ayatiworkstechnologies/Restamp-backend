@@ -52,6 +52,7 @@ from ..models import (
     PropertyListing,
 )
 from . import listings as listing_svc
+from . import notifications as notification_svc
 from . import visits as visit_svc
 
 _DOUBLE_TAP_SECONDS = 60
@@ -338,6 +339,34 @@ def _append_message(
     return row, True
 
 
+def _notify_follow_up(db: Session, enquiry: Enquiry, row: EnquiryMessage | None, stored: bool) -> None:
+    """Buyer follow-up on an existing enquiry -> the enquiry's owner, coalesced:
+    no new notification while the owner still has an unread new-enquiry or
+    follow-up notification for this enquiry from the last 10 minutes. Only a
+    newly STORED message counts (a double tap stores nothing).
+
+    Concurrency: callers hold the enquiry row lock (SELECT ... FOR UPDATE in
+    _append_message, held to COMMIT), and every ENQUIRY_NEW / ENQUIRY_MESSAGE
+    writer for this enquiry holds it too (the creator holds the implicit lock
+    on its newly inserted enquiry row). Concurrent follow-ups — including the
+    create_enquiry IntegrityError race branch, whose loser appends to the
+    winner's enquiry — therefore run one after another, and the coalescing
+    check reads the latest committed notifications through a fresh read view
+    (notifications._recent_unread_exists), not this transaction's older
+    REPEATABLE READ snapshot. Proven by tests/test_notifications_concurrency.py
+    against real MySQL with two connections."""
+    if not stored or row is None:
+        return
+    notification_svc.notify_safely(
+        db, "ENQUIRY_MESSAGE",
+        recipient_id=enquiry.owner_user_id, actor_id=row.sender_user_id,
+        entity_id=enquiry.id, listing_id=enquiry.property_listing_id,
+        dedupe_key=f"enquiry:{enquiry.id}:message:{row.id}",
+        coalesce_types=("ENQUIRY_NEW", "ENQUIRY_MESSAGE"),
+        coalesce_seconds=notification_svc.FOLLOW_UP_COALESCE_SECONDS,
+    )
+
+
 def create_enquiry(
     db: Session, buyer_id: int, listing_id: int, message: str | None, *, source_role: str
 ) -> tuple[dict, bool]:
@@ -363,21 +392,30 @@ def create_enquiry(
         )
     body = _clean_message(message)
 
-    def _active() -> Enquiry | None:
-        row = (
-            db.query(ActiveEnquiry)
-            .filter(
-                ActiveEnquiry.buyer_user_id == buyer_id,
-                ActiveEnquiry.property_listing_id == listing_id,
-            )
-            .first()
+    def _active(current: bool = False) -> Enquiry | None:
+        # current=True (race branch only): a locking read returns the latest
+        # COMMITTED rows. The concurrent winner's active row and enquiry were
+        # committed after this transaction's REPEATABLE READ snapshot, so a
+        # plain read cannot see them (that made the loser fail with 409
+        # instead of appending). Both are equality lookups on rows the
+        # duplicate-key error proves exist (unique key / primary key), so
+        # InnoDB takes record locks only, no gap locks.
+        q = db.query(ActiveEnquiry).filter(
+            ActiveEnquiry.buyer_user_id == buyer_id,
+            ActiveEnquiry.property_listing_id == listing_id,
         )
-        return db.get(Enquiry, row.enquiry_id) if row is not None else None
+        row = (q.with_for_update() if current else q).first()
+        if row is None:
+            return None
+        if current:
+            return db.get(Enquiry, row.enquiry_id, with_for_update=True, populate_existing=True)
+        return db.get(Enquiry, row.enquiry_id)
 
     existing = _active()
     if existing is not None:
         if body:
-            _append_message(db, existing, buyer_id, body)
+            row, stored = _append_message(db, existing, buyer_id, body)
+            _notify_follow_up(db, existing, row, stored)
         return _buyer_items(db, [existing], with_messages=True)[0], False
 
     now = _utcnow_naive_seconds()
@@ -403,12 +441,21 @@ def create_enquiry(
             db.flush()
     except IntegrityError:
         # Lost a concurrent race: the winner's enquiry now exists — append to it.
-        existing = _active()
+        existing = _active(current=True)
         if existing is None:  # pragma: no cover - defensive; constraint guarantees a row
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Enquiry already active")
         if body:
-            _append_message(db, existing, buyer_id, body)
+            row, stored = _append_message(db, existing, buyer_id, body)
+            _notify_follow_up(db, existing, row, stored)
         return _buyer_items(db, [existing], with_messages=True)[0], False
+    # A genuinely new lead (not a reused active enquiry): tell the owner. One
+    # key per enquiry, so a retry can never notify twice.
+    notification_svc.notify_safely(
+        db, "ENQUIRY_NEW",
+        recipient_id=enquiry.owner_user_id, actor_id=buyer_id,
+        entity_id=enquiry.id, listing_id=listing_id,
+        dedupe_key=f"enquiry:{enquiry.id}:new",
+    )
     return _buyer_items(db, [enquiry], with_messages=True)[0], True
 
 
@@ -485,6 +532,7 @@ def transition_owner_lead(
     if to_status not in _ALLOWED_OWNER_TRANSITIONS.get(previous_status, set()):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     enquiry.status = to_status
+    cancelled: list = []
     if to_status == "CLOSED":
         enquiry.closing_reason = closing_reason
         db.query(ActiveEnquiry).filter(ActiveEnquiry.enquiry_id == enquiry.id).delete()
@@ -511,6 +559,20 @@ def transition_owner_lead(
                 created_at=_utcnow_naive_seconds(),
             ))
     db.flush()
+    # Buyer (enquiry sender) hears about real changes only: CONTACTED once per
+    # enquiry (a NEW<->CONTACTED flip-flop cannot notify twice: same key) and
+    # CLOSED once (terminal). A move back to NEW and same-state repeats are
+    # silent. A close that cancelled visits sends this ONE notification
+    # (with a suffix), never one per cancelled visit. The closing reason is
+    # the owner's private outcome and is not shown.
+    if to_status != previous_status and to_status in ("CONTACTED", "CLOSED"):
+        notification_svc.notify_safely(
+            db, "LEAD_CONTACTED" if to_status == "CONTACTED" else "LEAD_CLOSED",
+            recipient_id=enquiry.buyer_user_id, actor_id=owner_id,
+            entity_id=enquiry.id, listing_id=enquiry.property_listing_id,
+            dedupe_key=f"enquiry:{enquiry.id}:status:{to_status}",
+            body_suffix=notification_svc.LEAD_CLOSED_VISITS_SUFFIX if cancelled else "",
+        )
     return _owner_items(db, [enquiry], with_messages=False)[0]
 
 
@@ -623,6 +685,14 @@ def reply_as_owner(db: Session, owner_id: int, lead_id: int, body: str) -> tuple
     if enquiry.status == "CLOSED":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Lead is closed")
     row, created = _append_message(db, enquiry, owner_id, body)
+    if created:
+        # One notification per stored reply (a double tap stores nothing).
+        notification_svc.notify_safely(
+            db, "ENQUIRY_REPLY",
+            recipient_id=enquiry.buyer_user_id, actor_id=owner_id,
+            entity_id=enquiry.id, listing_id=enquiry.property_listing_id,
+            dedupe_key=f"enquiry:{enquiry.id}:message:{row.id}",
+        )
     return _message_out(enquiry, row), created
 
 

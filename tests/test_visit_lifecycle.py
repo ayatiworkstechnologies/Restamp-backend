@@ -1,8 +1,9 @@
 """Two-way site-visit lifecycle across buyer and owner endpoints.
 
-Covers the flows the apps drive end to end: buyer request -> owner receives
--> owner confirms or counter-proposes; owner proposes from a lead -> buyer
-receives -> buyer confirms; reschedules visible to the other side; the
+Covers the flows the apps drive end to end under the strict Phase 5
+lifecycle: buyer request (PENDING) -> owner receives -> owner confirms;
+owner proposes from a lead (PENDING) -> buyer receives -> the poster
+confirms; time edits (counter-proposals, reschedules) are refused; the
 owner's "propose on a listing that is no longer live" case (previously a
 bare 404 the app showed as "The visit or listing could not be found");
 and cross-user isolation. Rollback-isolated `client` fixture.
@@ -23,8 +24,9 @@ def _iso(moment):
 
 
 def _naive(moment):
-    """How VisitOut.scheduled_at comes back: naive UTC ISO (no zone)."""
-    return moment.replace(tzinfo=None).isoformat()
+    """How VisitOut.scheduled_at comes back: the UTC instant with an
+    explicit "Z" (never a zone-less value a client could read as local)."""
+    return moment.replace(tzinfo=None).isoformat() + "Z"
 
 
 def _setup(c):
@@ -48,19 +50,19 @@ def test_buyer_request_reaches_owner_with_time_and_note(client):
                                        "note": "Evening please"}, headers=bh)
     assert r.status_code == 201, r.text
     vid = r.json()["id"]
-    assert r.json()["status"] == "REQUESTED"
+    assert r.json()["status"] == "PENDING"
     assert r.json()["scheduled_at"] == _naive(when)
 
     owner_rows = c.get("/owner/visits", params={"property_listing_id": lid}, headers=oh).json()["items"]
     row = next(v for v in owner_rows if v["id"] == vid)
-    assert row["status"] == "REQUESTED" and row["initiator"] == "BUYER"
+    assert row["status"] == "PENDING" and row["initiator"] == "BUYER"
     assert row["scheduled_at"] == _naive(when) and row["note"] == "Evening please"
     assert row["buyer_user_id"] == buyer["user_id"]
     assert row["owner_user_id"] == _owner_id(c, oh) and row["property_listing_id"] == lid
     assert c.get("/buyer/visits", headers=bh).json()["items"][0]["id"] == vid
 
 
-def test_owner_proposal_from_lead_reaches_buyer_who_confirms(client):
+def test_owner_proposal_from_lead_reaches_buyer_and_poster_confirms(client):
     c, _ = client
     lid, buyer, bh, oh = _setup(c)
     # Exactly what the app sends: ids from the owner's lead row.
@@ -73,11 +75,13 @@ def test_owner_proposal_from_lead_reaches_buyer_who_confirms(client):
     vid = r.json()["id"]
 
     mine = next(v for v in c.get("/buyer/visits", headers=bh).json()["items"] if v["id"] == vid)
-    assert mine["status"] == "PROPOSED" and mine["initiator"] == "OWNER"
+    assert mine["status"] == "PENDING" and mine["initiator"] == "OWNER"
     assert mine["scheduled_at"] == _naive(when) and mine["note"] == "Morning works"
     assert mine["buyer_user_id"] == buyer["user_id"] and mine["property_listing_id"] == lid
 
-    assert c.patch(f"/buyer/visits/{vid}", json={"status": "CONFIRMED"}, headers=bh).status_code == 200
+    # Strict Phase 5: the buyer cannot confirm; the poster does.
+    assert c.patch(f"/buyer/visits/{vid}", json={"status": "CONFIRMED"}, headers=bh).status_code == 422
+    assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=oh).status_code == 200
     owner_view = c.get(f"/owner/visits/{vid}", headers=oh).json()
     assert owner_view["status"] == "CONFIRMED" and owner_view["scheduled_at"] == _naive(when)
 
@@ -95,30 +99,33 @@ def test_owner_confirms_request_and_buyer_sees_confirmed_same_time(client):
     assert buyer_view["scheduled_at"] == r.json()["scheduled_at"] == _naive(when)
 
 
-def test_owner_counter_proposes_a_new_time_on_a_buyer_request(client):
+def test_owner_offers_another_time_by_rejecting_and_proposing(client):
+    """Strict Phase 5 has no counter-proposal edit: the owner cannot change
+    the time of a buyer's request (the owner can never impose a time on
+    it). Offering another time = reject the request, then propose anew."""
     c, _ = client
-    lid, _buyer_out, bh, oh = _setup(c)
-    vid = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": _iso(_at(5)),
+    lid, buyer, bh, oh = _setup(c)
+    when = _at(5)
+    vid = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": _iso(when),
                                          "note": "Evening please"}, headers=bh).json()["id"]
     counter = _at(6)
     r = c.patch(f"/owner/visits/{vid}", json={"scheduled_at": _iso(counter), "note": "Only mornings"},
                 headers=oh)
-    assert r.status_code == 200, r.text
-    body = r.json()
-    # Awaiting the buyer — the owner cannot impose a time.
-    assert body["status"] == "PROPOSED" and body["initiator"] == "BUYER"
-    assert body["scheduled_at"] == _naive(counter) and body["note"] == "Only mornings"
-    assert body["rescheduled_at"] is None  # status changed: "Awaiting your reply", not "Rescheduled"
+    assert r.status_code == 422, r.text
+    unchanged = c.get(f"/buyer/visits/{vid}", headers=bh).json()
+    assert unchanged["status"] == "PENDING" and unchanged["scheduled_at"] == _naive(when)
+    assert unchanged["note"] == "Evening please"
 
-    buyer_view = c.get(f"/buyer/visits/{vid}", headers=bh).json()
-    assert buyer_view["status"] == "PROPOSED" and buyer_view["scheduled_at"] == _naive(counter)
-    # Buyer accepts the owner's time; both sides agree on the persisted time.
-    assert c.patch(f"/buyer/visits/{vid}", json={"status": "CONFIRMED"}, headers=bh).status_code == 200
-    assert c.get(f"/owner/visits/{vid}", headers=oh).json()["status"] == "CONFIRMED"
-    assert c.get(f"/owner/visits/{vid}", headers=oh).json()["scheduled_at"] == _naive(counter)
+    assert c.patch(f"/owner/visits/{vid}", json={"status": "REJECTED"}, headers=oh).status_code == 200
+    r = c.post("/owner/visits", json={"property_listing_id": lid, "buyer_user_id": buyer["user_id"],
+                                       "scheduled_at": _iso(counter), "note": "Only mornings"}, headers=oh)
+    assert r.status_code == 201, r.text
+    offer = c.get(f"/buyer/visits/{r.json()['id']}", headers=bh).json()
+    assert offer["status"] == "PENDING" and offer["initiator"] == "OWNER"
+    assert offer["scheduled_at"] == _naive(counter) and offer["note"] == "Only mornings"
 
 
-def test_counter_proposal_rules_stay_strict(client):
+def test_time_and_note_edits_stay_refused(client):
     c, _ = client
     lid, _buyer_out, bh, oh = _setup(c)
     vid = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": FUTURE(5)},
@@ -130,24 +137,26 @@ def test_counter_proposal_rules_stay_strict(client):
     assert r.status_code == 422
     r = c.patch(f"/owner/visits/{vid}", json={"scheduled_at": _iso(_at(-1))}, headers=oh)
     assert r.status_code == 422
-    assert c.get(f"/buyer/visits/{vid}", headers=bh).json()["status"] == "REQUESTED"
-    # After the counter-proposal the buyer still cannot move an owner-proposed time.
-    assert c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(6)}, headers=oh).status_code == 200
+    assert c.get(f"/buyer/visits/{vid}", headers=bh).json()["status"] == "PENDING"
+    # Neither side may move the time; the proposer (here the buyer) is told why.
+    assert c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(6)}, headers=oh).status_code == 422
     r = c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": FUTURE(7)}, headers=bh)
-    assert r.status_code == 422 and r.json()["detail"] == "Only owner may reschedule a PROPOSED visit"
+    assert r.status_code == 422 and r.json()["detail"] == "The proposer cannot edit a submitted visit proposal"
 
 
-def test_owner_reschedule_of_confirmed_visit_reaches_buyer(client):
+def test_confirmed_visit_cannot_be_rescheduled(client):
     c, _ = client
     lid, _buyer_out, bh, oh = _setup(c)
     vid = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": FUTURE(5)},
                  headers=bh).json()["id"]
     assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=oh).status_code == 200
+    before = c.get(f"/buyer/visits/{vid}", headers=bh).json()
     moved = _at(9)
     r = c.patch(f"/owner/visits/{vid}", json={"scheduled_at": _iso(moved)}, headers=oh)
-    assert r.status_code == 200 and r.json()["status"] == "CONFIRMED"
+    assert r.status_code == 422 and r.json()["detail"] == "A CONFIRMED visit cannot be rescheduled or edited"
+    assert c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": _iso(moved)}, headers=bh).status_code == 422
     buyer_view = c.get(f"/buyer/visits/{vid}", headers=bh).json()
-    assert buyer_view["scheduled_at"] == _naive(moved) and buyer_view["rescheduled_at"] is not None
+    assert buyer_view["scheduled_at"] == before["scheduled_at"] and buyer_view["rescheduled_at"] is None
 
 
 def test_owner_propose_on_own_listing_that_is_no_longer_live(client):
@@ -173,6 +182,36 @@ def test_owner_propose_on_removed_listing(client):
                                        "scheduled_at": FUTURE(3)}, headers=oh)
     assert r.status_code == 422
     assert r.json()["detail"] == "Visits can only be scheduled on a live listing"
+
+
+def test_owner_propose_eligibility_follows_listing_state(client):
+    """The backend, not the app, decides: an owner may propose only on a
+    VERIFIED + AVAILABLE, not-deleted listing. PENDING (awaiting verification),
+    REJECTED and non-AVAILABLE listings are refused with the same 422, and no
+    visit row is created; the live listing accepts the proposal."""
+    from app.models import PropertyListing, PropertyVisit
+
+    c, session = client
+    lid, buyer, _bh, oh = _setup(c)
+    body = {"property_listing_id": lid, "buyer_user_id": buyer["user_id"], "scheduled_at": FUTURE(3)}
+    listing = session.get(PropertyListing, lid)
+    assert (listing.verification_status, listing.listing_status) == ("VERIFIED", "AVAILABLE")
+
+    for verification, availability in (("PENDING", "AVAILABLE"), ("REJECTED", "AVAILABLE"),
+                                       ("VERIFIED", "CLOSED"), ("VERIFIED", "SOLD")):
+        listing.verification_status, listing.listing_status = verification, availability
+        session.flush()
+        r = c.post("/owner/visits", json=body, headers=oh)
+        assert r.status_code == 422, (verification, availability, r.text)
+        assert r.json()["detail"] == "Visits can only be scheduled on a live listing"
+        assert session.query(PropertyVisit).filter_by(property_listing_id=lid).count() == 0
+
+    listing.verification_status, listing.listing_status = "VERIFIED", "AVAILABLE"
+    session.flush()
+    r = c.post("/owner/visits", json=body, headers=oh)
+    assert r.status_code == 201, r.text
+    assert r.json()["initiator"] == "OWNER" and r.json()["property_listing_id"] == lid
+    assert session.query(PropertyVisit).filter_by(property_listing_id=lid).count() == 1
 
 
 def test_owner_propose_on_foreign_or_missing_listing_stays_404(client):
@@ -202,4 +241,4 @@ def test_visits_are_isolated_between_users(client):
     assert c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(6)}, headers=oh2).status_code == 404
     # Role gates: a buyer token cannot use owner endpoints.
     assert c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(6)}, headers=bh).status_code == 403
-    assert c.get(f"/buyer/visits/{vid}", headers=bh).json()["status"] == "REQUESTED"
+    assert c.get(f"/buyer/visits/{vid}", headers=bh).json()["status"] == "PENDING"

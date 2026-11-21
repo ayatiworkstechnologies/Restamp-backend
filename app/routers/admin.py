@@ -23,7 +23,14 @@ Endpoints (permission in brackets; "admin" = any admin):
   POST /admin/users/{id}/reactivate       [users.suspend]
   GET  /admin/enquiries                   [enquiries.view]  read-only
   GET  /admin/enquiries/{id}              [enquiries.view]  thread, never lead notes
+  GET  /admin/subscriptions               [reports.view]  read-only; flags SIMULATED payments
+  GET  /admin/payments                    [reports.view]  read-only; flags SIMULATED payments
+  GET  /admin/plans, /admin/plan-history  [reports.view]
+  POST /admin/plans, PATCH /admin/plans/{id}, POST /admin/plans/{id}/status  [settings.configure_platform]
+  POST /admin/users/{id}/subscription     [users.suspend]  assign / change plan (audited)
+  POST /admin/subscriptions/{id}/extend|suspend|reactivate|cancel  [users.suspend]
   GET  /admin/audit-logs                  [settings.view_audit_logs]
+  GET  /admin/email-deliveries            [settings.view_audit_logs]  read-only delivery records
   GET  /admin/staff                       [settings.manage_team]
   POST /admin/staff                       [settings.manage_team]
   PATCH /admin/staff/{user_id}            [settings.manage_team]
@@ -52,8 +59,14 @@ from ..config import area_seeding_enabled
 from ..db import get_db
 from ..deps import require_admin, require_admin_permission
 from ..services import admin as admin_svc
+from ..services import capabilities as capabilities_svc
+from ..services import payment_refunds as refund_svc
+from ..services import contact_credits as credit_svc
+from ..services import subscriptions as sub_svc
 from ..services import agent_plans as agent_plan_svc
+from ..services import email as email_svc
 from ..services import localities as locality_svc
+from ..services import push as push_svc
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -226,6 +239,209 @@ def admin_list_enquiries(
     return schemas.AdminEnquiriesResponse(items=items, page=page, page_size=page_size, total=total)
 
 
+# --- billing (read-only; no payment gateway exists) ----------------------------------
+
+@router.get("/subscriptions", response_model=schemas.AdminSubscriptionsResponse)
+def admin_list_subscriptions(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("reports.view")),
+    sub_status: Literal["ACTIVE", "EXPIRED", "CANCELLED", "SUSPENDED"] | None = Query(default=None, alias="status"),
+    user_id: int | None = Query(default=None, ge=1),
+    role: UserRole | None = Query(default=None),
+    plan_code: str | None = Query(default=None, max_length=50),
+    q: str | None = Query(default=None, max_length=255),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    items, total = admin_svc.list_subscriptions(db, page, page_size, sub_status=sub_status, user_id=user_id,
+                                                plan_role=role, plan_code=plan_code, q=q)
+    return schemas.AdminSubscriptionsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+# --- subscription management (services/subscriptions.py) -------------------------------
+
+@router.get("/plans", response_model=schemas.SubscriptionPlansResponse)
+def admin_list_plans(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("reports.view")),
+    role: UserRole | None = Query(default=None),
+    include_archived: bool = Query(default=False),
+):
+    return schemas.SubscriptionPlansResponse(items=sub_svc.list_plans(db, role=role, include_archived=include_archived))
+
+
+@router.post("/plans", response_model=schemas.SubscriptionPlanOut, status_code=201)
+def admin_create_plan(
+    body: schemas.SubscriptionPlanCreate,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    out = sub_svc.create_plan(db, admin_id, body.model_dump())
+    db.commit()
+    return out
+
+
+@router.patch("/plans/{plan_id}", response_model=schemas.SubscriptionPlanOut)
+def admin_update_plan(
+    plan_id: int,
+    body: schemas.SubscriptionPlanUpdate,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    data = body.model_dump(exclude_unset=True)
+    note = data.pop("change_note", None)
+    out = sub_svc.update_plan(db, admin_id, plan_id, data, note)
+    db.commit()
+    return out
+
+
+@router.post("/plans/{plan_id}/status", response_model=schemas.SubscriptionPlanOut)
+def admin_set_plan_status(
+    plan_id: int,
+    body: schemas.SubscriptionPlanStatusIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    out = sub_svc.set_plan_status(db, admin_id, plan_id, body.status)
+    db.commit()
+    return out
+
+
+@router.get("/plan-history", response_model=schemas.PlanHistoryResponse)
+def admin_plan_history(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("reports.view")),
+    plan_id: int | None = Query(default=None, ge=1),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+):
+    items, total = sub_svc.plan_history(db, plan_id, page, page_size)
+    return schemas.PlanHistoryResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.post("/users/{user_id}/subscription", response_model=schemas.UserSubscriptionOut)
+def admin_assign_subscription(
+    user_id: int,
+    body: schemas.AdminAssignSubscriptionIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("users.suspend")),
+):
+    """Assign / change (upgrade, downgrade) a user's plan. Ends the user's current
+    plan of that role (history kept), records an ADMIN (unpaid) payment row, audits."""
+    out = sub_svc.admin_assign(db, admin_id, user_id, body.plan_code, body.reason, body.validity_days)
+    db.commit()
+    return out
+
+
+@router.post("/users/{user_id}/poster-type", response_model=schemas.PosterTypeConvertOut)
+def admin_convert_poster_type(
+    user_id: int,
+    body: schemas.PosterTypeConvertIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("users.suspend")),
+):
+    """Owner <-> Dealer conversion (admin-only, audited, reason required).
+    409 while a subscription of the current poster type is active; never
+    cancels, refunds or transfers anything; listings stay with the user."""
+    target = "BROKER" if body.poster_type == "DEALER" else body.poster_type
+    out = capabilities_svc.convert_poster_type(db, admin_id, user_id, target, body.reason)
+    db.commit()
+    return out
+
+
+@router.post("/subscriptions/{sub_id}/extend", response_model=schemas.UserSubscriptionOut)
+def admin_extend_subscription(
+    sub_id: int,
+    body: schemas.AdminExtendSubscriptionIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("users.suspend")),
+):
+    out = sub_svc.admin_extend(db, admin_id, sub_id, body.days, body.reason)
+    db.commit()
+    return out
+
+
+@router.post("/subscriptions/{sub_id}/{action}", response_model=schemas.UserSubscriptionOut)
+def admin_change_subscription_state(
+    sub_id: int,
+    action: Literal["suspend", "reactivate", "cancel"],
+    body: schemas.AdminSubscriptionReasonIn | None = None,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("users.suspend")),
+):
+    out = sub_svc.admin_set_state(db, admin_id, sub_id, action, (body.reason if body else None) or "")
+    db.commit()
+    return out
+
+
+@router.get("/contact-credits/pack", response_model=schemas.ContactCreditPackOut)
+def admin_get_contact_credit_pack(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("reports.view")),
+):
+    return credit_svc.pack_info(db)
+
+
+@router.put("/contact-credits/pack", response_model=schemas.ContactCreditPackOut)
+def admin_set_contact_credit_pack(
+    body: schemas.ContactCreditPackIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    """Set the 25-credit pack's price (paise) and whether it is on sale.
+    Versioned (plan_versions) and audited. The credit count is fixed at 25."""
+    out = credit_svc.set_pack_price(db, admin_id, body.price_paise, body.active, body.note)
+    db.commit()
+    return out
+
+
+@router.get("/payments/reviews", response_model=schemas.AdminPaymentReviewsResponse)
+def admin_list_payment_reviews(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("reports.view")),
+    review_status: Literal["PENDING", "RESOLVED"] | None = Query(default="PENDING"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """Verified payments flagged for manual review (no plan was granted), with
+    their refund state. Read-only."""
+    items, total = refund_svc.list_reviews(db, review_status, page, page_size)
+    return schemas.AdminPaymentReviewsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.post("/payments/{payment_id}/refund", response_model=schemas.PaymentRefundOut)
+async def admin_refund_payment(
+    payment_id: int,
+    body: schemas.PaymentRefundIn,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+):
+    """Refund a manual-review payment in full through Razorpay (audited).
+    409 when it is not awaiting review or a refund is already requested;
+    502 (recorded as FAILED, retryable) when the gateway fails. PROCESSED is
+    set only from the gateway's answer or its signed webhook."""
+    out = await refund_svc.request_refund(db, admin_id, payment_id, body.reason)
+    db.commit()
+    if out["status"] == "FAILED":
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail={"code": "REFUND_GATEWAY_FAILED", "failure_code": out["failure_code"],
+                                    "refund_id": out["id"]})
+    return out
+
+
+@router.get("/payments", response_model=schemas.AdminPaymentsResponse)
+def admin_list_payments(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("reports.view")),
+    payment_status: Literal["INITIATED", "SUCCESS", "FAILED"] | None = Query(default=None, alias="status"),
+    user_id: int | None = Query(default=None, ge=1),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    items, total = admin_svc.list_payments(db, page, page_size, payment_status=payment_status, user_id=user_id)
+    return schemas.AdminPaymentsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
 @router.get("/enquiries/{enquiry_id}", response_model=schemas.AdminEnquiryDetailOut)
 def admin_get_enquiry(
     enquiry_id: int, db: Session = Depends(get_db),
@@ -249,6 +465,47 @@ def admin_audit_logs(
     items, total = admin_svc.list_audit_logs(
         db, page, page_size, action=action, entity=entity, actor_user_id=actor_user_id)
     return schemas.AdminAuditLogsResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+# --- email delivery (Phase 3) -----------------------------------------------------------
+
+@router.get("/email-deliveries", response_model=schemas.AdminEmailDeliveriesResponse)
+def admin_email_deliveries(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("settings.view_audit_logs")),
+    status_filter: schemas.EmailOutboxStatus | None = Query(default=None, alias="status"),
+    category: schemas.EmailCategory | None = Query(default=None),
+    user_id: int | None = Query(default=None, ge=1),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """Read-only delivery records: status, category, recipient account (id +
+    masked address), created/sent/failed times, attempts and failure kind.
+    Never an email body, a verification code or provider credentials."""
+    items, total = email_svc.admin_list(
+        db, page, page_size, status_filter=status_filter, category=category, user_id=user_id)
+    return schemas.AdminEmailDeliveriesResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+# --- push delivery (Phase 4) ------------------------------------------------------------
+
+@router.get("/push-deliveries", response_model=schemas.AdminPushDeliveriesResponse)
+def admin_push_deliveries(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("settings.view_audit_logs")),
+    status_filter: schemas.PushOutboxStatus | None = Query(default=None, alias="status"),
+    category: schemas.PushCategory | None = Query(default=None),
+    user_id: int | None = Query(default=None, ge=1),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """Read-only delivery records: status, category, recipient account (id;
+    a device token NEVER leaves the server — not even masked in this list),
+    created/sent/failed times, attempts and the failure kind. Never a message
+    body or provider credentials."""
+    items, total = push_svc.admin_list(
+        db, page, page_size, status_filter=status_filter, category=category, user_id=user_id)
+    return schemas.AdminPushDeliveriesResponse(items=items, page=page, page_size=page_size, total=total)
 
 
 # --- staff --------------------------------------------------------------------------

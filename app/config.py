@@ -8,9 +8,53 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from urllib.parse import urlsplit
 
 from sqlalchemy.engine import make_url as _sqlalchemy_make_url
+
+# Local-development convenience: the backend's own .env (gitignored, next to
+# app/) is read BEFORE Settings below evaluates the environment, so
+# `uvicorn app.main:app` picks up RESTAMP_DATABASE_URL etc. without a manual
+# `export`. Without this, an unexported .env silently fell back to the
+# built-in placeholder URL (user:pass@localhost) and MySQL refused it (1045).
+#
+# Precedence (never weakens deployment configuration):
+# - A variable already set in the process environment ALWAYS wins; .env only
+#   fills names that are unset. Render/PM2/systemd values are never
+#   overridden, and Render deploys have no .env file at all (gitignored).
+# - Skipped under pytest: the suite must get its database URL only from an
+#   explicit export (tests/conftest.py refuses anything else), so a developer
+#   .env can never silently point tests at restamp_dev.
+# - RESTAMP_LOAD_DOTENV=0 disables it entirely.
+# Values are never printed or logged. Same parsing as alembic/env.py.
+_DOTENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+
+
+def _load_local_dotenv(path: str = _DOTENV_PATH) -> list[str]:
+    """Fill UNSET environment variables from `path`; returns the names set."""
+    if os.environ.get("RESTAMP_LOAD_DOTENV", "1") == "0" or "pytest" in sys.modules:
+        return []
+    if not os.path.isfile(path):
+        return []
+    loaded: list[str] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().removeprefix("export ").strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+                loaded.append(key)
+    return loaded
+
+
+DOTENV_LOADED_KEYS = _load_local_dotenv()
 
 
 def _get(name: str, default: str = "") -> str:
@@ -104,14 +148,33 @@ class Settings:
     CLOUDINARY_API_KEY: str = _get("CLOUDINARY_API_KEY", "")
     CLOUDINARY_API_SECRET: str = _get("CLOUDINARY_API_SECRET", "")
     CLOUDINARY_FOLDER: str = _get("CLOUDINARY_FOLDER", "restamp")
+    # Cloudinary (property photo uploads). Credentials come ONLY from the
+    # environment — never hardcoded, never logged. When CLOUDINARY_CLOUD_NAME
+    # is empty, photo uploads are treated as unconfigured (503).
+    CLOUDINARY_CLOUD_NAME: str = _get("CLOUDINARY_CLOUD_NAME", "")
+    CLOUDINARY_API_KEY: str = _get("CLOUDINARY_API_KEY", "")
+    CLOUDINARY_API_SECRET: str = _get("CLOUDINARY_API_SECRET", "")
+    CLOUDINARY_FOLDER: str = _get("CLOUDINARY_FOLDER", "restamp")
+    # CORS configuration for development environments (local/development/dev/test)
+    # These are additional allowed origins that supplement the built-in local defaults
+    # when RESTAMP_ENV is a development value. Ignored in production unless
+    # RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION is explicitly enabled.
+    # Examples: "http://localhost:3000,http://localhost:8081"
+    DEV_CORS_ORIGINS: str = _get("RESTAMP_CORS_DEV_ORIGINS", "")
+
+    # PRODUCTION ONLY: explicit opt-in that lets a local frontend call a
+    # production-classified backend. Only the exact value "1" enables it, and
+    # it then allows EXACTLY the fixed origins in PRODUCTION_LOCAL_DEV_ORIGINS
+    # (below) — never RESTAMP_CORS_DEV_ORIGINS, never other ports or hosts.
+    # Default "0" (disabled): production allows only RESTAMP_CORS_ORIGINS.
+    CORS_ALLOW_LOCALHOST_IN_PRODUCTION: bool = _get("RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION", "0") == "1"
+
     # DEVELOPMENT ONLY: comma-separated exact base-URL prefixes (each ending
     # in "/") that client-supplied listing photo URLs may also start with,
     # e.g. a local media server. Ignored entirely in production (see
     # app/services/media_urls.py), so it can never widen production
     # validation; a production process that has it set logs a warning.
     DEV_MEDIA_URL_PREFIXES: str = _get("RESTAMP_DEV_MEDIA_URL_PREFIXES", "")
-
-    # TEMPORARILY DISABLED — Chennai area seeding paused.
     # Gates the Chennai locality catalog work (locality loader + Perungudi
     # postcode reassignment scripts, admin agent-locality endpoints, locality
     # aliases). Default OFF; ignored in production (area_seeding_enabled()),
@@ -124,6 +187,48 @@ class Settings:
     # grant no access — every endpoint keeps its own authentication).
     DOCS_ENABLED: bool = _get("RESTAMP_DOCS_ENABLED", "0") == "1"
 
+    # Email notifications (Phase 3). Provider credentials are read ONLY from
+    # the server environment — never hardcoded, never logged, never sent to a
+    # client. EMAIL_PROVIDER selects the adapter (app/services/email_providers.py):
+    #   disabled (default) — nothing is ever sent or queued;
+    #   resend             — Resend HTTPS API (RESTAMP_RESEND_API_KEY);
+    #   smtp               — any SMTP relay, e.g. Amazon SES / SendGrid / Postmark
+    #                        (RESTAMP_SMTP_HOST/PORT/USERNAME/PASSWORD);
+    #   log                — DEVELOPMENT ONLY: records metadata, sends nothing
+    #                        (treated as disabled in production).
+    # A provider with missing credentials or no EMAIL_FROM is treated as
+    # disabled, so delivery can never be half-configured.
+    EMAIL_PROVIDER: str = _get("RESTAMP_EMAIL_PROVIDER", "disabled")
+    EMAIL_FROM: str = _get("RESTAMP_EMAIL_FROM", "")
+    EMAIL_FROM_NAME: str = _get("RESTAMP_EMAIL_FROM_NAME", "RESTAMP")
+    # Shown in every email footer; empty = no support line.
+    EMAIL_SUPPORT: str = _get("RESTAMP_EMAIL_SUPPORT", "")
+    # Public https base URL of the web app for "open in RESTAMP" links
+    # (fixed paths only, see email_templates.py). Empty = emails carry no link.
+    APP_BASE_URL: str = _get("RESTAMP_APP_BASE_URL", "")
+    RESEND_API_KEY: str = _get("RESTAMP_RESEND_API_KEY", "")
+    SMTP_HOST: str = _get("RESTAMP_SMTP_HOST", "")
+    SMTP_PORT: int = _get_int("RESTAMP_SMTP_PORT", 587)
+    SMTP_USERNAME: str = _get("RESTAMP_SMTP_USERNAME", "")
+    SMTP_PASSWORD: str = _get("RESTAMP_SMTP_PASSWORD", "")
+    EMAIL_TIMEOUT_SECONDS: int = _get_int("RESTAMP_EMAIL_TIMEOUT_SECONDS", 15)
+
+    # Push notifications (Phase 4). Provider credentials are read ONLY from
+    # the server environment — never hardcoded, never logged, never sent to a
+    # client. PUSH_PROVIDER selects the adapter (app/services/push_providers.py):
+    #   disabled (default) — nothing is queued or sent and no push endpoint is
+    #                        contacted at all (the mobile app stays dormant too);
+    #   expo               — Expo push HTTPS API (RESTAMP_EXPO_ACCESS_TOKEN
+    #                        optional, set later from the company's Expo
+    #                        account; never the personal project);
+    #   log                — DEVELOPMENT ONLY: records metadata, sends nothing
+    #                        (treated as disabled in production).
+    # Push delivery is therefore OFF everywhere until an operator explicitly
+    # selects a provider — mirroring the email providers' fail-closed rule.
+    PUSH_PROVIDER: str = _get("RESTAMP_PUSH_PROVIDER", "disabled")
+    EXPO_ACCESS_TOKEN: str = _get("RESTAMP_EXPO_ACCESS_TOKEN", "")
+    PUSH_TIMEOUT_SECONDS: int = _get_int("RESTAMP_PUSH_TIMEOUT_SECONDS", 15)
+
     # Reva AI Chatbot configuration (optional external LLM; falls back to verified demo/FAQ mode).
     OPENAI_API_KEY: str = _get("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = _get("OPENAI_MODEL", "gpt-4o-mini")
@@ -134,6 +239,42 @@ class Settings:
     AGARAM_MODEL_NAME: str = _get("AGARAM_MODEL_NAME", "murai-labs/agaram-2.5b-instruct")
     AGARAM_API_KEY: str = _get("AGARAM_API_KEY", _get("HF_TOKEN", _get("HUGGINGFACE_API_KEY", "")))
     AGARAM_ENABLED: bool = _get("AGARAM_ENABLED", "1") == "1"
+
+    # Public Reva assistant hardening. CHAT_TRUST_PROXY: "1" ONLY where a reverse
+    # proxy forwards the real client IP in X-Forwarded-For (Render). When on,
+    # the client IP for rate limiting is the RIGHTMOST forwarded entry (the
+    # one the trusted proxy appended); the header is otherwise ignored, so a
+    # caller can never spoof a different bucket by sending the header itself.
+    # (Named CHAT_* — the bare TRUST_PROXY name is a removed-setting lock in
+    # test_otp_core_contract.py and must stay removed.)
+    CHAT_TRUST_PROXY: bool = _get("RESTAMP_CHAT_TRUST_PROXY", "0") == "1"
+    # Fixed-window limits (per bucket) for the AI endpoints. Shared storage
+    # (rate_limit_windows) means one instance's hits count everywhere, so
+    # these numbers are totals, not per-instance. 0 disables a limit (never
+    # the recommended posture; allowed for local load tests only).
+    CHAT_RPM_PER_IP: int = _get_int("RESTAMP_CHAT_RPM_PER_IP", 20)
+    CHAT_RPM_PER_USER: int = _get_int("RESTAMP_CHAT_RPM_PER_USER", 10)
+    CHAT_RPH_PER_IP: int = _get_int("RESTAMP_CHAT_RPH_PER_IP", 120)
+    CHAT_RPH_PER_USER: int = _get_int("RESTAMP_CHAT_RPH_PER_USER", 60)
+    TRANSCRIBE_PER_HOUR_PER_IP: int = _get_int("RESTAMP_TRANSCRIBE_PER_HOUR_PER_IP", 20)
+    # Hard body-size caps (bytes) for the AI endpoints, checked before the
+    # body is parsed: chat JSON stays tiny; audio uploads match the 8 MB
+    # application cap with multipart overhead headroom.
+    CHAT_MAX_BODY_BYTES: int = _get_int("RESTAMP_CHAT_MAX_BODY_BYTES", 16_384)
+    TRANSCRIBE_MAX_BODY_BYTES: int = _get_int("RESTAMP_TRANSCRIBE_MAX_BODY_BYTES", 9_000_000)
+
+    # Payments (Razorpay). Credentials are read ONLY from the server
+    # environment — never hardcoded, never logged, never sent to a client.
+    # PAYMENT_PROVIDER="none" (default) fails closed: checkout, verification
+    # and webhook handling all return 503 and no subscription can be
+    # activated through a payment. "razorpay" enables the real provider
+    # flow; a razorpay selection with missing secrets is treated as
+    # unconfigured (never half-configured), mirroring the email providers.
+    PAYMENT_PROVIDER: str = _get("RESTAMP_PAYMENT_PROVIDER", "none")
+    RAZORPAY_KEY_ID: str = _get("RAZORPAY_KEY_ID", "")
+    RAZORPAY_KEY_SECRET: str = _get("RAZORPAY_KEY_SECRET", "")
+    RAZORPAY_WEBHOOK_SECRET: str = _get("RAZORPAY_WEBHOOK_SECRET", "")
+    RAZORPAY_TIMEOUT_SECONDS: int = _get_int("RESTAMP_RAZORPAY_TIMEOUT_SECONDS", 15)
 
 
 settings = Settings()
@@ -211,6 +352,15 @@ def is_production() -> bool:
     return not is_development()
 
 
+def payment_bypass_enabled() -> bool:
+    """TEMPORARY business decision (approved): users may activate a plan by
+    pressing Continue on the payment page without paying (subscription
+    source/payment provider BYPASS, never counted as paid). On by default;
+    RESTAMP_PAYMENT_BYPASS=0 turns it off at once (read at call time). Remove
+    this switch when a real payment gateway is connected."""
+    return os.environ.get("RESTAMP_PAYMENT_BYPASS", "1").strip() != "0"
+
+
 def area_seeding_enabled() -> bool:
     """TEMPORARILY DISABLED — Chennai area seeding paused.
 
@@ -275,6 +425,19 @@ def is_jwt_secret_strong(secret: str | None) -> bool:
     return True
 
 
+# The ONLY local origins a production-classified backend may allow, and only
+# with RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1: the website dev server
+# (Next.js :3000) and Expo web (:8081). Fixed in code on purpose: no
+# environment value can widen this to other ports, 127.0.0.1, LAN hosts or
+# external origins.
+PRODUCTION_LOCAL_DEV_ORIGINS: tuple[str, ...] = ("http://localhost:3000", "http://localhost:8081")
+
+
+def production_local_dev_origins() -> list[str]:
+    """The local origins production allows: the fixed pair when opted in, else none."""
+    return list(PRODUCTION_LOCAL_DEV_ORIGINS) if settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION else []
+
+
 def parse_cors_origins(raw: str | None) -> list[str]:
     """RESTAMP_CORS_ORIGINS as a list of exact origins (comma-separated, trimmed)."""
     return [o.strip() for o in (raw or "").split(",") if o.strip()]
@@ -311,6 +474,67 @@ def is_valid_production_origin(origin: str) -> bool:
     if origin != rebuilt:
         return False
     return not _PRIVATE_HOST.match(parts.hostname.strip("[]"))
+
+
+def is_valid_production_origin(origin: str) -> bool:
+    """An exact public https origin: scheme + host (+ optional port), nothing
+    else. Rejects "*", wildcards, http, paths/query/fragment, trailing
+    slashes, upper-case hosts, credentials in the URL, and localhost /
+    loopback / private-LAN hosts (those are development-only)."""
+    if not origin or "*" in origin or origin != origin.strip():
+        return False
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    # Exactly as a browser sends it (lowercase host, no default-port noise):
+    # CORS compares origins as exact strings, so anything else never matches.
+    rebuilt = f"https://{parts.hostname}" + (f":{port}" if port else "")
+    if origin != rebuilt:
+        return False
+    return not _PRIVATE_HOST.match(parts.hostname.strip("[]"))
+
+
+def is_valid_localhost_origin(origin: str) -> bool:
+    """Validate that an origin is an exact http/https localhost or 127.0.0.1 origin with optional port.
+    Used for RESTAMP_CORS_DEV_ORIGINS when CORS_ALLOW_LOCALHOST_IN_PRODUCTION is enabled.
+    Only allows exact http/https origins for localhost or 127.0.0.1 with optional port.
+    No wildcards, no paths, no credentials, no subdomains other than localhost.
+    """
+    if not origin or "*" in origin or origin != origin.strip():
+        return False
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    if not parts.hostname:
+        return False
+    if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    # Only allow localhost or 127.0.0.1 (with optional port)
+    host = parts.hostname.strip("[]").lower()
+    if host not in ("localhost", "127.0.0.1"):
+        return False
+    # Exactly as a browser sends it (lowercase host, no default-port noise):
+    # CORS compares origins as exact strings, so anything else never matches.
+    rebuilt = f"{parts.scheme}://{parts.hostname}" + (f":{port}" if port else "")
+    if origin != rebuilt:
+        return False
+    return True
 
 
 def validate_security_config() -> None:
@@ -424,6 +648,25 @@ def validate_security_config() -> None:
             "only exact public https origins (scheme and host, no path, no "
             "wildcard, no localhost or private-network hosts)."
         )
+    # Local frontend origins (explicit opt-in). The allowed set is fixed in
+    # code (PRODUCTION_LOCAL_DEV_ORIGINS), so there is nothing to validate —
+    # but never silently: say which origins are open. RESTAMP_CORS_DEV_ORIGINS
+    # is a development setting and is ignored here (it can never widen
+    # production CORS). Setting names / fixed origins only, never values.
+    if settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION:
+        _log.warning(
+            "RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1: browser origins %s "
+            "may call this production backend (credentialed CORS). CORS is not "
+            "authentication: every endpoint still requires its normal "
+            "authentication and authorization.",
+            ", ".join(PRODUCTION_LOCAL_DEV_ORIGINS),
+        )
+    if parse_cors_origins(settings.DEV_CORS_ORIGINS):
+        _log.warning(
+            "RESTAMP_CORS_DEV_ORIGINS is set but ignored in production; use "
+            "RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 for the approved "
+            "local origins."
+        )
     if is_staging():
         # The fixed testing OTP is ALWAYS active in staging (there is no
         # flag): anyone who can reach this backend can log in as any phone
@@ -463,6 +706,92 @@ def validate_security_config() -> None:
             "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
             "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
         )
+    if is_staging():
+        # The fixed testing OTP is ALWAYS active in staging (there is no
+        # flag): anyone who can reach this backend can log in as any phone
+        # number with the published testing code. A staging process must
+        # therefore never serve the public site — refuse that combination
+        # and say so loudly at startup.
+        if _PUBLIC_SITE_ORIGINS & set(cors):
+            raise RuntimeError(
+                "Insecure staging configuration: RESTAMP_CORS_ORIGINS must "
+                "not list the public site (https://restamp.in or "
+                "https://www.restamp.in) while the fixed testing OTP is "
+                "active. Point the public site at a production backend."
+            )
+        _log.warning(
+            "RESTAMP_ENV=staging: the fixed testing OTP is active — every "
+            "phone number can log in with the published testing code. Never "
+            "point real users at this deployment."
+        )
+        return
+    if fixed_otp_in_production():
+        # Not a refusal (an explicit owner opt-in), but never silent. All the
+        # production checks above still ran and passed before this point.
+        _log.warning(
+            "RESTAMP_PRODUCTION_FIXED_OTP=1: the fixed OTP is accepted in "
+            "production. Anyone can sign in as any ordinary (non-admin) phone "
+            "account. Admin accounts are refused and fixed-OTP sessions cannot "
+            "use admin endpoints or link Google."
+        )
+    # Photo-upload storage: NOT a hard failure (that would be a behavior
+    # change requiring an explicit product decision). When production has no
+    # Cloudinary cloud configured, uploads fall back to the local disk.
+    # Warn loudly at startup so the trade-off is visible, naming settings
+    # only (never values).
+    if not settings.CLOUDINARY_CLOUD_NAME:
+        _log.warning(
+            "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
+            "is empty; listing photo uploads will fall back to local-disk storage "
+            "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
+            "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
+        )
+    if not all(is_valid_production_origin(o) for o in cors):
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_CORS_ORIGINS must contain "
+            "only exact public https origins (scheme and host, no path, no "
+            "wildcard, no localhost or private-network hosts)."
+        )
+    if is_staging():
+        # The fixed testing OTP is ALWAYS active in staging (there is no
+        # flag): anyone who can reach this backend can log in as any phone
+        # number with the published testing code. A staging process must
+        # therefore never serve the public site — refuse that combination
+        # and say so loudly at startup.
+        if _PUBLIC_SITE_ORIGINS & set(cors):
+            raise RuntimeError(
+                "Insecure staging configuration: RESTAMP_CORS_ORIGINS must "
+                "not list the public site (https://restamp.in or "
+                "https://www.restamp.in) while the fixed testing OTP is "
+                "active. Point the public site at a production backend."
+            )
+        _log.warning(
+            "RESTAMP_ENV=staging: the fixed testing OTP is active — every "
+            "phone number can log in with the published testing code. Never "
+            "point real users at this deployment."
+        )
+        return
+    if fixed_otp_in_production():
+        # Not a refusal (an explicit owner opt-in), but never silent. All the
+        # production checks above still ran and passed before this point.
+        _log.warning(
+            "RESTAMP_PRODUCTION_FIXED_OTP=1: the fixed OTP is accepted in "
+            "production. Anyone can sign in as any ordinary (non-admin) phone "
+            "account. Admin accounts are refused and fixed-OTP sessions cannot "
+            "use admin endpoints or link Google."
+        )
+    # Photo-upload storage: NOT a hard failure (that would be a behavior
+    # change requiring an explicit product decision). When production has no
+    # Cloudinary cloud configured, uploads fall back to the local disk.
+    # Warn loudly at startup so the trade-off is visible, naming settings
+    # only (never values).
+    if not settings.CLOUDINARY_CLOUD_NAME:
+        _log.warning(
+            "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
+            "is empty; listing photo uploads will fall back to local-disk storage "
+            "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
+            "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
+        )
     if (settings.DEV_MEDIA_URL_PREFIXES or "").strip():
         # Not fatal: the media-URL validator ignores it in production, so
         # production validation is unchanged. Warn so the stray setting is
@@ -471,6 +800,7 @@ def validate_security_config() -> None:
             "RESTAMP_DEV_MEDIA_URL_PREFIXES is set but ignored in production; "
             "listing photo URLs must be approved Cloudinary URLs."
         )
+
 
 
 # Backwards-compatible alias (Phase 3 code read DBConfig.SQLALCHEMY_DATABASE_URI).

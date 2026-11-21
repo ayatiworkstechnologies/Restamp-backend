@@ -12,9 +12,10 @@ Tiers (validity from activation; FREE is a rolling window):
 Usage is derived from contact_reveal_audits (one row per successful reveal),
 so no separate counter can drift from what was actually revealed.
 
-PAYMENT IS SIMULATED: subscribe() records a provider="SIMULATED" payment and
-activates the plan without charging anyone. Replace with a real gateway
-(order → webhook-confirmed payment → subscription) before production billing.
+PAYMENT IS SIMULATED for subscribe_simulated(): it records a
+provider="SIMULATED" payment and activates the plan without charging anyone.
+The real gateway flow (Razorpay order → signed payment → subscription) lives
+in services/payments.py and activates through activate_for_payment() below.
 """
 from __future__ import annotations
 
@@ -23,8 +24,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from ..config import is_development
 from ..models import ContactRevealAudit, Payment, Plan, Subscription
 
 
@@ -56,7 +59,9 @@ def _now() -> datetime:
 
 
 def _plan_row(db: Session, plan: BuyerPlan) -> Plan:
-    """Get-or-create the catalogue row for a buyer plan (keeps price/name in sync)."""
+    """Get-or-create the catalogue row for a buyer plan. An existing row is never
+    overwritten: once it exists, admins manage its name/price/limits
+    (services/subscriptions.py) and the row is the source of truth."""
     row = db.query(Plan).filter(Plan.code == plan.code).first()
     if row is None:
         row = Plan(
@@ -66,35 +71,47 @@ def _plan_row(db: Session, plan: BuyerPlan) -> Plan:
             price_paise=plan.price_paise,
             duration_days=plan.duration_days,
             status="ACTIVE",
+            role="BUYER",
+            lead_limit=plan.lead_limit,
         )
         db.add(row)
         db.flush()
-    elif (row.name, row.price_paise, row.duration_days) != (plan.name, plan.price_paise, plan.duration_days):
-        row.name, row.price_paise, row.duration_days = plan.name, plan.price_paise, plan.duration_days
-        row.description = plan.leads_label
-        db.flush()
     return row
+
+
+def _from_row(row: Plan) -> BuyerPlan:
+    """The buyer plan as currently stored (admin edits apply). Rows created
+    before role/limit columns existed fall back to the code catalogue."""
+    known = BY_CODE.get(row.code)
+    if row.role is None and known is not None:
+        return known
+    limit = row.lead_limit if row.lead_limit is None or row.lead_limit >= 0 else None
+    label = "Unlimited leads" if limit is None else f"Up to {limit} leads"
+    return BuyerPlan(row.code, row.name, row.price_paise, row.duration_days or 0, limit, row.description or label)
 
 
 def _active_paid(db: Session, buyer_id: int):
     """Latest ACTIVE, unexpired paid buyer subscription → (Subscription, BuyerPlan) or None."""
     now = _now()
     row = (
-        db.query(Subscription, Plan.code)
+        db.query(Subscription, Plan)
         .join(Plan, Plan.id == Subscription.plan_id)
         .filter(
             Subscription.user_id == buyer_id,
             Subscription.status == "ACTIVE",
-            Plan.code.in_(PAID_CODES),
-            Subscription.end_date > now,
+            # Any buyer plan (code catalogue or admin-created), never the free tier.
+            or_(Plan.role == "BUYER", Plan.code.in_(PAID_CODES)),
+            Plan.code != FREE.code,
+            Subscription.suspended_at.is_(None),
+            or_(Subscription.end_date.is_(None), Subscription.end_date > now),
         )
         .order_by(Subscription.start_date.desc(), Subscription.id.desc())
         .first()
     )
     if row is None:
         return None
-    sub, code = row
-    return sub, BY_CODE[code]
+    sub, plan_row = row
+    return sub, _from_row(plan_row)
 
 
 def _window(db: Session, buyer_id: int):
@@ -181,8 +198,29 @@ def catalogue(db: Session) -> list[dict]:
     ]
 
 
+SIMULATED_REFUSED_DETAIL = (
+    "Paid plans can only be activated through a verified online payment."
+)
+
+
+def require_simulated_purchase_allowed() -> None:
+    """Refuse SIMULATED paid-plan activation outside an explicit development
+    environment (RESTAMP_ENV local/development/dev/test).
+
+    Fail closed: production, staging, an unset or unknown RESTAMP_ENV are all
+    refused. The decision is server-side only (no request field, header or
+    query flag is consulted), so a client can never re-enable free paid
+    plans. Existing subscriptions are untouched: this only stops NEW
+    simulated activations; payment-verified activation (services/payments.py)
+    is unaffected."""
+    if not is_development():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SIMULATED_REFUSED_DETAIL)
+
+
 def subscribe_simulated(db: Session, buyer_id: int, code: str) -> dict:
-    """Activate a paid buyer plan with a SIMULATED payment (no money is charged)."""
+    """Activate a paid buyer plan with a SIMULATED payment (no money is charged).
+    Development environments only (see require_simulated_purchase_allowed)."""
+    require_simulated_purchase_allowed()
     plan = BY_CODE.get(code)
     if plan is None or plan is FREE:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
@@ -192,7 +230,8 @@ def subscribe_simulated(db: Session, buyer_id: int, code: str) -> dict:
         user_id=buyer_id,
         provider="SIMULATED",
         provider_payment_id=f"SIM-{uuid.uuid4().hex[:16]}",
-        amount_paise=plan.price_paise,
+        # The plan row is admin-managed: record its current price, not the code default.
+        amount_paise=row.price_paise,
         currency="INR",
         status="SUCCESS",
         plan_id=row.id,
@@ -202,6 +241,28 @@ def subscribe_simulated(db: Session, buyer_id: int, code: str) -> dict:
     db.add(payment)
     db.flush()
     # One active buyer plan at a time: the new purchase replaces the old one.
+    _expire_previous(db, buyer_id)
+    db.add(
+        Subscription(
+            user_id=buyer_id,
+            plan_id=row.id,
+            payment_id=payment.id,
+            start_date=now,
+            end_date=now + timedelta(days=row.duration_days or plan.duration_days),
+            status="ACTIVE",
+        )
+    )
+    db.flush()
+    result = status_for(db, buyer_id)
+    result["transaction_id"] = payment.provider_payment_id
+    result["amount_paise"] = plan.price_paise
+    result["simulated"] = True
+    return result
+
+
+def _expire_previous(db: Session, buyer_id: int) -> None:
+    """Expire the buyer's current ACTIVE paid subscription (a new purchase
+    replaces the old one)."""
     (
         db.query(Subscription)
         .filter(
@@ -213,10 +274,37 @@ def subscribe_simulated(db: Session, buyer_id: int, code: str) -> dict:
         )
         .update({Subscription.status: "EXPIRED"}, synchronize_session=False)
     )
+
+
+def activate_for_payment(db: Session, payment: Payment, plan: BuyerPlan) -> dict:
+    """Activate a paid buyer plan from a verified payment row.
+
+    Used by the real payment flow (services/payments.py) after the provider
+    signature is verified; subscribe_simulated keeps its own inline path.
+    Idempotent: an ACTIVE subscription already tied to this payment returns
+    the current status (activated=False) without creating a duplicate. The
+    caller must hold the payment row locked (FOR UPDATE) so a concurrent
+    verify and webhook cannot both activate.
+    """
+    existing = (
+        db.query(Subscription)
+        # ANY subscription for this payment (even one later replaced/expired):
+        # a re-sent verify or webhook must never activate the same payment twice.
+        .filter(Subscription.payment_id == payment.id)
+        .first()
+    )
+    if existing is not None:
+        result = status_for(db, payment.user_id)
+        result["transaction_id"] = payment.provider_payment_id
+        result["amount_paise"] = payment.amount_paise
+        result["activated"] = False
+        return result
+    now = _now()
+    _expire_previous(db, payment.user_id)
     db.add(
         Subscription(
-            user_id=buyer_id,
-            plan_id=row.id,
+            user_id=payment.user_id,
+            plan_id=payment.plan_id,
             payment_id=payment.id,
             start_date=now,
             end_date=now + timedelta(days=plan.duration_days),
@@ -224,8 +312,8 @@ def subscribe_simulated(db: Session, buyer_id: int, code: str) -> dict:
         )
     )
     db.flush()
-    result = status_for(db, buyer_id)
+    result = status_for(db, payment.user_id)
     result["transaction_id"] = payment.provider_payment_id
-    result["amount_paise"] = plan.price_paise
-    result["simulated"] = True
+    result["amount_paise"] = payment.amount_paise
+    result["activated"] = True
     return result

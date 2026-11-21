@@ -42,6 +42,9 @@ from sqlalchemy.orm import Session
 
 from ..models import (
     AdminAccount,
+    Payment,
+    Plan,
+    Subscription,
     AuditLog,
     AuthIdentity,
     BrokerPostcodeAccessCurrent,
@@ -62,6 +65,7 @@ from ..models import (
 from . import admin_rbac, users_roles
 from . import enquiries as enquiry_svc
 from . import listings as listing_svc
+from . import notifications as notification_svc
 from . import owner_listings as owner_svc
 
 _ADMIN_RULESET = "admin-review-v1"  # verifications.ruleset_version for admin decisions
@@ -285,9 +289,10 @@ def decide_listing(
         .scalar()
     )
     now = _utcnow_naive()
+    attempt_no = int(last_attempt or 0) + 1
     db.add(Verification(
         property_listing_id=listing_id,
-        attempt_no=int(last_attempt or 0) + 1,
+        attempt_no=attempt_no,
         ruleset_version=_ADMIN_RULESET,
         checks_json=checks,
         result="PASS" if to_status == "VERIFIED" else "FAIL",
@@ -303,6 +308,9 @@ def decide_listing(
         {"listing_id": listing_id, "verification_status": current}, after,
     )
     db.flush()
+    # Only a real change reaches here (same-state repeats returned above). The
+    # admin's reason/category/notes are not copied into the notification.
+    notification_svc.notify_listing_decision(db, listing, to_status, attempt_no, actor_id=admin_id)
 
 
 # --- users -----------------------------------------------------------------------------
@@ -440,6 +448,21 @@ def set_user_status(db: Session, admin_id: int, user_id: int, new_status: str, r
         "user", {"user_id": user_id, "status": previous}, after,
     )
     db.flush()
+    if new_status == "suspended":
+        # Email only (mandatory account email, verified address): a suspended
+        # account cannot open the app, so there is no in-app notice. The
+        # admin's reason is never included in the email.
+        from . import email as email_svc
+        email_svc.enqueue_account_suspended(db, user_id, datetime.now(timezone.utc).isoformat())
+    if new_status == "active":
+        # Reactivation only: a suspended account cannot call any authenticated
+        # API, so an in-app suspension notice would be unreadable (it is
+        # planned for the email phase). Each reactivation is its own event.
+        notification_svc.notify_safely(
+            db, "ACCOUNT_REACTIVATED",
+            recipient_id=user_id, actor_id=admin_id, entity_id=user_id,
+            dedupe_key=f"account:{user_id}:reactivated:{datetime.now(timezone.utc).isoformat()}",
+        )
 
 
 # --- enquiries (read-only) ------------------------------------------------------------
@@ -724,3 +747,141 @@ def revoke_staff(db: Session, admin_id: int, user_id: int) -> None:
     record_audit(db, admin_id, "ADMIN_STAFF_REVOKED", "admin_account",
                  {"user_id": user_id, "admin_role": previous}, None)
     db.flush()
+
+
+# --- billing (read-only) -------------------------------------------------------------
+# Subscriptions and payments as stored. There is NO real payment gateway: the
+# only writers today are the buyer/agent "subscribe" endpoints, which record a
+# payment with provider "SIMULATED" (no money moved). Every row therefore
+# carries its provider and a `simulated` flag so the admin UI can never present
+# a simulated activation as a real payment. Nothing here writes.
+
+SIMULATED_PROVIDER = "SIMULATED"
+# Providers that never represent money received (simulated, temporary bypass, admin assignment, free trial).
+UNPAID_PROVIDERS = ("SIMULATED", "BYPASS", "ADMIN", "FREE_TRIAL")
+
+
+def list_subscriptions(
+    db: Session,
+    page: int,
+    page_size: int,
+    sub_status: str | None = None,
+    user_id: int | None = None,
+    plan_role: str | None = None,
+    plan_code: str | None = None,
+    q: str | None = None,
+) -> tuple[list[dict], int]:
+    now = _utcnow_naive()
+    base = (
+        db.query(Subscription, Plan, Payment, User, UserCurrentRole.role)
+        .join(Plan, Subscription.plan_id == Plan.id)
+        .join(Payment, Subscription.payment_id == Payment.id)
+        .join(User, Subscription.user_id == User.id)
+        .outerjoin(UserCurrentRole, UserCurrentRole.user_id == User.id)
+    )
+    if user_id is not None:
+        base = base.filter(Subscription.user_id == user_id)
+    if plan_role is not None:
+        base = base.filter(Plan.role == plan_role)
+    if plan_code is not None:
+        base = base.filter(Plan.code == plan_code)
+    if q:
+        term = q.strip()
+        cond = User.display_name.like(_like(term))
+        if term.isdigit():
+            cond = or_(cond, User.id == int(term), Subscription.id == int(term))
+        base = base.filter(cond)
+    if sub_status == "SUSPENDED":
+        base = base.filter(Subscription.status == "ACTIVE", Subscription.suspended_at.isnot(None),
+                           or_(Subscription.end_date.is_(None), Subscription.end_date > now))
+    elif sub_status == "EXPIRED":
+        # Stored EXPIRED, or ACTIVE whose end date has passed (status is not swept).
+        base = base.filter(or_(Subscription.status == "EXPIRED",
+                               (Subscription.status == "ACTIVE") & (Subscription.end_date.isnot(None)) & (Subscription.end_date <= now)))
+    elif sub_status == "ACTIVE":
+        base = base.filter(Subscription.status == "ACTIVE", Subscription.suspended_at.is_(None),
+                           or_(Subscription.end_date.is_(None), Subscription.end_date > now))
+    elif sub_status == "CANCELLED":
+        base = base.filter(Subscription.status == "CANCELLED")
+    total = base.with_entities(func.count(Subscription.id)).scalar() or 0
+    rows = base.order_by(Subscription.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    items = []
+    for sub, plan, pay, user, role in rows:
+        expired = sub.status == "EXPIRED" or (sub.status == "ACTIVE" and sub.end_date is not None and sub.end_date <= now)
+        items.append({
+            "id": sub.id,
+            "user_id": user.id,
+            "user_name": user.display_name,
+            "user_current_role": role,
+            "plan_code": plan.code,
+            "plan_name": plan.name,
+            "price_paise": plan.price_paise,
+            "status": "EXPIRED" if expired else ("SUSPENDED" if sub.status == "ACTIVE" and sub.suspended_at else sub.status),
+            "start_date": sub.start_date,
+            "end_date": sub.end_date,
+            "payment_id": pay.id,
+            "payment_provider": pay.provider,
+            "simulated": pay.provider in UNPAID_PROVIDERS,
+            "plan_role": plan.role,
+            "source": sub.source,
+            "billing_cycle": plan.billing_cycle,
+            "duration_days": plan.duration_days,
+            "assigned_by_user_id": sub.assigned_by_user_id,
+            "ended_reason": sub.ended_reason,
+            "usage": _subscription_usage(db, user.id, plan.role) if not expired and sub.status == "ACTIVE" else {},
+        })
+    return items, total
+
+
+def _subscription_usage(db: Session, user_id: int, role: str | None) -> dict:
+    """Real usage for a current subscription (same sources the limits are enforced from)."""
+    from . import subscriptions as sub_svc
+    if role == "OWNER":
+        return {"listings_used": sub_svc.owner_listing_count(db, user_id)}
+    if role == "BUYER":
+        from . import buyer_plans
+        return {"leads_used": buyer_plans.status_for(db, user_id)["leads_used"]}
+    if role == "BROKER":
+        from . import agent_plans
+        s = agent_plans.status_for(db, user_id)
+        return {"localities_used": len(s.get("localities") or [])} if s.get("has_plan") else {}
+    return {}
+
+
+def list_payments(
+    db: Session,
+    page: int,
+    page_size: int,
+    payment_status: str | None = None,
+    user_id: int | None = None,
+) -> tuple[list[dict], int]:
+    base = (
+        db.query(Payment, Plan.code, Plan.name, User.display_name)
+        .outerjoin(Plan, Payment.plan_id == Plan.id)
+        .join(User, Payment.user_id == User.id)
+    )
+    if payment_status is not None:
+        base = base.filter(Payment.status == payment_status)
+    if user_id is not None:
+        base = base.filter(Payment.user_id == user_id)
+    total = base.with_entities(func.count(Payment.id)).scalar() or 0
+    rows = base.order_by(Payment.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return [
+        {
+            "id": pay.id,
+            "user_id": pay.user_id,
+            "user_name": name,
+            "plan_code": code,
+            "plan_name": plan_name,
+            "provider": pay.provider,
+            "simulated": pay.provider in UNPAID_PROVIDERS,
+            # Gateway references are shown only for real providers; a simulated id is not a transaction.
+            "provider_payment_id": None if pay.provider in UNPAID_PROVIDERS else pay.provider_payment_id,
+            "amount_paise": pay.amount_paise,
+            "currency": pay.currency,
+            "status": pay.status,
+            "created_at": pay.created_at,
+            "paid_at": pay.paid_at,
+        }
+        for pay, code, plan_name, name in rows
+    ], total

@@ -19,7 +19,7 @@ restamp_dev database, so no row created here survives the test.
 """
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone, fresh_pincode
+from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, register_phone, fresh_pincode
 
 _SEQ = {"n": 0}
 
@@ -38,6 +38,7 @@ def _owner(c, phone: str | None = None) -> dict:
     out = register_phone(c, phone)
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     return {"token": token, "user_id": out["user_id"], "phone": phone}
 
@@ -129,7 +130,9 @@ def test_owner_b_cannot_see_or_manage_owner_a_listing(client):
             r = c.post(path, headers=test1_headers)
         else:
             r = c.post(path, json=payload, headers=test1_headers)
-        assert r.status_code == 404, (path, r.text)
+        # Self-verification is refused for EVERY poster before any lookup
+        # (403, no existence leak); the other routes stay 404.
+        assert r.status_code == (403 if path.endswith("/verify") else 404), (path, r.text)
 
     # 6. Test 1 cannot edit, attach photos to, or list leads for it.
     r = c.patch(
@@ -161,7 +164,7 @@ def test_owner_b_cannot_see_or_manage_owner_a_listing(client):
     r = c.get(f"/owner/listings/{lid}", headers=roshan_headers)
     assert r.status_code == 200, r.text
     assert r.json()["listing_id"] == lid
-    r = c.post(f"/owner/listings/{lid}/verify", headers=roshan_headers)
+    r = admin_verify(c, lid)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
 
@@ -243,7 +246,7 @@ def test_public_marketplace_shows_only_published_owner_listings(client):
     assert lid not in ids
 
     # VERIFIED (still AVAILABLE): publicly visible to every buyer.
-    r = c.post(f"/owner/listings/{lid}/verify", headers=auth_header(roshan["token"]))
+    r = admin_verify(c, lid)
     assert r.status_code == 200, r.text
     assert c.get(f"/buyer/listings/{lid}").status_code == 200
     ids = [x["listing_id"] for x in c.get("/buyer/listings").json()["items"]]

@@ -17,7 +17,13 @@ def test_table_count_is_29():
     # Viewed history (h8i9j0k1l2m3): + viewed_properties.
     # Messages/notes (j0k1l2m3n4o5): + enquiry_messages, lead_notes.
     # Agent locality catalog (k1l2m3n4o5p6): + locality_aliases.
-    assert len(MD.tables) == 38
+    # Notifications (m3n4o5p6q7r8): + notifications.
+    # Email (n4o5p6q7r8s9): + user_emails, email_verification_codes, email_outbox.
+    # Rate limiting (o5p6q7r8s9t0): + rate_limit_windows.
+    # Push notifications (o5p6q7r8s9t1): + push_devices, push_outbox, push_preferences.
+    assert len(MD.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2)
+    assert "notifications" in MD.tables
+    assert "rate_limit_windows" in MD.tables
     assert "enquiry_messages" in MD.tables and "lead_notes" in MD.tables
     assert "saved_properties" in MD.tables
     assert "viewed_properties" in MD.tables
@@ -101,7 +107,7 @@ def test_price_index_and_fk_counts():
     idx = [i.name for i in MD.tables["property_listings"].indexes]
     assert "idx_property_listings_price_paise" in idx
     total_fk = sum(len(list(c.foreign_keys)) for t in MD.tables.values() for c in t.columns)
-    assert total_fk == 59  # 49 existing + 3 property_visits + 2 viewed_properties + 2 enquiry_messages + 2 lead_notes + 1 locality_aliases FKs
+    assert total_fk == 83  # + 7 contact-credit FKs (u1v2w3x4y5z6: accounts 1, unlocks 3, ledger 3); + 4 payment_refunds FKs (t0u1v2w3x4y5); + 1 plan_versions FK (q7r8s9t0u1v2); + 2 push_deliveries FKs (p6q7r8s9t0u1); + 4 email FKs (n4o5p6q7r8s9); 49 existing + 3 property_visits + 2 viewed_properties + 2 enquiry_messages + 2 lead_notes + 1 locality_aliases + 2 notifications FKs; + 4 push FKs (o5p6q7r8s9t1) — rate_limit_windows (o5p6q7r8s9t0) has none
 
 
 def test_forbidden_schema_absent():
@@ -113,7 +119,7 @@ def test_forbidden_schema_absent():
     # approved RENT design (Task 7); only a bare `phone` column stays forbidden.
     col_names = {c.name for tbl in MD.tables.values() for c in tbl.columns}
     assert "phone" not in col_names
-    assert "saved_properties" in MD.tables and len(MD.tables) == 38
+    assert "saved_properties" in MD.tables and len(MD.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + notifications (m3n4o5p6q7r8), 3 email tables (n4o5p6q7r8s9); + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
     for tbl in MD.tables.values():
         for c in tbl.columns:
             assert type(c.type).__name__ != "Numeric"  # no DECIMAL money

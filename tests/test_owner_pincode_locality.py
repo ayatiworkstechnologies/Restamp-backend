@@ -15,7 +15,7 @@ from sqlalchemy import text
 
 from app.services import localities as loc_svc
 from app.services.owner_listings import PINCODE_LOCALITY_MISMATCH
-from tests.conftest import auth_header, fresh_pincode, register_phone
+from tests.conftest import grant_test_posting_plan, auth_header, fresh_pincode, register_phone
 
 _n = {"i": 0}
 
@@ -25,6 +25,7 @@ def _owner(c):
     tok = register_phone(c, f"+916775{_n['i']:06d}")
     h = auth_header(tok["access_token"])
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=h).status_code == 200
+    grant_test_posting_plan(c, h)
     return h
 
 

@@ -11,6 +11,10 @@ BROKER — require_broker reads the role from the DB, never the token):
 
 Agent plans (any authenticated active account — a buyer becomes an agent by
 buying one):
+  GET  /broker/plans                — public catalogue of purchasable agent
+                                      plans (real checkout uses /payments/*)
+  GET  /broker/locality-catalog     — public list of agent-enabled, served
+                                      localities (the checkout picker)
   GET  /broker/plan                    — the caller's active agent plan, if any
   POST /broker/plans/{code}/subscribe  — buy a plan for chosen localities
                                          (SIMULATED payment); grants coverage
@@ -40,6 +44,7 @@ from ..security import ensure_active_user, get_current_user_id
 from ..services import agent_plans as agent_plan_svc
 from ..services import brokers as broker_svc
 from ..services import listings as listing_svc
+from ..services import localities as locality_svc
 from ..models import PhysicalProperty, PropertyListing
 from .buyer import ConstructionStatus, Deal, PropType, Sort
 
@@ -70,7 +75,8 @@ def subscribe_agent_plan(
     user_id: int = Depends(_active_user),
 ):
     """Buy an agent plan for the chosen localities. PAYMENT IS SIMULATED —
-    no money is charged. Grants coverage and switches the role to BROKER."""
+    no money is charged. Grants coverage and switches the role to BROKER.
+    Development environments only: 403 in production (pay via /payments)."""
     result = agent_plan_svc.subscribe_simulated(db, user_id, code, body.localities)
     db.commit()
     return result
@@ -88,6 +94,30 @@ def start_agent_trial(
     result = agent_plan_svc.start_trial(db, user_id, body.locality)
     db.commit()
     return result
+
+
+@router.get("/plans")
+def list_agent_plans():
+    """Public catalogue of purchasable agent plans (locality coverage,
+    price, validity). The free trial is not sold online."""
+    return {"items": agent_plan_svc.catalogue()}
+
+
+@router.get("/locality-catalog")
+def list_agent_locality_catalog(
+    db: Session = Depends(get_db),
+    q: str | None = Query(default=None, max_length=255),
+):
+    """Public catalogue of localities an agent may choose (admin-enabled,
+    served): name + pincodes only. Powers the agent plan checkout."""
+    items, total = locality_svc.list_catalog(db, q=q, enabled=True, page=1, page_size=500)
+    return {
+        "items": [
+            {"locality_id": i["locality_id"], "name": i["name"], "pincodes": i["pincodes"]}
+            for i in items
+        ],
+        "total": total,
+    }
 
 
 @router.post("/plan/localities", response_model=schemas.AgentPlanLocalitiesOut)

@@ -76,6 +76,32 @@ def get_current_user_id(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
+def get_optional_user_id(
+    db: Session = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> int | None:
+    """User id for endpoints that serve guests AND signed-in users, or None.
+
+    - No Authorization header at all: a guest. The endpoint serves public
+      data only (Reva chat: the public knowledge base + public listings).
+    - A header IS presented: it must be a valid, active session — the same
+      decode/signature/expiry checks as get_current_user_id plus the
+      deleted-user/suspension checks of ensure_active_user. Fail closed: a
+      stale or forged token is 401/403 exactly like a required-auth endpoint,
+      never silently downgraded to guest (that would hide a broken session
+      behind public answers and could look like a working sign-in).
+    """
+    if credentials is None or not credentials.credentials:
+        return None
+    payload = decode_token(credentials.credentials)
+    try:
+        user_id = int(payload["sub"])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    ensure_active_user(db, user_id)
+    return user_id
+
+
 def get_session_amr(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> str | None:

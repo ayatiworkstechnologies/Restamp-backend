@@ -54,7 +54,9 @@ def test_buyer_reveal_and_audit(client):
     r = c.post(f"/buyer/listings/{lid}/contact", headers=auth_header(tok["access_token"]))
     assert r.status_code == 200, r.text
     # The owner's public-safe name rides along (seed owner "Owner"); never a phone.
-    assert r.json() == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
+    _b = r.json()  # Phase 3 adds unlock_status/free_unlocks_remaining/credit_balance (additive)
+    assert {k: _b[k] for k in ("phone", "owner_name", "own_listing")} == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
+    assert _b["unlock_status"] in ("UNLOCKED_FREE", "ALREADY_UNLOCKED")
     row = session.execute(
         text(
             "SELECT user_id, property_listing_id FROM contact_reveal_audits "
@@ -72,7 +74,8 @@ def test_auth_and_visibility_gates(client):
     tok = register_phone(c, "+916200000003")
     h = auth_header(tok["access_token"])
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
-    assert c.post(f"/buyer/listings/{lid}/contact", headers=h).status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode.
+    assert c.post(f"/buyer/listings/{lid}/contact", headers=h).status_code == 200
     before = audit_count(session)
     for kwargs in ({"verification": "PENDING"}, {"status": "SOLD"}, {"status": "RENTED"}, {"status": "LEASED"}):
         bad, _, _ = seed_owner_listing(session, **kwargs)
@@ -80,7 +83,8 @@ def test_auth_and_visibility_gates(client):
         r = c.post(f"/buyer/listings/{bad}/contact", headers=auth_header(buyer["access_token"]))
         assert r.status_code == 404, kwargs
         assert r.json() == {"detail": "Not found"}
-    assert c.post("/buyer/listings/999999999/contact", headers=h).status_code == 403  # role first
+    # Phase 1: the OWNER-mode account has buyer capability -> plain 404.
+    assert c.post("/buyer/listings/999999999/contact", headers=h).status_code == 404
     fresh = register_phone(c, "+916200000999")
     assert c.post("/buyer/listings/999999999/contact", headers=auth_header(fresh["access_token"])).status_code == 404
     assert audit_count(session) == before  # failures leave no audit rows

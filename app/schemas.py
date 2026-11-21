@@ -66,6 +66,9 @@ class OTPRequest(BaseModel):
 class OTPVerify(BaseModel):
     phone: str = Field(pattern=INDIAN_MOBILE_PATTERN)
     code: str = Field(pattern=r"^\d{6}$")
+    # Declared account type, applied ONLY when this verify registers a new
+    # account (ignored for existing accounts). Grants no posting right.
+    account_type: Literal["BUYER", "OWNER", "DEALER", "BROKER"] | None = None
 
 
 class GoogleAuthIn(BaseModel):
@@ -80,12 +83,55 @@ class TokenOut(BaseModel):
     role: str | None
 
 
+class RefreshTokenIn(BaseModel):
+    refresh_token: str
+    token_hash: str
+
+
+class PosterPlanOut(BaseModel):
+    subscription_id: int
+    plan_code: str
+    plan_name: str
+    source: str | None = None
+    end_date: datetime | None = None
+    is_trial: bool = False
+
+
+class CapabilitiesOut(BaseModel):
+    """Backend-authoritative capabilities (Buyer always; Owner XOR Dealer)."""
+    buyer: bool
+    poster_type: str | None
+    owner: bool
+    dealer: bool
+    poster_plan_status: Literal["NONE", "ACTIVE", "TRIAL", "INACTIVE"]
+    poster_plan: PosterPlanOut | None = None
+    can_post: bool = False
+    active_mode: str | None
+    allowed_modes: list[str]
+
+
+class PosterTypeConvertIn(BaseModel):
+    poster_type: Literal["OWNER", "BROKER", "DEALER"]
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class PosterTypeConvertOut(BaseModel):
+    user_id: int
+    old_poster_type: str
+    new_poster_type: str
+    reason: str
+    converted_at: datetime
+    converted_by: int
+    revoked_locality_grants: int
+
+
 class MeOut(BaseModel):
     id: int
     display_name: str
     role: str | None
     providers: list[str]
     is_admin: bool
+    capabilities: CapabilitiesOut | None = None
 
 
 class AdminGrant(BaseModel):
@@ -193,6 +239,77 @@ class ListingContactRevealOut(ContactRevealOut):
 
     owner_name: str | None = None
     own_listing: bool = False
+    # Phase 3 (additive): how this reveal was entitled. ALREADY_UNLOCKED |
+    # UNLOCKED_FREE | UNLOCKED_CREDIT | UNLOCKED_PLAN (legacy buyer plan) |
+    # DEALER_AREA (agent locality access, no buyer unlock) | OWN_LISTING.
+    unlock_status: str | None = None
+    free_unlocks_remaining: int | None = None
+    credit_balance: int | None = None
+
+
+class ContactCreditPackOut(BaseModel):
+    code: str
+    credits: int
+    price_paise: int | None = None  # null until an admin sets the (undecided) price
+    currency: str
+    available: bool
+
+
+class LegacyBuyerPlanOut(BaseModel):
+    plan_code: str
+    plan_name: str
+    lead_limit: int | None = None
+    leads_used: int
+    leads_remaining: int | None = None
+    valid_until: datetime | None = None
+
+
+class ContactEntitlementOut(BaseModel):
+    free_unlocks_total: int
+    free_unlocks_used: int
+    free_unlocks_remaining: int
+    credit_balance: int
+    unlocked_properties: int
+    legacy_plan: LegacyBuyerPlanOut | None = None
+    pack: ContactCreditPackOut
+
+
+class ContactUnlockOut(BaseModel):
+    listing_id: int
+    unlocked: bool
+    source: str | None = None
+    unlocked_at: datetime | None = None
+
+
+class ContactUnlocksResponse(BaseModel):
+    items: list[ContactUnlockOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class ContactLedgerEntryOut(BaseModel):
+    id: int
+    entry_type: str
+    credits_delta: int
+    free_delta: int
+    balance_after: int
+    payment_id: int | None = None
+    listing_id: int | None = None
+    created_at: datetime
+
+
+class ContactLedgerResponse(BaseModel):
+    items: list[ContactLedgerEntryOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class ContactCreditPackIn(BaseModel):
+    price_paise: int = Field(ge=100, le=100_000_000)
+    active: bool = True
+    note: str | None = Field(default=None, max_length=500)
 
 
 class EnquiryCreate(BaseModel):
@@ -411,7 +528,7 @@ class VerificationRejectIn(BaseModel):
 
 # --- Property visits (buyer/owner scheduled viewings) --------------------------
 
-_VISIT_STATUSES = {"REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"}
+_VISIT_STATUSES = {"PENDING", "REQUESTED", "PROPOSED", "CONFIRMED", "REJECTED", "DECLINED", "CANCELLED", "COMPLETED"}
 
 
 class VisitCreate(BaseModel):
@@ -433,13 +550,15 @@ class OwnerVisitCreate(BaseModel):
 
 
 class VisitUpdate(BaseModel):
-    """Reschedule, edit the shared note and/or status-transition a visit. At
-    least one field is required; actor permissions and the state machine are
-    enforced in the service. `note` may be edited by whoever may edit the
-    time in the visit's current status; "" clears it."""
+    """Status-transition a visit (strict Phase 5). At least one field is
+    required; actor permissions and the state machine are enforced in the
+    service. `scheduled_at` / `note` are kept for contract compatibility but
+    every time or note edit is refused with 422 (proposals and confirmed
+    visits are immutable). REJECTED is the poster's answer to a PENDING
+    visit; DECLINED remains valid only for legacy REQUESTED/PROPOSED rows."""
 
     scheduled_at: datetime | None = None
-    status: Literal["CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = None
+    status: Literal["CONFIRMED", "REJECTED", "DECLINED", "CANCELLED", "COMPLETED"] | None = None
     note: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
@@ -1352,6 +1471,67 @@ class AdminEnquiryRow(BaseModel):
     last_message_at: datetime | None = None
 
 
+class AdminSubscriptionRow(BaseModel):
+    """One stored subscription. `simulated` is true when its payment came from the
+    simulated subscribe endpoints (provider SIMULATED: no money was charged).
+    `status` is EXPIRED when the end date has passed even if not yet swept."""
+
+    id: int
+    user_id: int
+    user_name: str | None = None
+    user_current_role: str | None = None
+    plan_code: str
+    plan_name: str
+    price_paise: int
+    status: str
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+    payment_id: int
+    payment_provider: str
+    simulated: bool
+    plan_role: str | None = None
+    source: str | None = None
+    billing_cycle: str | None = None
+    duration_days: int | None = None
+    assigned_by_user_id: int | None = None
+    ended_reason: str | None = None
+    # Live usage for current (ACTIVE, unexpired) subscriptions only; empty otherwise.
+    usage: dict = Field(default_factory=dict)
+
+
+class AdminSubscriptionsResponse(BaseModel):
+    items: list[AdminSubscriptionRow]
+    page: int
+    page_size: int
+    total: int
+
+
+class AdminPaymentRow(BaseModel):
+    """One stored payment record. provider_payment_id is withheld for simulated
+    rows (not a real transaction). No gateway secrets are ever part of this."""
+
+    id: int
+    user_id: int
+    user_name: str | None = None
+    plan_code: str | None = None
+    plan_name: str | None = None
+    provider: str
+    simulated: bool
+    provider_payment_id: str | None = None
+    amount_paise: int
+    currency: str
+    status: str
+    created_at: datetime | None = None
+    paid_at: datetime | None = None
+
+
+class AdminPaymentsResponse(BaseModel):
+    items: list[AdminPaymentRow]
+    page: int
+    page_size: int
+    total: int
+
+
 class AdminEnquiriesResponse(BaseModel):
     items: list[AdminEnquiryRow]
     page: int
@@ -1538,3 +1718,599 @@ class AdminAgentAssignOut(AdminAgentCoverageOut):
     added_localities: list[str]
     unmatched_localities: list[str]
     unavailable_localities: list[str]
+
+
+# --- In-app notifications (notification system Phase 1) ---------------------------
+# Owner-scoped responses: every row belongs to the caller. Content is rendered
+# server-side from fixed templates (no phones, names or message bodies).
+# `target` is a fixed kind + the related id the caller can already open; the
+# app maps the kind to its own screens (never a backend-supplied route).
+
+NotificationAudience = Literal["BUYER", "OWNER", "ACCOUNT"]
+NotificationCategory = Literal["PROPERTIES", "VISITS", "SYSTEM"]
+NotificationTargetKind = Literal[
+    "OWNER_LEAD", "BUYER_ENQUIRY", "OWNER_VISIT", "BUYER_VISIT", "OWNER_LISTING", "NONE"
+]
+
+
+class NotificationTarget(BaseModel):
+    kind: NotificationTargetKind
+    id: int | None = None
+
+
+class NotificationOut(BaseModel):
+    id: int
+    type: str
+    category: NotificationCategory
+    audience: NotificationAudience
+    title: str
+    body: str
+    entity_type: str | None = None
+    entity_id: int | None = None
+    property_listing_id: int | None = None
+    cover_image_url: str | None = None
+    target: NotificationTarget
+    is_read: bool
+    read_at: datetime | None = None
+    created_at: datetime
+
+
+class NotificationsResponse(BaseModel):
+    items: list[NotificationOut]
+    page: int
+    page_size: int
+    total: int
+    unread_count: int
+
+
+class NotificationUnreadCountOut(BaseModel):
+    unread_count: int
+
+
+class NotificationsReadAllOut(BaseModel):
+    updated: int
+    unread_count: int
+
+
+# --- Email notifications (notification system Phase 3) ----------------------------
+# The caller's own contact email, its verification state and optional-email
+# preferences. Verification codes are never part of a response, except
+# `debug_code` in an explicit development environment (same convention as the
+# local login code); production and staging never return it.
+
+class EmailPreferences(BaseModel):
+    enquiries: bool = True
+    visits: bool = True
+    listings: bool = True
+
+
+class EmailStatusOut(BaseModel):
+    email: str | None = None
+    verified: bool
+    verified_at: datetime | None = None
+    # False while no email provider is configured: the address is saved but
+    # no verification email can be sent yet.
+    delivery_available: bool
+    preferences: EmailPreferences
+    debug_code: str | None = None
+
+
+class EmailSetIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class EmailVerifyIn(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+
+EmailOutboxStatus = Literal["PENDING", "PROCESSING", "SENT", "FAILED"]
+EmailCategory = Literal["VERIFICATION", "ENQUIRY", "VISIT", "LISTING", "ACCOUNT"]
+
+
+class AdminEmailDeliveryOut(BaseModel):
+    id: int
+    user_id: int
+    recipient: str | None = None  # masked address (a***@example.com)
+    category: EmailCategory
+    template: str
+    status: EmailOutboxStatus
+    attempts: int
+    failure: str | None = None
+    provider: str | None = None
+    created_at: datetime
+    sent_at: datetime | None = None
+    failed_at: datetime | None = None
+    next_attempt_at: datetime | None = None
+
+
+class AdminEmailDeliveriesResponse(BaseModel):
+    items: list[AdminEmailDeliveryOut]
+    page: int
+    page_size: int
+    total: int
+
+
+# --- Push notifications (notification system Phase 4) ------------------------------
+# The caller's own registered devices and push preferences (INDEPENDENT of
+# email and in-app preferences). A device token is NEVER part of a response,
+# a log or a payload sent to a client: only a masked prefix for recognition.
+
+class PushPreferences(BaseModel):
+    enquiries: bool = True
+    visits: bool = True
+    listings: bool = True
+
+
+class PushDeviceOut(BaseModel):
+    id: int
+    platform: Literal["ios", "android"]
+    status: Literal["ACTIVE", "INACTIVE", "INVALID"]
+    invalid_reason: str | None = None
+    token_prefix: str | None = None  # masked display form (never the token)
+    app_version: str | None = None
+    device_name: str | None = None
+    registered_at: datetime
+    refreshed_at: datetime
+
+
+class PushStatusOut(BaseModel):
+    # False while no push provider is configured: devices may be registered
+    # but nothing is delivered yet (the mobile app shows its dormant state).
+    available: bool
+    devices: list[PushDeviceOut]
+    preferences: PushPreferences
+
+
+class PushDeviceCreateIn(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+    platform: Literal["ios", "android"]
+    app_version: str | None = Field(default=None, max_length=50)
+    device_name: str | None = Field(default=None, max_length=100)
+
+
+PushOutboxStatus = Literal["PENDING", "PROCESSING", "SENT", "FAILED"]
+PushCategory = Literal["ENQUIRY", "VISIT", "LISTING", "ACCOUNT"]
+
+
+class AdminPushDeviceCounts(BaseModel):
+    """Per-device outcomes of one push: accepted = Expo ticket ok (NOT yet
+    confirmed), delivered = receipt ok, failed, pending (not final yet)."""
+    pending: int = 0
+    accepted: int = 0
+    delivered: int = 0
+    failed: int = 0
+
+
+class AdminPushDeliveryOut(BaseModel):
+    id: int
+    user_id: int
+    category: PushCategory
+    template: str
+    status: PushOutboxStatus
+    attempts: int
+    failure: str | None = None
+    provider: str | None = None
+    created_at: datetime
+    sent_at: datetime | None = None
+    failed_at: datetime | None = None
+    next_attempt_at: datetime | None = None
+    devices: AdminPushDeviceCounts = AdminPushDeviceCounts()
+
+
+class AdminPushDeliveriesResponse(BaseModel):
+    items: list[AdminPushDeliveryOut]
+    page: int
+    page_size: int
+    total: int
+
+
+# ---------------------------------------------------------------------------
+# Online payments (Razorpay) — response models for routers/payments.py.
+# Fields mirror services/payments.py exactly; secrets never appear here.
+# ---------------------------------------------------------------------------
+class PaymentConfigOut(BaseModel):
+    provider: Literal["razorpay", "none"]
+    razorpay_key_id: str | None = None  # PUBLIC checkout key only
+
+
+class PaymentCheckoutPlanOut(BaseModel):
+    kind: Literal["buyer", "agent", "owner", "credits"]
+    code: str
+    name: str
+    price_paise: int
+    duration_days: int
+    locality_limit: int | None = None  # agent plans only
+
+
+class PaymentCheckoutOut(BaseModel):
+    payment_id: int
+    provider: Literal["razorpay"]
+    razorpay_key_id: str
+    razorpay_order_id: str
+    amount_paise: int
+    currency: str
+    plan: PaymentCheckoutPlanOut
+    unmatched_localities: list[str] | None = None  # agent plans only
+    unavailable_localities: list[str] | None = None  # agent plans only
+
+
+class PaymentVerifyOut(BaseModel):
+    """Activation result. The plan-status fields differ between buyer and
+    agent plans (services/buyer_plans.status_for, agent_plans.status_for), so
+    they pass through unchanged; the payment fields are always present."""
+
+    model_config = ConfigDict(extra="allow")
+    payment_id: int
+    status: Literal["INITIATED", "SUCCESS", "FAILED"]
+    activated: bool
+    transaction_id: str | None = None
+    amount_paise: int
+    # Verified payment that could not be activated safely (e.g. Owner/Dealer
+    # conflict): kept as SUCCESS and flagged for an admin. No plan granted.
+    manual_review: bool = False
+    review_reason: str | None = None
+
+
+class PaymentRefundIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class PaymentRefundOut(BaseModel):
+    id: int
+    payment_id: int
+    user_id: int
+    status: Literal["REQUESTED", "PENDING", "PROCESSED", "FAILED"]
+    amount_paise: int
+    provider_refund_id: str | None = None
+    gateway_status: str | None = None
+    failure_code: str | None = None
+    intended_poster_type: str | None = None
+    original_payment_status: str
+    review_reason: str | None = None
+    admin_user_id: int
+    admin_reason: str
+    attempts: int
+    requested_at: datetime
+    processed_at: datetime | None = None
+
+
+class AdminPaymentReviewOut(BaseModel):
+    payment_id: int
+    user_id: int
+    provider: str
+    status: str
+    amount_paise: int
+    provider_payment_id: str | None = None
+    paid_at: datetime | None = None
+    plan_code: str | None = None
+    intended_poster_type: str | None = None
+    review_status: str | None = None
+    review_reason: str | None = None
+    flagged_at: datetime | None = None
+    refund: PaymentRefundOut | None = None
+
+
+class AdminPaymentReviewsResponse(BaseModel):
+    items: list[AdminPaymentReviewOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class PaymentWebhookAckOut(BaseModel):
+    status: Literal["ok"]
+    ignored: bool | None = None
+    duplicate: bool | None = None
+    activation_failed: bool | None = None
+
+
+class PaymentHistoryItemOut(BaseModel):
+    payment_id: int
+    provider: str
+    status: str
+    amount_paise: int
+    currency: str
+    plan_code: str | None = None
+    plan_name: str | None = None
+    provider_payment_id: str | None = None
+    provider_order_id: str | None = None
+    created_at: datetime | None = None
+    paid_at: datetime | None = None
+
+
+class PaymentHistoryOut(BaseModel):
+    items: list[PaymentHistoryItemOut]
+
+
+class InvoiceSellerOut(BaseModel):
+    name: str
+    support: str | None = None
+
+
+class InvoiceBuyerOut(BaseModel):
+    user_id: int
+    name: str | None = None
+    email: str | None = None
+
+
+class InvoicePlanOut(BaseModel):
+    code: str | None = None
+    name: str | None = None
+    description: str | None = None
+
+
+class InvoicePaymentOut(BaseModel):
+    provider: str
+    provider_payment_id: str | None = None
+    provider_order_id: str | None = None
+    paid_at: datetime | None = None
+
+
+class PaymentInvoiceOut(BaseModel):
+    invoice_number: str
+    issued_at: datetime
+    seller: InvoiceSellerOut
+    buyer: InvoiceBuyerOut
+    plan: InvoicePlanOut
+    payment: InvoicePaymentOut
+    amount_paise: int
+    currency: str
+    note: str
+
+
+# --- subscription management (services/subscriptions.py) ------------------------------
+
+class SubscriptionPlanOut(BaseModel):
+    """One admin-managed plan. status: ACTIVE | PAUSED | ARCHIVED. Limits: null = unlimited."""
+
+    id: int
+    code: str
+    name: str
+    description: str | None = None
+    role: str
+    price_paise: int
+    duration_days: int | None = None
+    billing_cycle: str
+    listing_limit: int | None = None
+    lead_limit: int | None = None
+    location_limit: int | None = None
+    features: list[str] = Field(default_factory=list)
+    visible: bool
+    recommended: bool
+    status: str
+    version: int
+    is_free: bool
+    active_subscribers: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    updated_by_user_id: int | None = None
+
+
+class SubscriptionPlansResponse(BaseModel):
+    items: list[SubscriptionPlanOut]
+
+
+class SubscriptionPlanCreate(BaseModel):
+    code: str = Field(min_length=3, max_length=50)
+    role: Literal["BUYER", "OWNER", "BROKER"]
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+    price_paise: int = Field(ge=0, le=1_000_000_000)
+    duration_days: int | None = Field(default=None, ge=1, le=3650)
+    billing_cycle: Literal["one_time", "monthly", "quarterly", "yearly"] = "one_time"
+    listing_limit: int | None = Field(default=None, ge=-1, le=100000)
+    lead_limit: int | None = Field(default=None, ge=-1, le=100000)
+    location_limit: int | None = Field(default=None, ge=-1, le=100000)
+    features: list[str] = Field(default_factory=list, max_length=30)
+    visible: bool = True
+    recommended: bool = False
+    sort_order: int = 0
+    status: Literal["ACTIVE", "PAUSED"] = "ACTIVE"
+
+
+class SubscriptionPlanUpdate(BaseModel):
+    """Partial update; every change bumps the plan version (pricing history)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+    price_paise: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    duration_days: int | None = Field(default=None, ge=1, le=3650)
+    billing_cycle: Literal["one_time", "monthly", "quarterly", "yearly"] | None = None
+    listing_limit: int | None = Field(default=None, ge=-1, le=100000)
+    lead_limit: int | None = Field(default=None, ge=-1, le=100000)
+    location_limit: int | None = Field(default=None, ge=-1, le=100000)
+    features: list[str] | None = Field(default=None, max_length=30)
+    visible: bool | None = None
+    recommended: bool | None = None
+    sort_order: int | None = None
+    change_note: str | None = Field(default=None, max_length=500)
+
+
+class SubscriptionPlanStatusIn(BaseModel):
+    status: Literal["ACTIVE", "PAUSED", "ARCHIVED"]
+
+
+class PlanVersionOut(BaseModel):
+    id: int
+    plan_id: int
+    plan_code: str
+    version: int
+    snapshot: dict
+    change_note: str | None = None
+    changed_by_user_id: int | None = None
+    created_at: datetime | None = None
+
+
+class PlanHistoryResponse(BaseModel):
+    items: list[PlanVersionOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class UserSubscriptionOut(BaseModel):
+    """A subscription with its plan. payment_verified is true ONLY for a real,
+    successful gateway payment (never for ADMIN / BYPASS / SIMULATED)."""
+
+    id: int
+    user_id: int
+    plan: SubscriptionPlanOut
+    status: str
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+    source: str | None = None
+    assigned_by_user_id: int | None = None
+    ended_reason: str | None = None
+    payment_provider: str | None = None
+    payment_status: str | None = None
+    payment_verified: bool = False
+    already_active: bool | None = None
+
+
+class AdminAssignSubscriptionIn(BaseModel):
+    plan_code: str = Field(min_length=1, max_length=50)
+    reason: str = Field(min_length=1, max_length=500)
+    validity_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class AdminExtendSubscriptionIn(BaseModel):
+    days: int = Field(ge=1, le=3650)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class AdminSubscriptionReasonIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class PaymentBypassIn(BaseModel):
+    plan_code: str = Field(min_length=1, max_length=50)
+
+
+class MyRoleSubscription(BaseModel):
+    subscription: UserSubscriptionOut | None = None
+    usage: dict = Field(default_factory=dict)
+
+
+class MySubscriptionsOut(BaseModel):
+    current_role: str | None = None
+    subscriptions: dict[str, MyRoleSubscription]
+
+
+# --- Conversation system schemas (Phase 4) --------------------------------------
+
+class ConversationOut(BaseModel):
+    """Response model for a conversation."""
+
+    id: int
+    conversation_type: str  # PROPERTY or DIRECT
+    property_listing_id: int | None = None
+    participant_a_user_id: int
+    participant_b_user_id: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    other_user_id: int | None = None
+    other_user_display_name: str | None = None
+    property_info: dict | None = None
+    latest_message: dict | None = None
+    latest_message_at: datetime | None = None
+    unread_count: int = 0
+
+
+class ConversationsResponse(BaseModel):
+    """Response model for listing conversations."""
+
+    items: list[ConversationOut]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class MessageOut(BaseModel):
+    """Response model for a single message."""
+
+    id: int
+    conversation_id: int
+    sender_user_id: int
+    body: str
+    message_type: str | None = None
+    created_at: datetime | None = None
+
+
+class MessagesResponse(BaseModel):
+    """Response model for paginated messages."""
+
+    items: list[MessageOut]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class ConversationCreateIn(BaseModel):
+    """Input for creating a conversation."""
+
+    other_user_id: int = Field(ge=1, le=2**31 - 1)
+    conversation_type: str = Field(pattern="^(PROPERTY|DIRECT)$")
+    property_listing_id: int | None = Field(
+        default=None,
+        ge=None,
+        le=None,
+        description="Required for PROPERTY type; NULL for DIRECT type",
+    )
+
+
+class MessageCreateIn(BaseModel):
+    """Input for sending a message."""
+
+    body: str = Field(min_length=1, max_length=5000)
+    message_type: str | None = Field(
+        default=None,
+        pattern="^(TEXT|IMAGE|SYSTEM)$",
+    )
+
+
+class MarkConversationReadIn(BaseModel):
+    """Input for marking a conversation as read."""
+
+    pass  # No input needed; user_id derived from auth token
+
+
+class MarkMessageReadIn(BaseModel):
+    """Input for marking a specific message as read."""
+
+    message_id: int = Field(ge=1, le=2**31 - 1)
+
+
+class UnreadCountOut(BaseModel):
+    """Response model for unread count."""
+
+    unread_count: int
+
+
+
+class MyPaymentRow(BaseModel):
+    """One of the caller's own payment records. `paid` is true ONLY for a real,
+    successful gateway payment; BYPASS / ADMIN / SIMULATED / FREE_TRIAL rows are
+    never paid and carry no transaction reference."""
+
+    id: int
+    plan_code: str | None = None
+    plan_name: str | None = None
+    plan_role: str | None = None
+    provider: str
+    paid: bool
+    transaction_ref: str | None = None
+    amount_paise: int
+    currency: str
+    status: str
+    created_at: datetime | None = None
+    paid_at: datetime | None = None
+    subscription_id: int | None = None
+
+
+class MyPaymentsResponse(BaseModel):
+    items: list[MyPaymentRow]
+    page: int
+    page_size: int
+    total: int

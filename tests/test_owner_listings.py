@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, fresh_pincode, make_postcode, register_phone
+from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, fresh_pincode, make_postcode, register_phone
 
 
 def _setup_owner(client) -> tuple[dict, str]:
@@ -27,6 +27,7 @@ def _setup_owner(client) -> tuple[dict, str]:
         headers=auth_header(token),
     )
     assert r.status_code == 200, r.text
+    grant_test_posting_plan(client, auth_header(token))
     # Re-verify profile or use token (role is evaluated from DB / token)
     return token_out, token
 
@@ -126,11 +127,13 @@ def test_owner_cannot_access_other_owner_listing(client):
     token_out_a = register_phone(c, "+919876543212")
     token_a = token_out_a["access_token"]
     c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token_a))
+    grant_test_posting_plan(c, auth_header(token_a))
 
     # Setup Owner B
     token_out_b = register_phone(c, "+919876543213")
     token_b = token_out_b["access_token"]
     c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token_b))
+    grant_test_posting_plan(c, auth_header(token_b))
 
     # Owner A creates listing
     r = c.post(
@@ -162,6 +165,7 @@ def _setup_owner_with_phone(client, phone: str) -> str:
     token_out = register_phone(client, phone)
     token = token_out["access_token"]
     r = client.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(client, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 
@@ -245,7 +249,7 @@ def test_listing_auto_verifies_after_two_minutes_and_persists(client):
     assert found[0]["verification_status"] == "PENDING"
 
     # ... explicit verify transitions PENDING -> VERIFIED + AVAILABLE ...
-    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    r = admin_verify(c, listing_id)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     assert r.json()["listing_status"] == "AVAILABLE"
@@ -256,7 +260,7 @@ def test_listing_auto_verifies_after_two_minutes_and_persists(client):
     assert lstat == "AVAILABLE"
 
     # ... and idempotent: repeats keep it VERIFIED without changes.
-    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    r = admin_verify(c, listing_id)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     vstat, _, _ = _db_status(session, listing_id)
@@ -280,7 +284,7 @@ def test_listing_detail_fetch_also_auto_verifies(client):
     assert r.json()["verification_status"] == "PENDING"
 
     # ... explicit verify flips and persists.
-    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    r = admin_verify(c, listing_id)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     vstat, _, _ = _db_status(session, listing_id)

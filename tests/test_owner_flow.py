@@ -106,7 +106,7 @@ def test_owner_cannot_touch_another_owners_listing(client):
 # --- visits -------------------------------------------------------------------------
 
 def _visit_for(c, session, token_owner):
-    """A REQUESTED visit on a VERIFIED listing of token_owner's."""
+    """A PENDING (buyer-requested) visit on a VERIFIED listing of token_owner's."""
     lid = _create(c, token_owner)["listing_id"]
     session.execute(text("UPDATE property_listings SET verification_status='VERIFIED' WHERE id=:i"), {"i": lid})
     buyer = fresh_buyer(c)
@@ -128,7 +128,7 @@ def test_visits_are_isolated_between_owners(client):
     assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=hb).status_code == 404
     # A foreign property filter fails closed (404, never an empty page).
     assert c.get(f"/owner/visits?property_listing_id={lid}", headers=hb).status_code == 404
-    assert c.get(f"/owner/visits/{vid}", headers=ha).json()["status"] == "REQUESTED"
+    assert c.get(f"/owner/visits/{vid}", headers=ha).json()["status"] == "PENDING"
     card = c.get(f"/owner/listings/{lid}", headers=ha).json()
     assert card["visit_count"] == 1
 

@@ -55,12 +55,13 @@ def test_owner_broker_exclusivity(client):
     assert c.get("/broker/scope", headers=h).status_code == 403
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
     assert c.get("/owner/vault", headers=h).status_code == 200
-    assert c.get("/buyer/welcome", headers=h).status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode.
+    assert c.get("/buyer/welcome", headers=h).status_code == 200
     assert c.get("/broker/scope", headers=h).status_code == 403
     c.post("/users/me/role", json={"role": "BROKER"}, headers=h)
     assert c.get("/broker/scope", headers=h).status_code == 200
     assert c.get("/owner/vault", headers=h).status_code == 403
-    assert c.get("/buyer/welcome", headers=h).status_code == 403
+    assert c.get("/buyer/welcome", headers=h).status_code == 200
 
 
 def test_owner_switch_preserves_property_history(client):
@@ -236,7 +237,7 @@ def test_schema_regression_29_tables(client):
                   "WHERE TABLE_SCHEMA = DATABASE()")
         ).fetchall()
     } - {"alembic_version"}
-    assert len(tables) == 38  # + enquiry_messages, lead_notes (j0k1l2m3n4o5), locality_aliases (k1l2m3n4o5p6)
+    assert len(tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + enquiry_messages, lead_notes (j0k1l2m3n4o5), locality_aliases (k1l2m3n4o5p6), notifications (m3n4o5p6q7r8); + rate_limit_windows (o5p6q7r8s9t0), push_devices/push_outbox/push_preferences (o5p6q7r8s9t1)
     assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "rent_terms" in tables

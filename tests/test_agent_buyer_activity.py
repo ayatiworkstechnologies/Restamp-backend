@@ -108,7 +108,7 @@ def test_a_reused_lead_keeps_the_role_it_was_created_with(client):
     assert c.get(f"/owner/leads/{eid}", headers=ho).json()["source_role"] == "BUYER"
 
 
-def test_owner_mode_and_buyer_plans_stay_refused(client):
+def test_owner_mode_and_agent_mode_keep_buyer_capability(client):
     c, session = client
     lid, _, _ = seed_owner_listing(session)
     _n["i"] += 1
@@ -119,9 +119,10 @@ def test_owner_mode_and_buyer_plans_stay_refused(client):
                                ("GET", "/buyer/visits", None), ("GET", "/buyer/viewed", None),
                                ("GET", "/buyer/call-events", None)):
         r = c.request(method, path, json=body, headers=ho)
-        assert r.status_code == 403 and r.json()["detail"] == "BUYER role required", path
+        # Phase 1 (approved): buyer capability exists in every mode.
+        assert r.status_code in (200, 201), (path, r.text)
     ha, _ = _agent(c, session, lid)
-    assert c.get("/buyer/plan", headers=ha).status_code == 403  # buyer plans remain buyer-only
+    assert c.get("/buyer/plan", headers=ha).status_code == 200
 
 
 def test_buyers_and_agents_never_see_each_others_activity(client):

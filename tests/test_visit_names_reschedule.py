@@ -3,11 +3,9 @@
 - names (D6): buyer's chosen name and owner's public name on both sides;
   phone-number defaults are never returned (null);
 - listing snapshot carries locality/city/property_type;
-- rescheduled_at: set when an accepted change moves the time (not when the
-  same time is re-sent), cleared when the status changes, set again by a later
-  reschedule; returned as explicit UTC;
-- note: editable by whoever may edit the time in the current status, "" clears,
-  note-only PATCH allowed, terminal visits refuse it; visible to both parties;
+- rescheduled_at: never set under strict Phase 5 (no time edits), cleared by
+  every status change; returned as explicit UTC;
+- note: set at creation, visible to both parties, never editable afterwards;
 - status transitions and isolation unchanged.
 Rollback-isolated.
 """
@@ -68,45 +66,44 @@ def test_phone_default_names_are_never_returned(client):
     assert "+91" not in str(owner_view) and "+91" not in str(visit)
 
 
-def test_reschedule_sets_and_status_change_clears(client):
+def test_no_reschedule_and_status_change_keeps_rescheduled_at_clear(client):
+    """Strict Phase 5: time edits do not exist, so rescheduled_at is never
+    set on a new visit; every status change keeps it null."""
     c, session = client
     visit, hb, ho = _setup(c, session)
     vid = visit["id"]
     same = c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": _iso(FUTURE)}, headers=hb)
-    assert same.status_code == 200 and same.json()["rescheduled_at"] is None  # same time: not a reschedule
+    assert same.status_code == 422  # even re-sending the same time is an edit attempt
     moved = c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": _iso(LATER)}, headers=hb)
-    assert moved.status_code == 200 and moved.json()["rescheduled_at"].endswith("Z")
-    assert moved.json()["status"] == "REQUESTED"  # status unchanged
+    assert moved.status_code == 422
+    assert c.get(f"/buyer/visits/{vid}", headers=hb).json()["status"] == "PENDING"
     confirmed = c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=ho)
     assert confirmed.json()["status"] == "CONFIRMED" and confirmed.json()["rescheduled_at"] is None
     again = c.patch(f"/owner/visits/{vid}", json={"scheduled_at": _iso(LATER + timedelta(hours=2))}, headers=ho)
-    assert again.status_code == 200 and again.json()["status"] == "CONFIRMED"
-    assert again.json()["rescheduled_at"] is not None  # owner may reschedule after confirming
-    assert c.get(f"/buyer/visits/{vid}", headers=hb).json()["rescheduled_at"] == again.json()["rescheduled_at"]
+    assert again.status_code == 422  # confirmed visits are immutable
     done = c.patch(f"/owner/visits/{vid}", json={"status": "COMPLETED"}, headers=ho)
     assert done.json()["rescheduled_at"] is None
 
 
 def test_note_edit_rules(client):
+    """The note is set at creation and shared with both parties; it can
+    never be edited afterwards (the proposer may not edit a submitted
+    proposal; confirmed/terminal visits are immutable)."""
     c, session = client
     visit, hb, ho = _setup(c, session, note="Gate 2 please")
     vid = visit["id"]
     assert visit["note"] == "Gate 2 please"
-    # REQUESTED: only the buyer may edit time/note.
     r = c.patch(f"/owner/visits/{vid}", json={"note": "Owner edit"}, headers=ho)
-    assert r.status_code == 422 and r.json()["detail"] == "Only buyer may edit the note of a REQUESTED visit"
+    assert r.status_code == 422 and r.json()["detail"] == "A PENDING visit cannot be rescheduled or edited"
     r = c.patch(f"/buyer/visits/{vid}", json={"note": "  Gate 3 instead  "}, headers=hb)
-    assert r.status_code == 200 and r.json()["note"] == "Gate 3 instead"
-    assert r.json()["rescheduled_at"] is None  # note-only edit is not a reschedule
-    assert c.get(f"/owner/visits/{vid}", headers=ho).json()["note"] == "Gate 3 instead"  # shared note
-    # CONFIRMED: either party; "" clears.
+    assert r.status_code == 422 and r.json()["detail"] == "The proposer cannot edit a submitted visit proposal"
+    assert c.get(f"/owner/visits/{vid}", headers=ho).json()["note"] == "Gate 2 please"  # shared, unchanged
     assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=ho).status_code == 200
     r = c.patch(f"/owner/visits/{vid}", json={"note": ""}, headers=ho)
-    assert r.status_code == 200 and r.json()["note"] is None
-    # Terminal: no edits.
+    assert r.status_code == 422 and r.json()["detail"] == "A CONFIRMED visit cannot be rescheduled or edited"
     assert c.patch(f"/owner/visits/{vid}", json={"status": "COMPLETED"}, headers=ho).status_code == 200
     r = c.patch(f"/buyer/visits/{vid}", json={"note": "late"}, headers=hb)
-    assert r.status_code == 422 and r.json()["detail"] == "Cannot edit the note of a COMPLETED visit"
+    assert r.status_code == 422 and r.json()["detail"] == "A COMPLETED visit cannot be rescheduled or edited"
     assert c.patch(f"/buyer/visits/{vid}", json={}, headers=hb).status_code == 422
     assert c.patch(f"/buyer/visits/{vid}", json={"note": "x" * 2001}, headers=hb).status_code == 422
 

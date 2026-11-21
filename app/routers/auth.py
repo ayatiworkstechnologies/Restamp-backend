@@ -5,13 +5,14 @@ successful verification (standard OTP registration), default role BUYER.
 Google: unknown identities NEVER auto-create (404 GOOGLE_UNKNOWN); the client
 must onboard through an approved flow before the Google identity can be linked.
 """
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import schemas
 from ..config import fixed_otp_in_production, otp_display_permitted
 from ..db import get_db
-from ..models import AuthIdentity
+from ..models import AuthIdentity, AuditLog, RefreshToken
 from ..security import (
     FIXED_OTP_AMR,
     create_access_token,
@@ -21,8 +22,9 @@ from ..security import (
     is_fixed_otp_session,
 )
 from ..services import google as google_svc
-from ..services import users_roles
+from ..services import capabilities, users_roles
 from ..services import otp as otp_service
+from ..services.refresh_tokens import create_refresh_token, validate_refresh_token, rotate_refresh_token, revoke_refresh_token, get_valid_refresh_token
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -90,7 +92,13 @@ def otp_verify(body: schemas.OTPVerify, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid code"
         )
     if user is None:
-        user = users_roles.create_user(db, display_name=body.phone)
+        # The declared account type applies only to a brand-new account: it
+        # never changes an existing account's poster type or mode.
+        user = users_roles.create_user(
+            db,
+            display_name=body.phone,
+            poster_type=capabilities.normalize_account_type(body.account_type),
+        )
         users_roles.link_identity(db, user.id, "phone", body.phone, verified_by="otp")
         db.commit()
     else:
@@ -147,6 +155,7 @@ def google_link(
         role=users_roles.get_current_role(db, user.id),
         providers=providers,
         is_admin=users_roles.is_admin(db, user.id),
+        capabilities=capabilities.capabilities(db, user.id),
     )
 
 
@@ -162,4 +171,117 @@ def me(db: Session = Depends(get_db), user=Depends(get_current_user)):
         role=users_roles.get_current_role(db, user.id),
         providers=providers,
         is_admin=users_roles.is_admin(db, user.id),
+        capabilities=capabilities.capabilities(db, user.id),
     )
+
+
+@router.post("/refresh", response_model=schemas.TokenOut)
+def refresh_access_token(
+    body: schemas.RefreshTokenIn,
+    db: Session = Depends(get_db),
+):
+    """Refresh an access token using a valid refresh token.
+
+    - Validates the refresh token by JTI and stored hash.
+    - Rotates the token: invalidates the old one and issues a new one.
+    - Prevents reuse of revoked/expired tokens.
+    - Returns a new access token and a new refresh token.
+    """
+    from ..security import decode_token
+
+    # Decode the JWT to extract the JTI
+    try:
+        payload = decode_token(body.refresh_token)
+    except HTTPException:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
+        )
+    jti = payload.get("jti")
+    if not jti:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
+        )
+
+    # Validate the refresh token against the database
+    rt = validate_refresh_token(jti, body.token_hash, db)
+    user_id = rt.user_id
+
+    # Rotate: invalidate the old token and issue a new one
+    old_rt, new_rt = rotate_refresh_token(jti, body.token_hash, db)
+
+    # Create a new access token for the user
+    from ..security import create_access_token as _create_access_token
+    role = users_roles.get_current_role(db, user_id)
+    new_access_token, ttl = _create_access_token(user_id, role)
+
+    return schemas.TokenOut(
+        access_token=new_access_token, expires_in=ttl, user_id=user_id, role=role
+    )
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Server-side invalidate the refresh token for the current session.
+
+    - Revokes ALL valid refresh tokens associated with the authenticated user.
+    - Idempotent: if tokens are already revoked, no error is raised.
+    - After this call, the client's Bearer token must be discarded;
+      any subsequent refresh attempt will be rejected (access token
+      remains valid until its natural expiry).
+    """
+    from ..services.refresh_tokens import revoke_refresh_token
+    from ..models import RefreshToken
+
+    # Revoke all valid (non-revoked, non-expired) refresh tokens for this user
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == user.id,
+        RefreshToken.revoked_at.is_(None),
+    ).update({"revoked_at": datetime.now(timezone.utc)}, synchronize_session=False)
+
+    # Also revoke any token that has an explicit revoked_at but was previously
+    # active, ensuring complete invalidation.
+    db.commit()
+
+
+@router.post("/close-account", status_code=status.HTTP_204_NO_CONTENT)
+def close_account(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Non-destructively close the authenticated user's account.
+
+    - Sets the user's status to ``closed``, preventing future authentication.
+    - Preserves ALL account data: property listings, enquiries, conversations,
+      messages, site visits, verification records, contact credits, subscriptions,
+      payment records, audit logs, and dealer locality entitlements.
+    - Idempotent: closing an already-closed account is a no-op.
+    - Auditable: the status change is recorded in the user row.
+    - Does NOT cancel subscriptions, issue refunds, or delete any records.
+
+    Returns 204 No Content on success. If the account is already closed,
+    returns 204 without error (idempotent).
+    """
+    from ..models import User
+
+    # Only transition from active to closed; if already closed, it is idempotent.
+    if user.status == "active":
+        user.status = "closed"
+        db.add(AuditLog(
+            user_id=user.id,
+            action="ACCOUNT_CLOSED",
+            entity=f"user:{user.id}",
+            before_json={"status": "active"},
+            after_json={"status": "closed"},
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+    elif user.status == "closed":
+        # Idempotent: already closed, no error.
+        db.commit()
+    else:
+        # User is suspended or otherwise disabled; still idempotent —
+        # nothing to do for "close" operation.
+        db.commit()

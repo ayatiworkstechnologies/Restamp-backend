@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone, fresh_pincode
+from tests.conftest import seed_verified, admin_verify, grant_test_posting_plan, auth_header, register_phone, fresh_pincode
 
 _SEQ = {"n": 0}
 FUTURE = lambda days=7: (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
@@ -19,6 +19,7 @@ def _owner(c, phone=None):
     out = register_phone(c, phone or f"+91920000{_SEQ['n']:04d}")
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     return out, token
 
@@ -45,8 +46,7 @@ def _listing(c, token, title=None):
     )
     assert r.status_code == 201, r.text
     lid = r.json()["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify",
-                  headers=auth_header(token)).status_code == 200
+    seed_verified(c, lid)  # setup only (verification itself: admin-only)
     return lid
 
 
@@ -83,7 +83,7 @@ def test_buyer_schedules_lists_details(client):
                headers=auth_header(buyer["access_token"]))
     assert r.status_code == 201, r.text
     body = r.json()
-    assert body["status"] == "REQUESTED" and body["initiator"] == "BUYER"
+    assert body["status"] == "PENDING" and body["initiator"] == "BUYER"  # strict Phase 5
     assert body["buyer_user_id"] == buyer["user_id"] and body["note"] == "Evening"
     assert body["listing"]["title"] and body["created_at"] and body["updated_at"]
     vid = body["id"]
@@ -133,13 +133,16 @@ def test_visit_auth_and_roles(client):
                    ("get", f"/owner/visits/{vid}"), ("patch", f"/owner/visits/{vid}")]
     for method, path in buyer_paths + owner_paths:
         assert getattr(c, method)(path).status_code == 401, (method, path)
-    # Wrong roles: buyer on owner routes -> 403, owner on buyer routes -> 403.
+    # Wrong roles: buyer on owner routes -> 403. # Phase 1 (approved): buyer capability exists in every mode.
+    # An OWNER-mode account on buyer routes is never 403; it sees only its
+    # own buyer-side visits (another buyer's visit is a 404).
     for method, path in owner_paths:
         r = getattr(c, method)(path, headers=auth_header(buyer["access_token"]))
         assert r.status_code == 403, (method, path, r.text)
     for method, path in buyer_paths:
         r = getattr(c, method)(path, headers=auth_header(otoken))
-        assert r.status_code == 403, (method, path, r.text)
+        assert r.status_code != 403, (method, path, r.text)
+    assert c.get(f"/buyer/visits/{vid}", headers=auth_header(otoken)).status_code == 404
 
 
 # --- Owner propose + relationship gate ------------------------------------------
@@ -176,7 +179,7 @@ def test_owner_propose_requires_relationship(client):
                      "scheduled_at": FUTURE(), "note": "Saturday?"},
                headers=h)
     assert r.status_code == 201, r.text
-    assert r.json()["status"] == "PROPOSED" and r.json()["initiator"] == "OWNER"
+    assert r.json()["status"] == "PENDING" and r.json()["initiator"] == "OWNER"  # strict Phase 5
     # Contact-reveal relationship also qualifies (second buyer via contact).
     assert c.post(f"/buyer/listings/{lid}/contact",
                   headers=auth_header(stranger["access_token"])).status_code == 200
@@ -201,9 +204,12 @@ def test_buyer_request_owner_confirm_complete(client):
                    headers=bh).status_code == 422
     assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"},
                    headers=oh).status_code == 200
-    # Either side may reschedule a confirmed visit; past times rejected.
+    # Strict Phase 5: a confirmed visit is immutable — neither side may
+    # reschedule it (future or past times alike).
     assert c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": FUTURE(14)},
-                   headers=bh).status_code == 200
+                   headers=bh).status_code == 422
+    assert c.patch(f"/owner/visits/{vid}", json={"scheduled_at": FUTURE(14)},
+                   headers=oh).status_code == 422
     assert c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": PAST()},
                    headers=bh).status_code == 422
     # Only the owner completes; terminal afterwards.
@@ -215,7 +221,9 @@ def test_buyer_request_owner_confirm_complete(client):
                    headers=oh).status_code == 422
 
 
-def test_proposed_buyer_confirm_decline_and_cancel(client):
+def test_owner_proposal_poster_decides_buyer_cancels(client):
+    """Strict Phase 5: the poster alone confirms/rejects every PENDING
+    visit (including their own proposal); the buyer's only move is cancel."""
     c, _ = client
     _, otoken = _owner(c)
     buyer = _buyer(c)
@@ -225,23 +233,25 @@ def test_proposed_buyer_confirm_decline_and_cancel(client):
     vid = c.post("/owner/visits",
                  json={"property_listing_id": lid, "buyer_user_id": buyer["user_id"],
                        "scheduled_at": FUTURE()}, headers=oh).json()["id"]
-    # Owner cannot confirm their own proposal; buyer confirms.
-    assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"},
-                   headers=oh).status_code == 422
+    # The buyer cannot confirm an owner proposal; the poster confirms it.
     assert c.patch(f"/buyer/visits/{vid}", json={"status": "CONFIRMED"},
-                   headers=bh).status_code == 200
-    # Second visit: buyer declines, then nothing moves.
+                   headers=bh).status_code == 422
+    assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"},
+                   headers=oh).status_code == 200
+    # Second proposal: the buyer cannot decline it, only cancel; then nothing moves.
     vid2 = c.post("/owner/visits",
                   json={"property_listing_id": lid, "buyer_user_id": buyer["user_id"],
                         "scheduled_at": FUTURE(3)}, headers=oh).json()["id"]
     assert c.patch(f"/buyer/visits/{vid2}", json={"status": "DECLINED"},
-                   headers=bh).status_code == 200
-    assert c.patch(f"/buyer/visits/{vid2}", json={"status": "CONFIRMED"},
                    headers=bh).status_code == 422
-    # Third visit: owner declines the buyer's request, buyer cancels path stays shut.
+    assert c.patch(f"/buyer/visits/{vid2}", json={"status": "CANCELLED"},
+                   headers=bh).status_code == 200
+    assert c.patch(f"/owner/visits/{vid2}", json={"status": "CONFIRMED"},
+                   headers=oh).status_code == 422
+    # Third visit: owner rejects the buyer's request; the buyer cannot revive it.
     vid3 = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": FUTURE(5)},
                   headers=bh).json()["id"]
-    assert c.patch(f"/owner/visits/{vid3}", json={"status": "DECLINED"},
+    assert c.patch(f"/owner/visits/{vid3}", json={"status": "REJECTED"},
                    headers=oh).status_code == 200
     assert c.patch(f"/buyer/visits/{vid3}", json={"scheduled_at": FUTURE(9)},
                    headers=bh).status_code == 422
@@ -268,7 +278,7 @@ def test_combined_confirm_and_reschedule_checks_original_state(client):
     r = c.patch(f"/buyer/visits/{vid}",
                 json={"status": "CONFIRMED", "scheduled_at": FUTURE(8)}, headers=bh)
     assert r.status_code == 422, r.text
-    assert c.get(f"/buyer/visits/{vid}", headers=bh).json()["status"] == "PROPOSED"
+    assert c.get(f"/buyer/visits/{vid}", headers=bh).json()["status"] == "PENDING"
 
     # An owner confirming a buyer request may not smuggle in a time change.
     vid2 = c.post("/buyer/visits",
@@ -277,7 +287,7 @@ def test_combined_confirm_and_reschedule_checks_original_state(client):
     r = c.patch(f"/owner/visits/{vid2}",
                 json={"status": "CONFIRMED", "scheduled_at": FUTURE(9)}, headers=oh)
     assert r.status_code == 422, r.text
-    assert c.get(f"/owner/visits/{vid2}", headers=oh).json()["status"] == "REQUESTED"
+    assert c.get(f"/owner/visits/{vid2}", headers=oh).json()["status"] == "PENDING"
 
 
 def test_cross_user_isolation_and_filters(client):
@@ -354,4 +364,4 @@ def test_visits_table_matches_model_and_head(client):
         _expected_heads()[0]
     from app.models import Base
     assert "property_visits" in Base.metadata.tables
-    assert len(Base.metadata.tables) == 38  # + locality_aliases (k1l2m3n4o5p6)
+    assert len(Base.metadata.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + locality_aliases (k1l2m3n4o5p6), notifications (m3n4o5p6q7r8); + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
