@@ -173,15 +173,18 @@ def _setup_owner_with_phone(client, phone: str) -> str:
 
 
 def _create_listing(client, token: str, title: str, area_value=None, area_unit=None) -> dict:
+    # Self-contained location: a free pincode paired with a locality created
+    # for it inside the test's rolled-back transaction (no shared-DB rows).
+    pin = fresh_pincode(client)
     payload = {
         "title": title,
         "transaction_type": "RENT",
         "property_type": "APARTMENT",
         "price_rupees": 25000,
         "price_period": "MONTHLY",
-        "locality": "Oldwashermenpet",
+        "locality": paired_locality(client, pin, "Create"),
         "city": "Chennai",
-        "pincode": "600021",
+        "pincode": pin,
     }
     if area_value is not None:
         payload["area_value"] = area_value
@@ -504,15 +507,25 @@ def test_area_unit_normalized_lowercase(client):
 
 
 def _post_listing(client, token: str, title: str, **overrides):
+    # Same isolation as _create_listing. An explicit pincode keeps the
+    # caller's value (range tests post out-of-range pins on purpose); an
+    # in-range one gets the locality that owns it in this session.
+    pin = overrides.get("pincode")
+    if pin is None:
+        pin = fresh_pincode(client)
+    locality = overrides.get("locality")
+    if locality is None:
+        in_range = isinstance(pin, str) and pin.isdigit() and 600001 <= int(pin) <= 600118
+        locality = paired_locality(client, pin, "Post") if in_range else "Range Reject Nagar"
     payload = {
         "title": title,
         "transaction_type": "RENT",
         "property_type": "APARTMENT",
         "price_rupees": 25000,
         "price_period": "MONTHLY",
-        "locality": "Oldwashermenpet",
+        "locality": locality,
         "city": "Chennai",
-        "pincode": "600021",
+        "pincode": pin,
     }
     payload.update(overrides)
     return client.post("/owner/listings", json=payload, headers=auth_header(token))
