@@ -1,3 +1,4 @@
+from __future__ import annotations
 """RESTAMP Phase 4 — user/role/admin routes plus minimal authorization-proof endpoints.
 
 Role-scoped demo endpoints (buyer/welcome, owner/*, broker/scope) exist ONLY to

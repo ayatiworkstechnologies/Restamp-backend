@@ -1,3 +1,4 @@
+from __future__ import annotations
 """RESTAMP Phase 4 — authentication routes (phone OTP + Google + self profile).
 
 Phone (registration-capable): unknown phone identities create a user on first

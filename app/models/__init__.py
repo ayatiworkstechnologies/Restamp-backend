@@ -1,3 +1,4 @@
+from __future__ import annotations
 # RESTAMP Phase 1 — SQLAlchemy DB Models (approved architecture only)
 # Design-only upstream: RESTAMP_DATABASE_ARCHITECTURE_V2.4.2_FINAL.md
 # No APIs, auth flows, payments, business services, AI, chat, site visits,

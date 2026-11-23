@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Enum, JSON, text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.sql import func

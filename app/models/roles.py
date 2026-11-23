@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import declarative_base
