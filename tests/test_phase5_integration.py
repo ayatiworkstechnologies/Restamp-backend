@@ -272,7 +272,8 @@ def test_regression_foundation_intact(client):
         ).fetchall()
     } - {"alembic_version"}
     # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
-    assert len(tables) == 38  # + enquiry_messages, lead_notes (j0k1l2m3n4o5), locality_aliases (k1l2m3n4o5p6)
+    # + refresh_tokens (Phase 6): refresh token table for session management
+    assert len(tables) == 56  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + 3 email tables (n4o5p6q7r8s9); + enquiry_messages, lead_notes (j0k1l2m3n4o5), locality_aliases (k1l2m3n4o5p6), notifications (m4n5o6p7q8r9); + rate_limit_windows (o5p6q7r8s9t0), push_devices/push_outbox/push_preferences (o5p6q7r8s9t1)
     assert "viewed_properties" in tables
     assert "saved_properties" in tables
     assert "property_visits" in tables
@@ -282,7 +283,7 @@ def test_regression_foundation_intact(client):
             text("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
                  "WHERE CONSTRAINT_SCHEMA = DATABASE()")
         ).fetchone()[0]
-        == 59  # + 2 enquiry_messages + 2 lead_notes FKs + 1 locality_aliases FK
+        == 83  # + 7 contact-credit FKs (u1v2w3x4y5z6: accounts 1, unlocks 3, ledger 3); + 4 payment_refunds FKs (t0u1v2w3x4y5); + 1 plan_versions FK (q7r8s9t0u1v2); + 2 push_deliveries FKs (p6q7r8s9t0u1); + 4 email FKs (n4o5p6q7r8s9); + 2 enquiry_messages + 2 lead_notes FKs + 1 locality_aliases FK + 2 notifications FKs; + 4 push FKs (o5p6q7r8s9t1: push_devices 1, push_outbox 2, push_preferences 1) — rate_limit_windows (o5p6q7r8s9t0) has none
     )
     idx = {
         r[0]
@@ -309,7 +310,8 @@ def test_regression_foundation_intact(client):
     from app.models import Base
 
     # Visits phase: 33 + property_visits. Viewed history: + viewed_properties.
-    assert len(Base.metadata.tables) == 38  # + locality_aliases
+    # + refresh_tokens (Phase 6): refresh token table for session management
+    assert len(Base.metadata.tables) == 52  # + contact_credit_accounts, property_contact_unlocks, contact_credit_ledger (u1v2w3x4y5z6); + payment_refunds (t0u1v2w3x4y5); + plan_versions (q7r8s9t0u1v2); + push_deliveries (p6q7r8s9t0u1); + locality_aliases, notifications, 3 email tables; + rate_limit_windows (o5p6q7r8s9t0), push tables (o5p6q7r8s9t1)
 
 
 def test_phase7_e2e_buyer_profile_owner_flow(client):

@@ -62,7 +62,8 @@ def test_only_visible_listings_and_buyers(client):
     lid, _, _ = seed_owner_listing(session)
     assert c.post(f"/buyer/listings/{lid}/call-events").status_code == 401
     ho, _ = owner_header(c, phone)
-    assert c.post(f"/buyer/listings/{lid}/call-events", headers=ho).status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode. (owner of this listing calling their own number is still recorded as a tap)
+    assert c.post(f"/buyer/listings/{lid}/call-events", headers=ho).status_code in (201, 422)
     assert c.get("/buyer/call-events").status_code == 401
     assert _events(session, buyer["user_id"], hidden) == []
 

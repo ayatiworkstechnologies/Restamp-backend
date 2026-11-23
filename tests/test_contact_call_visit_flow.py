@@ -71,8 +71,8 @@ def test_reveal_names_the_owner_of_that_listing_not_the_caller(client):
     h, _ = _buyer(c, name=f"Caller {run}")
     r1 = c.post(f"/buyer/listings/{l1}/contact", headers=h).json()
     r2 = c.post(f"/buyer/listings/{l2}/contact", headers=h).json()
-    assert r1 == {"phone": p1, "owner_name": f"Lakshmi {run}", "own_listing": False}
-    assert r2 == {"phone": p2, "owner_name": f"Arjun {run}", "own_listing": False}
+    assert {k: r1[k] for k in ("phone", "owner_name", "own_listing")} == {"phone": p1, "owner_name": f"Lakshmi {run}", "own_listing": False}
+    assert {k: r2[k] for k in ("phone", "owner_name", "own_listing")} == {"phone": p2, "owner_name": f"Arjun {run}", "own_listing": False}
     # The public detail names the same owner.
     assert c.get(f"/buyer/listings/{l1}").json()["owner_name"] == f"Lakshmi {run}"
 
@@ -90,7 +90,9 @@ def test_own_listing_is_flagged_and_lead_contact_shape_is_unchanged(client):
     lid, _, phone = _listing(session, "Self Owner")
     h = _owner_in_buyer_mode(c, phone)
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
-    assert r.status_code == 200 and r.json() == {"phone": phone, "owner_name": "Self Owner", "own_listing": True}
+    _b = r.json()  # Phase 3 adds unlock_status (OWN_LISTING: nothing consumed)
+    assert r.status_code == 200 and {k: _b[k] for k in ("phone", "owner_name", "own_listing")} == {"phone": phone, "owner_name": "Self Owner", "own_listing": True}
+    assert _b["unlock_status"] == "OWN_LISTING" and _b["credit_balance"] is None
     # Owner -> buyer lead contact keeps its phone-only response.
     hb, _ = _buyer(c)
     lead = c.post("/buyer/enquiries", json={"property_listing_id": lid, "message": "hi"}, headers=hb).json()
@@ -105,7 +107,8 @@ def test_contact_needs_an_authorized_buyer_or_agent(client):
     _n["i"] += 1
     ho = auth_header(register_phone(c, f"+916774{_n['i']:06d}")["access_token"])
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=ho).status_code == 200
-    assert c.post(f"/buyer/listings/{lid}/contact", headers=ho).status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode.
+    assert c.post(f"/buyer/listings/{lid}/contact", headers=ho).status_code == 200
     # Public listing responses never carry the owner's number.
     assert "phone" not in json.dumps(c.get(f"/buyer/listings/{lid}").json()).lower().replace("owner_name", "")
 
@@ -166,7 +169,7 @@ def test_buyer_visit_is_saved_listed_and_reaches_the_owner_as_buyer(client):
     assert r.status_code == 201, r.text
     v = r.json()
     assert (v["property_listing_id"], v["buyer_user_id"], v["owner_user_id"]) == (lid, buyer_id, owner_id)
-    assert v["status"] == "REQUESTED" and v["requester_role"] == "BUYER" and v["owner_display_name"] == "Visit Owner"
+    assert v["status"] == "PENDING" and v["requester_role"] == "BUYER" and v["owner_display_name"] == "Visit Owner"
     mine = c.get("/buyer/visits", headers=h).json()
     assert [i["id"] for i in mine["items"]] == [v["id"]]  # Activity -> Visits
     ho, _ = owner_header(c, owner_phone)
@@ -214,7 +217,8 @@ def test_visit_authorization_is_unchanged(client):
     ho = auth_header(register_phone(c, f"+916774{_n['i']:06d}")["access_token"])
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=ho).status_code == 200
     r = c.post("/buyer/visits", json={"property_listing_id": lid, "scheduled_at": FUTURE}, headers=ho)
-    assert r.status_code == 403
+    # Phase 1 (approved): buyer capability exists in every mode.
+    assert r.status_code == 201, r.text
     # An agent outside its area is still refused (agent upgrade), nothing written.
     other, _, _ = _listing(session, "Other Area Owner")
     ha, agent_id = _agent_for(c, session, other)

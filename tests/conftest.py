@@ -12,6 +12,30 @@ os.environ["RESTAMP_ENV"] = "local"
 os.environ["RESTAMP_JWT_SECRET"] = "phase4-test-secret"
 os.environ["RESTAMP_GOOGLE_DEV_MODE"] = "1"
 os.environ["RESTAMP_DISABLE_AUTO_VERIFY"] = "1"
+# Phase 3: tests drive the email outbox explicitly (email_svc.process_outbox);
+# the background loop must not race them.
+os.environ["RESTAMP_DISABLE_EMAIL_WORKER"] = "1"
+# Phase 4: the push outbox and the reminder scans are driven explicitly by the
+# tests (push_svc.process_outbox / reminders.run_scan); the background loops
+# must not race them.
+os.environ["RESTAMP_DISABLE_PUSH_WORKER"] = "1"
+os.environ["RESTAMP_DISABLE_REMINDER_WORKER"] = "1"
+# Reva AI endpoints are rate limited against the SHARED rate_limit_windows
+# table: the whole suite shares one client IP, so per-minute windows would
+# make unrelated tests flaky. Disabled here; the dedicated rate-limit tests
+# patch settings directly (services.rate_limit reads limits at call time).
+os.environ["RESTAMP_CHAT_RPM_PER_IP"] = "0"
+os.environ["RESTAMP_CHAT_RPM_PER_USER"] = "0"
+os.environ["RESTAMP_CHAT_RPH_PER_IP"] = "0"
+os.environ["RESTAMP_CHAT_RPH_PER_USER"] = "0"
+os.environ["RESTAMP_TRANSCRIBE_PER_HOUR_PER_IP"] = "0"
+# M8 communication limits: same reason (one shared client IP). Disabled for the
+# general suite (production ignores the switch); test_rate_limit_m8.py re-enables
+# them per test. A stable
+# non-production HMAC key so production-config tests pass the M8 startup check.
+os.environ["RESTAMP_COMM_RATE_LIMITS_DISABLED"] = "1"
+os.environ["RESTAMP_DISABLE_RATE_LIMIT_CLEANUP"] = "1"
+os.environ.setdefault("RESTAMP_RATE_LIMIT_KEY", "m8-test-rate-limit-key-0123456789abcdefghij")
 # Development-only approved photo-URL prefix used by test fixtures (ignored in
 # production; see app/services/media_urls.py). Every other host is rejected.
 os.environ["RESTAMP_DEV_MEDIA_URL_PREFIXES"] = "https://t.test/"
@@ -314,3 +338,97 @@ def make_postcode(session, tag: str = "", pincode: str | None = None) -> int:
     )
     session.flush()
     return session.execute(_text("SELECT LAST_INSERT_ID()")).fetchone()[0]
+
+
+# --- Paid-entitlement fixtures (Phase 2) ---------------------------------------
+# Restricted listing operations need a current, paid, non-trial Owner/Dealer
+# plan (app/services/capabilities.ensure_can_post) and verification is
+# admin-only. Tests that need a poster or a VERIFIED listing as SETUP get them
+# through the REAL production paths below — there is no bypass of either rule
+# anywhere in the test suite.
+
+_fixture_admin_seq = {"n": 0}
+
+
+def grant_test_posting_plan(c, headers, role: str = "OWNER") -> int:
+    """Give the account behind `headers` a real ACTIVE paid poster plan.
+
+    Uses the same service path as an admin assignment
+    (subscriptions._activate: provider ADMIN, claims the poster type, ends
+    any current plan of the role, history kept). The plan row is a hidden
+    (visible=False), unlimited, 365-day fixture plan inside the test's
+    rolled-back transaction. Returns the user id.
+    """
+    user_id = c.get("/auth/me", headers=headers).json()["id"]
+    grant_posting_plan_for_user(c.test_session, user_id, role)
+    return user_id
+
+
+def grant_posting_plan_for_user(session, user_id: int, role: str = "OWNER") -> None:
+    """Session-level form of grant_test_posting_plan (same real service path)."""
+    from app.models import Plan
+    from app.services import subscriptions as sub_svc
+
+    code = f"TEST_FIXTURE_{role}_PLAN"
+    plan = session.query(Plan).filter(Plan.code == code).first()
+    if plan is None:
+        plan = Plan(code=code, name=f"Test fixture {role} plan", role=role, price_paise=0,
+                    duration_days=365, status="ACTIVE", visible=False, version=1)
+        session.add(plan)
+        session.flush()
+    sub_svc._activate(session, user_id, plan, sub_svc.ADMIN_PROVIDER, "ADMIN", 0, None,
+                      "Replaced by test fixture plan")
+    session.flush()
+
+
+def fixture_admin_headers(c) -> dict:
+    """Headers of a SUPER_ADMIN created once per test (real admin_accounts row)."""
+    cached = getattr(c, "_fixture_admin_headers", None)
+    if cached is not None:
+        return cached
+    _fixture_admin_seq["n"] += 1
+    tok = register_phone(c, f"+916889{os.getpid() % 1000:03d}{_fixture_admin_seq['n']:03d}")
+    c.test_session.execute(
+        text("INSERT INTO admin_accounts (user_id, admin_role) VALUES (:u, 'SUPER_ADMIN')"),
+        {"u": tok["user_id"]},
+    )
+    c.test_session.flush()
+    c._fixture_admin_headers = auth_header(tok["access_token"])
+    return c._fixture_admin_headers
+
+
+class _AdminVerifyResult:
+    """The admin verify response, with the nested `listing` fields also at the
+    top level so lifecycle tests can keep reading verification_status etc."""
+
+    def __init__(self, resp):
+        self.status_code, self.text, self._resp = resp.status_code, resp.text, resp
+
+    def json(self):
+        body = self._resp.json()
+        if isinstance(body, dict) and isinstance(body.get("listing"), dict):
+            return {**body["listing"], **body}
+        return body
+
+
+def admin_verify(c, listing_id):
+    """Verify a listing the only allowed way: POST /admin/listings/{id}/verify
+    (audited, notifies the owner)."""
+    return _AdminVerifyResult(
+        c.post(f"/admin/listings/{listing_id}/verify", headers=fixture_admin_headers(c))
+    )
+
+
+def seed_verified(c, listing_id) -> None:
+    """SETUP ONLY: put a PENDING listing into VERIFIED state through the
+    verification service (verifications audit row written), like tests that
+    seed VERIFIED rows directly. No HTTP route, no notification. Tests about
+    who may verify use admin_verify / the routes instead."""
+    from app.models import PropertyListing
+    from app.services import owner_listings as owner_svc
+
+    session = c.test_session
+    owner_id = session.get(PropertyListing, listing_id).user_id
+    owner_svc.transition_verification(session, owner_id, listing_id, "VERIFIED")
+    session.flush()
+

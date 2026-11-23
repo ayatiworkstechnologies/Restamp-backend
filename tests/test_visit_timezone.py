@@ -3,7 +3,7 @@
 property_visits.scheduled_at is a timezone-naive DATETIME holding UTC. The
 service normalizes timezone-aware inputs to UTC, treats naive inputs as
 UTC, validates "in the future" against UTC now, and the API returns the
-stored naive UTC value (no suffix) — which clients must read as UTC.
+stored UTC instant with an explicit "Z" (both apps already accept it).
 
 These tests pin that contract for buyer creation, owner proposals and both
 reschedule paths: the persisted row and the API response describe the same
@@ -20,6 +20,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # 30 Dec 2030, 4:30 PM in Chennai == 11:00 UTC.
 CHENNAI_430PM = "2030-12-30T16:30:00+05:30"
 UTC_11AM = "2030-12-30T11:00:00"
+UTC_11AM_OUT = UTC_11AM + "Z"  # explicit UTC on the wire
 
 
 def _stored(session, visit_id):
@@ -51,7 +52,7 @@ def test_offset_input_is_stored_and_returned_as_the_same_utc_instant(client):
     assert r.status_code == 201, r.text
     body = r.json()
     assert _stored(session, body["id"]) == datetime(2030, 12, 30, 11, 0, 0)
-    assert body["scheduled_at"] == UTC_11AM  # naive UTC on the wire
+    assert body["scheduled_at"] == UTC_11AM_OUT
     assert _as_utc_instant(body["scheduled_at"]) == datetime.fromisoformat(CHENNAI_430PM)
 
 
@@ -60,7 +61,7 @@ def test_z_input_is_not_shifted(client):
     r, _, _, _ = _buyer_visit(c, session, "2030-12-30T11:00:00Z")
     assert r.status_code == 201, r.text
     assert _stored(session, r.json()["id"]) == datetime(2030, 12, 30, 11, 0, 0)
-    assert r.json()["scheduled_at"] == UTC_11AM
+    assert r.json()["scheduled_at"] == UTC_11AM_OUT
 
 
 def test_naive_input_is_treated_as_utc(client):
@@ -74,7 +75,7 @@ def test_get_returns_the_same_instant_as_create(client):
     c, session = client
     r, _, buyer, _ = _buyer_visit(c, session, CHENNAI_430PM)
     got = c.get(f"/buyer/visits/{r.json()['id']}", headers=auth_header(buyer["access_token"]))
-    assert got.status_code == 200 and got.json()["scheduled_at"] == UTC_11AM
+    assert got.status_code == 200 and got.json()["scheduled_at"] == UTC_11AM_OUT
 
 
 def test_past_instant_is_rejected_whatever_its_offset(client):
@@ -99,27 +100,24 @@ def test_near_future_offset_instant_is_accepted(client):
     assert _stored(session, r.json()["id"]) == expected
 
 
-def test_reschedules_and_owner_proposals_normalize_to_utc(client):
+def test_time_edits_are_refused_and_never_shift_the_stored_instant(client):
+    """Strict Phase 5: no reschedules. An offset time sent as an edit is
+    refused and the stored UTC instant is untouched (on PENDING and on
+    CONFIRMED visits alike)."""
     c, session = client
     r, lid, buyer, phone = _buyer_visit(c, session, CHENNAI_430PM)
     vid = r.json()["id"]
     hb = auth_header(buyer["access_token"])
-
-    # Buyer reschedule with an offset.
     r = c.patch(f"/buyer/visits/{vid}", json={"scheduled_at": "2030-12-31T09:15:00+05:30"}, headers=hb)
-    assert r.status_code == 200, r.text
-    assert _stored(session, vid) == datetime(2030, 12, 31, 3, 45, 0)
-    assert r.json()["scheduled_at"] == "2030-12-31T03:45:00"
-
-    # Owner reschedule of the same visit (owners may edit times once it is
-    # CONFIRMED — existing state-machine rule, unchanged).
+    assert r.status_code == 422, r.text
+    assert _stored(session, vid) == datetime(2030, 12, 30, 11, 0, 0)
     ho, _ = owner_header(c, phone)
     assert c.patch(f"/owner/visits/{vid}", json={"status": "CONFIRMED"}, headers=ho).status_code == 200
     r = c.patch(f"/owner/visits/{vid}", json={"scheduled_at": "2031-01-02T18:00:00+05:30"}, headers=ho)
-    assert r.status_code == 200, r.text
-    assert _stored(session, vid) == datetime(2031, 1, 2, 12, 30, 0)
+    assert r.status_code == 422, r.text
+    assert _stored(session, vid) == datetime(2030, 12, 30, 11, 0, 0)
     owner_view = c.get(f"/owner/visits/{vid}", headers=ho).json()
-    assert _as_utc_instant(owner_view["scheduled_at"]) == datetime.fromisoformat("2031-01-02T18:00:00+05:30")
+    assert _as_utc_instant(owner_view["scheduled_at"]) == datetime.fromisoformat(CHENNAI_430PM)
 
 
 def test_owner_proposal_normalizes_to_utc_and_rejects_past(client):
@@ -136,4 +134,4 @@ def test_owner_proposal_normalizes_to_utc_and_rejects_past(client):
     r = c.post("/owner/visits", json={**payload, "scheduled_at": CHENNAI_430PM}, headers=ho)
     assert r.status_code == 201, r.text
     assert _stored(session, r.json()["id"]) == datetime(2030, 12, 30, 11, 0, 0)
-    assert r.json()["scheduled_at"] == UTC_11AM
+    assert r.json()["scheduled_at"] == UTC_11AM_OUT

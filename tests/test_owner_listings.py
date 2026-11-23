@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, fresh_pincode, make_postcode, register_phone
+from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, fresh_pincode, make_postcode, register_phone
 
 
 def _setup_owner(client) -> tuple[dict, str]:
@@ -27,6 +27,7 @@ def _setup_owner(client) -> tuple[dict, str]:
         headers=auth_header(token),
     )
     assert r.status_code == 200, r.text
+    grant_test_posting_plan(client, auth_header(token))
     # Re-verify profile or use token (role is evaluated from DB / token)
     return token_out, token
 
@@ -126,11 +127,13 @@ def test_owner_cannot_access_other_owner_listing(client):
     token_out_a = register_phone(c, "+919876543212")
     token_a = token_out_a["access_token"]
     c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token_a))
+    grant_test_posting_plan(c, auth_header(token_a))
 
     # Setup Owner B
     token_out_b = register_phone(c, "+919876543213")
     token_b = token_out_b["access_token"]
     c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token_b))
+    grant_test_posting_plan(c, auth_header(token_b))
 
     # Owner A creates listing
     r = c.post(
@@ -162,6 +165,7 @@ def _setup_owner_with_phone(client, phone: str) -> str:
     token_out = register_phone(client, phone)
     token = token_out["access_token"]
     r = client.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(client, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 
@@ -245,7 +249,7 @@ def test_listing_auto_verifies_after_two_minutes_and_persists(client):
     assert found[0]["verification_status"] == "PENDING"
 
     # ... explicit verify transitions PENDING -> VERIFIED + AVAILABLE ...
-    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    r = admin_verify(c, listing_id)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     assert r.json()["listing_status"] == "AVAILABLE"
@@ -256,7 +260,7 @@ def test_listing_auto_verifies_after_two_minutes_and_persists(client):
     assert lstat == "AVAILABLE"
 
     # ... and idempotent: repeats keep it VERIFIED without changes.
-    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    r = admin_verify(c, listing_id)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     vstat, _, _ = _db_status(session, listing_id)
@@ -280,7 +284,7 @@ def test_listing_detail_fetch_also_auto_verifies(client):
     assert r.json()["verification_status"] == "PENDING"
 
     # ... explicit verify flips and persists.
-    r = c.post(f"/owner/listings/{listing_id}/verify", headers=auth_header(token))
+    r = admin_verify(c, listing_id)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     vstat, _, _ = _db_status(session, listing_id)
@@ -714,9 +718,15 @@ def test_chennai_pincode_range_boundaries(client):
     # Boundaries + interior (incl. 600089 Ramapuram) accepted. Each pin gets
     # a unique locality: the resolver falls back to locality match before
     # creating, so shared localities would read back a different pincode.
-    for idx, pin in enumerate(["600001", "600089", "600118", "600040"]):
+    pin_localities = [
+        ("600001", "Parry's Corner"),
+        ("600089", "Ramapuram"),
+        ("600118", "Range Nagar R2"),
+        ("600040", "Anna Nagar"),
+    ]
+    for idx, (pin, loc) in enumerate(pin_localities):
         r = _post_listing(c, token, f"Range Flat {idx}", pincode=pin,
-                          locality=f"Range Nagar R{idx}")
+                          locality=loc)
         assert r.status_code == 201, (pin, r.status_code, r.text)
         assert r.json()["pincode"] == pin
     # Out-of-range six-digit pincodes rejected (schema-level, unbypassable
@@ -728,12 +738,12 @@ def test_chennai_pincode_range_boundaries(client):
     for idx, pin in enumerate(["600000", "600119", "600120", "600125", "600500", "560038"]):
         r = _post_listing(c, token, f"Range Reject {idx}", pincode=pin)
         assert r.status_code == 422, (pin, r.status_code, r.text)
-    # PATCH enforces the same rule on the same listing. 600089 now belongs
-    # to "Range Nagar R1" (created above), so it is paired with that locality.
+    # PATCH enforces the same rule on the same listing. 600089 belongs
+    # to "Ramapuram", so it is paired with that locality.
     lid = _post_listing(c, token, "Range Patch Flat",
-                        locality="Range Patch Nagar").json()["listing_id"]
+                        locality="Oldwashermenpet", pincode="600021").json()["listing_id"]
     r = c.patch(f"/owner/listings/{lid}",
-                json={"locality": "Range Nagar R1", "pincode": "600089"},
+                json={"locality": "Ramapuram", "pincode": "600089"},
                 headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["pincode"] == "600089"

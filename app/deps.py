@@ -18,7 +18,7 @@ from .security import (
     get_session_amr,
     is_fixed_otp_session,
 )
-from .services import admin_rbac, users_roles
+from .services import admin_rbac, capabilities, users_roles
 
 
 def require_role(*allowed: str, detail: str | None = None):
@@ -28,49 +28,46 @@ def require_role(*allowed: str, detail: str | None = None):
         role = users_roles.get_current_role(db, user_id)
         if role not in allowed:
             # Actionable detail (caller's own state only, no data leak):
-            # e.g. "BUYER role required" tells a 403 recipient exactly why
-            # their valid token was refused (owner/agent-mode account trying
-            # a buyer action) instead of a bare "Forbidden".
+            # e.g. "OWNER role required" tells a 403 recipient exactly why
+            # their valid token was refused instead of a bare "Forbidden".
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=detail or f"{'/'.join(allowed)} role required",
             )
+        if role in capabilities.POSTER_TYPES:
+            # Fail closed on Owner/Dealer exclusivity: a poster mode is usable
+            # only when the account's poster type is unset or the same type
+            # (mode switches already refuse this; legacy rows are re-checked).
+            poster_type = capabilities.get_poster_type(db, user_id)
+            if poster_type is not None and poster_type != role:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=detail or f"{'/'.join(allowed)} role required",
+                )
         return user_id
 
     return _check
 
 
-def _role_or_dealer(*allowed: str, detail: str | None = None):
-    """Like require_role, but an OWNER-mode account holding Dealer area
-    access also passes: dealers post as OWNER and use agent area features
-    (owner properties in their chosen areas, owner numbers) without
-    switching roles."""
-    def _check(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
-        ensure_active_user(db, user_id)
-        role = users_roles.get_current_role(db, user_id)
-        if role in allowed:
-            return user_id
-        if role == "OWNER":
-            from .services import agent_plans as agent_plan_svc
-
-            if agent_plan_svc.has_dealer_access(db, user_id):
-                return user_id
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=detail or f"{'/'.join(allowed)} role required",
-        )
-
-    return _check
+def require_buyer(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
+    """Buyer capability: EVERY active account has it, in every app mode
+    (BUYER, OWNER or BROKER). The mode never removes buyer features."""
+    ensure_active_user(db, user_id)
+    return user_id
 
 
-require_buyer = require_role("BUYER")
 # Buyer activity (wishlist, enquiries, visits, viewed, call taps, owner
-# contact) is shared by buyers and agents (BROKER): an agent connects with
-# owners exactly like a buyer, on their own account. The 403 text stays
-# "BUYER role required" so an OWNER-mode account still knows what to switch to.
-require_buyer_or_agent = _role_or_dealer("BUYER", "BROKER", detail="BUYER role required")
+# contact) is a capability of every account; agents (BROKER mode) keep their
+# area gate inside the endpoints. Kept as a separate name for compatibility.
+require_buyer_or_agent = require_buyer
 require_owner = require_role("OWNER")
-require_broker = _role_or_dealer("BROKER")
+require_broker = require_role("BROKER")
+# Listing management (/owner/*) for both poster types: Owner mode or Dealer
+# (BROKER) mode, with the Owner/Dealer exclusivity check of require_role.
+# Ownership stays the per-object user_id check in the services; restricted
+# (paid) operations additionally call capabilities.ensure_can_post. The 403
+# text is unchanged for existing clients.
+require_poster = require_role("OWNER", "BROKER", detail="OWNER role required")
 
 
 def _refuse_fixed_otp_session(amr: str | None) -> None:
@@ -149,5 +146,6 @@ __all__ = [
     "require_buyer",
     "require_owner",
     "require_owner_of_physical_property",
+    "require_poster",
     "require_role",
 ]

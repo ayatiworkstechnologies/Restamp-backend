@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -15,12 +15,14 @@ from ..services import listings as listing_svc
 from ..services import call_events as call_svc
 from ..services import buyer_plans as plan_svc
 from ..services import contact as contact_svc
+from ..services import contact_credits as credit_svc
 from ..services import enquiries as enquiry_svc
 from ..services import saved as saved_svc
 from ..services import visits as visit_svc
 from ..services import viewed as viewed_svc
 from ..services import users_roles
 from ..services import agent_plans as agent_plan_svc
+from ..services import rate_limit as rl_svc
 
 router = APIRouter(prefix="/buyer", tags=["buyer"])
 
@@ -28,14 +30,15 @@ router = APIRouter(prefix="/buyer", tags=["buyer"])
 def _agent_area_gate(db: Session, user_id: int, listing_id: int) -> str | None:
     """Agents (BROKER) may act only on listings inside their plan's areas
     (free trial: one area) -> 402 AGENT_AREA_NOT_IN_PLAN otherwise. Buyers
-    are never area-restricted. Returns the caller's current role."""
+    are never area-restricted. Returns the BUYER-ACTIVITY role recorded on
+    leads/visits/call taps: "BROKER" in agent mode, otherwise "BUYER" — an
+    account in OWNER mode acting as a buyer is recorded as a buyer, never as
+    "OWNER" (buyer capability is mode-independent)."""
     role = users_roles.get_current_role(db, user_id)
-    if role == "OWNER" and agent_plan_svc.has_dealer_access(db, user_id):
-        # Dealers act like agents here (area-limited, no buyer quota).
-        role = "BROKER"
     if role == "BROKER":
         agent_plan_svc.ensure_listing_in_plan(db, user_id, listing_id)
-    return role
+        return "BROKER"
+    return "BUYER"
 
 Deal = Literal["BUY", "RESALE", "RENT", "LEASE"]
 PropType = Literal["APARTMENT", "VILLA", "HOUSE", "COMMERCIAL", "PLOT", "AGRICULTURAL_LAND"]
@@ -114,10 +117,14 @@ def get_similar(
 
 @router.post("/listings/{listing_id}/contact", response_model=schemas.ListingContactRevealOut)
 def reveal_listing_contact(
+    request: Request,
     listing_id: int,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
 ):
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "listing_contact", buyer_id, request)
     # Buyer-plan lead quota: a NEW property beyond the plan's limit is
     # refused with 402 BUYER_PLAN_REQUIRED before anything is revealed.
     # The 402 carries only the last 4 digits of the owner's number (teaser);
@@ -130,11 +137,19 @@ def reveal_listing_contact(
     if owner_id == buyer_id:
         # Owner (switched to buyer mode) viewing their OWN listing: it's their
         # own number — no lead, no audit, no quota (create_enquiry would 422).
-        return schemas.ListingContactRevealOut(phone=owner_phone, owner_name=owner_name, own_listing=True)
-    if role != "BROKER":
-        # Buyers: 3 free owner numbers, then a buyer plan. Agents have no
-        # reveal limit; their limit is the areas in their plan (gate above).
-        plan_svc.ensure_can_reveal(db, buyer_id, listing_id, phone_last4=owner_phone[-4:])
+        return schemas.ListingContactRevealOut(phone=owner_phone, owner_name=owner_name, own_listing=True,
+                                               unlock_status="OWN_LISTING")
+    if role == "BROKER":
+        # Dealer (agent mode) inside its purchased areas (gate above): the
+        # SEPARATE Dealer locality entitlement. No buyer unlock is created and
+        # no free unlock or credit is consumed.
+        entitlement = {"unlock_status": "DEALER_AREA"}
+    else:
+        # Buyer capability (any other mode): permanent per-property unlock —
+        # already unlocked (free of charge) -> active legacy plan -> one of the
+        # 3 lifetime free unlocks -> one purchased credit; else 402 with
+        # nothing revealed or written (services/contact_credits).
+        entitlement = credit_svc.unlock(db, buyer_id, listing_id, phone_last4=owner_phone[-4:])
     phone, _audit = contact_svc.reveal_contact(db, buyer_id, listing_id)
     # P3 leads MVP: a successful reveal guarantees exactly one ACTIVE lead
     # (NEW enquiry) for this buyer+listing. Reuses the existing row on
@@ -143,7 +158,56 @@ def reveal_listing_contact(
     # The lead keeps the revealer's role, so an agent's reveal is an Agent lead.
     enquiry_svc.create_enquiry(db, buyer_id, listing_id, None, source_role=role or "BUYER")
     db.commit()
-    return schemas.ListingContactRevealOut(phone=phone, owner_name=owner_name)
+    return schemas.ListingContactRevealOut(
+        phone=phone, owner_name=owner_name, unlock_status=entitlement["unlock_status"],
+        free_unlocks_remaining=entitlement.get("free_unlocks_remaining"),
+        credit_balance=entitlement.get("credit_balance"),
+    )
+
+
+@router.get("/contact-credits", response_model=schemas.ContactEntitlementOut)
+def get_contact_entitlement(db: Session = Depends(get_db), user_id: int = Depends(require_buyer)):
+    """The caller's buyer contact entitlement (same on every device and in
+    every app mode): lifetime free unlocks, purchased credit balance, number
+    of permanently unlocked properties, any legacy buyer plan, pack info."""
+    return credit_svc.summary(db, user_id)
+
+
+@router.get("/contact-credits/history", response_model=schemas.ContactLedgerResponse)
+def get_contact_credit_history(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(require_buyer),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """The caller's own ledger (purchases and unlocks), newest first."""
+    items, total = credit_svc.list_ledger(db, user_id, page, page_size)
+    return schemas.ContactLedgerResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/unlocks", response_model=schemas.ContactUnlocksResponse)
+def list_contact_unlocks(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(require_buyer),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    """Properties the caller has permanently unlocked, newest first."""
+    rows, total = credit_svc.list_unlocks(db, user_id, page, page_size)
+    items = [{"listing_id": r["listing_id"], "unlocked": True, "source": r["source"],
+              "unlocked_at": r["unlocked_at"]} for r in rows]
+    return schemas.ContactUnlocksResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/unlocks/{listing_id}", response_model=schemas.ContactUnlockOut)
+def get_contact_unlock(listing_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_buyer)):
+    """Whether the caller has unlocked this property (never returns a phone;
+    the number comes only from POST /buyer/listings/{id}/contact)."""
+    row = credit_svc.get_unlock(db, user_id, listing_id)
+    if row is None:
+        return schemas.ContactUnlockOut(listing_id=listing_id, unlocked=False)
+    return schemas.ContactUnlockOut(listing_id=listing_id, unlocked=True, source=row.source,
+                                    unlocked_at=row.unlocked_at)
 
 
 @router.get("/plans")
@@ -167,7 +231,8 @@ def subscribe_buyer_plan(
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer),
 ):
-    """Activate a paid buyer plan. PAYMENT IS SIMULATED — no money is charged."""
+    """Activate a paid buyer plan. PAYMENT IS SIMULATED — no money is charged.
+    Development environments only: 403 in production (pay via /payments)."""
     result = plan_svc.subscribe_simulated(db, buyer_id, code)
     db.commit()
     return result
@@ -175,10 +240,14 @@ def subscribe_buyer_plan(
 
 @router.post("/enquiries", response_model=schemas.EnquiryOut, status_code=201)
 def create_buyer_enquiry(
+    request: Request,
     body: schemas.EnquiryCreate,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
 ):
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "enquiry_create", buyer_id, request)
     if body.property_listing_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     # The sender's role (BUYER or BROKER) is recorded on a new lead so the
@@ -262,17 +331,22 @@ def unsave_buyer_listing(
 
 @router.post("/visits", response_model=schemas.VisitOut, status_code=201)
 def schedule_buyer_visit(
+    request: Request,
     body: schemas.VisitCreate,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
 ):
-    """Schedule a visit on a verified, available listing (lands REQUESTED).
+    """Schedule a visit on a verified, available listing (lands PENDING;
+    the owner/dealer is notified and alone confirms or rejects it).
 
     The scheduled time must be in the future. Returns 404 for invisible
     listings or diverged ownership, 422 for past times, self-visits, or
     when the owner has closed the buyer's lead on it ("Lead is closed" —
     a new enquiry opens a fresh lead).
     """
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "buyer_visit_create", buyer_id, request)
     if body.property_listing_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     role = _agent_area_gate(db, buyer_id, body.property_listing_id)
@@ -292,7 +366,7 @@ def schedule_buyer_visit(
 def list_buyer_visits(
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
-    status: Literal["REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = Query(default=None),
+    status: Literal["PENDING", "CONFIRMED", "REJECTED", "CANCELLED", "COMPLETED", "REQUESTED", "PROPOSED", "DECLINED"] | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
@@ -313,16 +387,19 @@ def get_buyer_visit(
 
 @router.patch("/visits/{visit_id}", response_model=schemas.VisitOut)
 def update_buyer_visit(
+    request: Request,
     visit_id: int,
     body: schemas.VisitUpdate,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
 ):
-    """Reschedule and/or confirm/decline/cancel own visit per the state
-    rules (buyers confirm/decline owner-proposed visits, reschedule
-    requested/confirmed times, cancel open visits). 404 when not owned,
-    422 for invalid moves, past times, or a visit whose lead the owner has
-    closed ("Lead is closed")."""
+    """Cancel own open visit (PENDING or CONFIRMED) — the only buyer move
+    under strict Phase 5. 404 when not owned, 422 for any other status, any
+    time/note edit, or a visit whose lead the owner has closed ("Lead is
+    closed")."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "buyer_visit_status", buyer_id, request)
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(

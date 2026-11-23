@@ -12,6 +12,9 @@ class User(Base):
     avatar_url = Column(String(500), nullable=True)
     email = Column(String(255), nullable=True)
     status = Column(Enum("active","suspended","closed"), nullable=False, server_default="active")
+    # Exclusive poster capability (NULL = Buyer only). Never set by a mode
+    # switch; see services/capabilities.py and migration r8s9t0u1v2w3.
+    poster_type = Column(Enum("OWNER","BROKER"), nullable=True)
     created_at = Column(DateTime, server_default=func.current_timestamp(), nullable=False)
     updated_at = Column(mysql.TIMESTAMP(), server_default=text('CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'), nullable=False)
     

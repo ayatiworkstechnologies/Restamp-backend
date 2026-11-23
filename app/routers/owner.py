@@ -22,31 +22,45 @@ No schema changes; all writes use existing property_listings / physical_properti
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy.orm import Session
 from typing import Literal
 
 from .. import schemas
 from ..config import settings
+from ..services.owner_listings import _get_owned_listing_for_update, owner_owns_listing
 from ..db import get_db
-from ..deps import require_owner
+from ..deps import require_poster
+from ..services import capabilities
+from ..services import subscriptions as sub_svc
 from ..services import owner_listings as owner_svc
 from ..services import enquiries as enquiry_svc
 from ..services import visits as visit_svc
+from ..services import rate_limit as rl_svc
 from ..services import photo_storage
 from ..services import storage as storage_svc
 from ..services.media_urls import MAX_LISTING_PHOTOS
 
 router = APIRouter(prefix="/owner", tags=["owner"])
+log = logging.getLogger("restamp.owner")
 
 
 @router.post("/listings", response_model=schemas.OwnerListingOut, status_code=201)
 def create_listing(
     body: schemas.OwnerListingCreate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Create a new property listing. Lands in PENDING / AVAILABLE state."""
+    # Restricted (paid) poster operation: needs the current paid Owner/Dealer
+    # plan of the account's poster type (402 POSTER_PLAN_REQUIRED otherwise).
+    capabilities.ensure_can_post(db, owner_id)
+    # Owner plan listing limit (402 OWNER_PLAN_LIMIT). The owner row is locked so two
+    # concurrent posts cannot both pass the check. Owners without a plan: unchanged.
+    sub_svc._lock_user(db, owner_id)
+    sub_svc.ensure_owner_can_create(db, owner_id)
     price_paise = body.price_rupees * 100
     try:
         listing = owner_svc.create_owner_listing(
@@ -115,7 +129,7 @@ def create_listing(
 @router.get("/listings", response_model=schemas.OwnerListingsResponse)
 def list_my_listings(
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
@@ -128,7 +142,7 @@ def list_my_listings(
 def get_my_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Get a single listing detail; returns 404 if not owned by caller."""
     card = owner_svc.get_owner_listing(db, owner_id, listing_id)
@@ -147,7 +161,7 @@ def get_my_listing(
 @router.get("/leads", response_model=schemas.OwnerLeadsResponse)
 def list_my_leads(
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
     property_listing_id: int | None = Query(default=None, ge=1),
     status: Literal["NEW", "CONTACTED", "CLOSED"] | None = Query(default=None),
     page: int = Query(default=1, ge=1),
@@ -172,7 +186,7 @@ def update_my_lead(
     lead_id: int,
     body: schemas.OwnerLeadUpdate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Persist an owner-side lead status change (P4).
 
@@ -207,7 +221,7 @@ def update_my_lead(
 def get_my_lead(
     lead_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """One of the caller's leads with the buyer's full message thread
     (CONTRACT §D). 404 when it is not the caller's. Pure read. Private notes
@@ -217,11 +231,12 @@ def get_my_lead(
 
 @router.post("/leads/{lead_id}/messages", response_model=schemas.EnquiryMessageOut, status_code=201)
 def reply_to_my_lead(
+    request: Request,
     lead_id: int,
     body: schemas.OwnerMessageIn,
     response: Response,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Reply to the buyer on the caller's open lead (two-way thread).
 
@@ -232,6 +247,9 @@ def reply_to_my_lead(
     the lead is not the caller's, 422 for a closed lead or an empty/over-long
     message, 429 when the per-thread message limit is reached. Private notes
     are never part of a thread."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "lead_message", owner_id, request)
     message, created = enquiry_svc.reply_as_owner(db, owner_id, lead_id, body.message)
     db.commit()
     if not created:
@@ -241,9 +259,10 @@ def reply_to_my_lead(
 
 @router.post("/leads/{lead_id}/contact", response_model=schemas.ContactRevealOut)
 def reveal_my_lead_contact(
+    request: Request,
     lead_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """The buyer's phone for one of the caller's own leads (Call / WhatsApp).
 
@@ -251,6 +270,9 @@ def reveal_my_lead_contact(
     404 "Not found" unless the lead and its listing are the caller's; 404
     "Contact not available" when the buyer has no phone on file. Lead list
     and detail responses stay phone-free."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "lead_contact", owner_id, request)
     phone = enquiry_svc.reveal_buyer_contact(db, owner_id, lead_id)
     db.commit()
     return schemas.ContactRevealOut(phone=phone)
@@ -260,7 +282,7 @@ def reveal_my_lead_contact(
 def list_my_lead_notes(
     lead_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Private notes on the caller's lead, oldest first (D4). 404 when the
     lead is not the caller's. Never exposed through any buyer endpoint."""
@@ -273,7 +295,7 @@ def add_my_lead_note(
     lead_id: int,
     body: schemas.LeadNoteIn,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Append a private note (1-2000 chars, trimmed) to the caller's lead.
     Append-only; allowed on closed leads. 404 when not the caller's."""
@@ -289,7 +311,7 @@ async def upload_listing_photo(
     file: UploadFile = File(...),
     category: str = Form("Living Room"),
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Upload one photo file for the caller's own listing (multipart/form-data).
 
@@ -298,6 +320,9 @@ async def upload_listing_photo(
     detail endpoint). First photo on a listing becomes cover (order_index 0);
     later uploads append without touching the existing cover.
     """
+    # Restricted (paid) poster operation: needs the current paid Owner/Dealer
+    # plan of the account's poster type (402 POSTER_PLAN_REQUIRED otherwise).
+    capabilities.ensure_can_post(db, owner_id)
     try:
         canonical_category = schemas.normalize_media_category(category)
     except ValueError as e:
@@ -323,27 +348,40 @@ async def upload_listing_photo(
     # Stream with a hard cap (MIME validated above; never trust the filename).
     chunks: list[bytes] = []
     total = 0
+    max_bytes = storage_svc.max_image_bytes()  # RESTAMP_PHOTO_MAX_BYTES
     while True:
-        chunk = await file.read(storage_svc.MAX_IMAGE_BYTES // 10 or 65536)
+        chunk = await file.read(max(max_bytes // 10, 65536))
         if not chunk:
             break
         total += len(chunk)
-        if total > storage_svc.MAX_IMAGE_BYTES:
+        if total > max_bytes:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                                detail="Image exceeds 10 MB")
+                                detail=storage_svc.size_exceeded_detail())
         chunks.append(chunk)
     data = b"".join(chunks)
     if not data:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Empty file")
 
+    # Real content check (magic bytes), whichever backend stores it: the
+    # declared MIME/extension alone never decide what we accept.
+    try:
+        storage_svc.validate_image_content(data, extension)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
     mime = file.content_type.split(";")[0].strip().lower()
-    is_local = not bool(settings.CLOUDINARY_CLOUD_NAME)
+    # RESTAMP_PHOTO_STORAGE selects the backend for NEW photos only; the
+    # stored public_id ("local:" or Cloudinary) later drives deletion.
+    is_local = storage_svc.uploads_use_local_storage()
     try:
         if is_local:
+            # Resolve the public base BEFORE writing so a misconfigured
+            # production process never leaves an orphan file behind. Never
+            # request.base_url in production (internal upstream behind Nginx).
+            base_url = storage_svc.public_base_url(str(request.base_url))
             storage_name, byte_size = storage_svc.save_listing_image(listing_id, data, extension)
-            base_url = str(request.base_url).rstrip("/")
             secure_url = f"{base_url}{settings.MEDIA_URL_PREFIX}/{storage_name}"
-            public_id = f"local:{storage_name}"
+            public_id = f"{storage_svc.LOCAL_PREFIX}{storage_name}"
         else:
             secure_url, public_id, byte_size = photo_storage.upload_listing_image(
                 listing_id, data, extension, mime
@@ -351,6 +389,7 @@ async def upload_listing_photo(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except OSError:
+        log.warning("listing photo storage failed")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Upload failed")
 
     try:
@@ -365,26 +404,17 @@ async def upload_listing_photo(
         db.commit()
         db.refresh(media)
     except HTTPException:
-        if is_local:
-            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
-        else:
-            photo_storage.delete_uploaded_image(public_id)
+        storage_svc.delete_photo(public_id)
         db.rollback()
         raise
     except ValueError as e:
         # Gallery cap reached by a concurrent upload: drop the orphan, 422.
-        if is_local:
-            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
-        else:
-            photo_storage.delete_uploaded_image(public_id)
+        storage_svc.delete_photo(public_id)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception:
         # DB failure after the upload landed: destroy the orphan, persist nothing.
-        if is_local:
-            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
-        else:
-            photo_storage.delete_uploaded_image(public_id)
+        storage_svc.delete_photo(public_id)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Upload failed")
 
@@ -404,7 +434,7 @@ def update_listing(
     listing_id: int,
     body: schemas.OwnerListingUpdate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Update the caller's own listing in place (partial PATCH).
 
@@ -415,6 +445,9 @@ def update_listing(
     validation failures (nothing committed). Never falls back to creating
     a listing.
     """
+    # Restricted (paid) poster operation: needs the current paid Owner/Dealer
+    # plan of the account's poster type (402 POSTER_PLAN_REQUIRED otherwise).
+    capabilities.ensure_can_post(db, owner_id)
     updates = body.model_dump(exclude_unset=True)
     if updates.get("rent_terms") is not None and "rent_terms" in updates:
         # Nested exclude_unset already applied recursively; normalize to a
@@ -440,14 +473,12 @@ def update_listing(
     except ValueError as e:
         sp.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-    # Best-effort Cloudinary cleanup for implicitly removed gallery rows:
-    # the DB commit already succeeded, so a storage failure must never fail
-    # the request — at worst an orphaned asset remains (documented).
+    # Best-effort storage cleanup for implicitly removed gallery rows, routed
+    # by each row's own public_id (local: -> disk, else Cloudinary). The DB
+    # commit already succeeded, so a storage failure must never fail the
+    # request — at worst an orphaned asset remains (documented).
     for public_id in removed_public_ids:
-        try:
-            photo_storage.delete_uploaded_image(public_id)
-        except Exception:
-            pass
+        storage_svc.delete_photo(public_id)
     card = owner_svc.get_owner_listing(db, owner_id, listing.id)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error")
@@ -510,13 +541,16 @@ def _run_status_transition(
 def submit_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Resubmit a REJECTED listing as PENDING for re-review (refreshes submitted_at).
 
     Idempotent when already PENDING. Returns 422 when VERIFIED (nothing to
     resubmit). Returns 404 when the listing does not belong to the caller.
     """
+    # Restricted (paid) poster operation: needs the current paid Owner/Dealer
+    # plan of the account's poster type (402 POSTER_PLAN_REQUIRED otherwise).
+    capabilities.ensure_can_post(db, owner_id)
     return _run_verification_transition(db, owner_id, listing_id, "PENDING")
 
 
@@ -524,16 +558,24 @@ def submit_listing(
 def verify_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
-    """Explicitly verify a PENDING listing (PENDING -> VERIFIED, audited).
+    """Self-verification is NOT allowed (Phase 2 security fix).
 
-    Idempotent when already VERIFIED. Returns 422 from REJECTED (submit
-    first) or other invalid states. Returns 404 when not owned by caller.
-    Owner-driven (self-serve preserved); a future admin-moderation step can
-    gate this route without changing the transition validation.
+    Verification (PENDING -> VERIFIED) is a moderation decision: only an
+    administrator with `properties.approve` may make it, through
+    POST /admin/listings/{id}/verify (audited), or the existing automatic
+    verification worker. This route is kept so existing clients get a clear,
+    stable refusal instead of a 404: authenticated posters always receive
+    403 ADMIN_VERIFICATION_REQUIRED and nothing is read or written.
     """
-    return _run_verification_transition(db, owner_id, listing_id, "VERIFIED")
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "ADMIN_VERIFICATION_REQUIRED",
+            "message": "Listings are verified by the RESTAMP team. Submit the listing for review instead.",
+        },
+    )
 
 
 @router.post("/listings/{listing_id}/reject", response_model=schemas.OwnerListingOut)
@@ -541,14 +583,28 @@ def reject_listing(
     listing_id: int,
     body: schemas.VerificationRejectIn | None = None,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Explicitly reject a PENDING listing (PENDING -> REJECTED, audited).
 
     Accepts an optional ``{"reason": ...}`` stored in the verification audit
     row. Idempotent when already REJECTED. Returns 422 when VERIFIED.
-    Returns 404 when the listing does not belong to the caller.
+    Owner self-rejection is blocked (403): only an authorized administrator
+    can reject a property. Returns 404 when the listing does not belong
+    to the caller (cross-owner never an oracle).
     """
+    from ..services.owner_listings import owner_owns_listing
+
+    # Block owner self-rejection: only an administrator can reject a property.
+    # This applies regardless of the listing's verification status.
+    if owner_owns_listing(db, owner_id, listing_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ADMIN_VERIFICATION_REQUIRED",
+                "message": "Listings are verified by the RESTAMP team. Submit the listing for review instead.",
+            },
+        )
     reason = body.reason if body is not None else None
     return _run_verification_transition(db, owner_id, listing_id, "REJECTED", reason)
 
@@ -557,7 +613,7 @@ def reject_listing(
 def publish_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Publish an archived listing (CLOSED -> AVAILABLE). VERIFIED only.
 
@@ -565,6 +621,9 @@ def publish_listing(
     VERIFIED or is in a terminal deal state (SOLD/RENTED/LEASED/EXPIRED).
     Returns 404 when the listing does not belong to the caller.
     """
+    # Restricted (paid) poster operation: needs the current paid Owner/Dealer
+    # plan of the account's poster type (402 POSTER_PLAN_REQUIRED otherwise).
+    capabilities.ensure_can_post(db, owner_id)
     return _run_status_transition(db, owner_id, listing_id, "AVAILABLE")
 
 
@@ -572,7 +631,7 @@ def publish_listing(
 def archive_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Archive a live listing (AVAILABLE -> CLOSED, reversible via publish).
 
@@ -587,7 +646,7 @@ def update_listing_status(
     listing_id: int,
     body: schemas.ListingStatusUpdate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Validated listing-status transition (general form of publish/archive).
 
@@ -596,6 +655,10 @@ def update_listing_status(
     terminal. Same-state repeats are idempotent. Returns 404 when the
     listing does not belong to the caller, 422 for invalid transitions.
     """
+    # Re-publishing (-> AVAILABLE) is a restricted poster operation; closing a
+    # listing or marking it sold/rented/leased never needs a plan.
+    if body.status == "AVAILABLE":
+        capabilities.ensure_can_post(db, owner_id)
     return _run_status_transition(db, owner_id, listing_id, body.status, body.closed_reason)
 
 
@@ -604,14 +667,18 @@ def delete_listing_photo(
     listing_id: int,
     media_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Remove one gallery photo from the caller's own listing.
 
     The media row is deleted and siblings renumbered (cover stays index 0);
-    the Cloudinary asset is destroyed best-effort after the DB commit.
+    the stored file (server disk for ``local:`` ids, Cloudinary otherwise) is
+    removed best-effort after the DB commit.
     Returns 404 when the listing/photo does not belong to the caller.
     """
+    # Restricted (paid) poster operation: needs the current paid Owner/Dealer
+    # plan of the account's poster type (402 POSTER_PLAN_REQUIRED otherwise).
+    capabilities.ensure_can_post(db, owner_id)
     sp = db.begin_nested()
     try:
         found, public_id = owner_svc.delete_listing_photo(db, owner_id, listing_id, media_id)
@@ -625,11 +692,9 @@ def delete_listing_photo(
     except Exception:
         sp.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Delete failed")
-    if public_id:
-        try:
-            photo_storage.delete_uploaded_image(public_id)
-        except Exception:
-            pass
+    # Routed by storage source: local: ids remove the server file, other ids
+    # destroy the legacy Cloudinary asset. Never raises (row already gone).
+    storage_svc.delete_photo(public_id)
     return None
 
 
@@ -637,7 +702,7 @@ def delete_listing_photo(
 def delete_listing(
     listing_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Soft-delete (remove) the caller's own listing.
 
@@ -679,7 +744,7 @@ def delete_listing(
 def create_draft(
     body: schemas.DraftCreate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Save a new draft (always creates; repeat saves update via PUT)."""
     card = owner_svc.create_draft(
@@ -697,7 +762,7 @@ def create_draft(
 @router.get("/drafts", response_model=schemas.DraftListOut)
 def list_drafts(
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """List the caller's drafts, most recently updated first."""
     items, total = owner_svc.list_drafts(db, owner_id)
@@ -708,7 +773,7 @@ def list_drafts(
 def get_draft(
     draft_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Get one draft; 404 if missing or owned by someone else."""
     card = owner_svc.get_draft(db, owner_id, draft_id)
@@ -722,7 +787,7 @@ def update_draft(
     draft_id: int,
     body: schemas.DraftUpdate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Replace a draft's snapshot; 404 if missing or owned by someone else."""
     card = owner_svc.update_draft(
@@ -744,7 +809,7 @@ def update_draft(
 def delete_draft(
     draft_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Discard a draft; 404 if missing or owned by someone else."""
     if not owner_svc.delete_draft(db, owner_id, draft_id):
@@ -762,18 +827,23 @@ def delete_draft(
 
 @router.post("/visits", response_model=schemas.VisitOut, status_code=201)
 def propose_owner_visit(
+    request: Request,
     body: schemas.OwnerVisitCreate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """Propose a visit to a buyer holding an enquiry or contact relationship
-    on one of the caller's own verified, available listings (lands PROPOSED).
+    on one of the caller's own verified, available listings (lands PENDING;
+    the buyer is notified).
 
     Returns 404 for foreign listings or unknown buyers, 422 for unrelated
     buyers, past times, self-visits, the caller's own listing when it is
     not live ("Visits can only be scheduled on a live listing"), or a buyer
     whose lead the owner has closed ("Lead is closed").
     """
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "owner_visit_create", owner_id, request)
     if body.property_listing_id <= 0 or body.buyer_user_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     try:
@@ -790,9 +860,9 @@ def propose_owner_visit(
 @router.get("/visits", response_model=schemas.VisitsResponse)
 def list_my_visits(
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
     property_listing_id: int | None = Query(default=None, ge=1),
-    status: Literal["REQUESTED", "PROPOSED", "CONFIRMED", "DECLINED", "CANCELLED", "COMPLETED"] | None = Query(default=None),
+    status: Literal["PENDING", "CONFIRMED", "REJECTED", "CANCELLED", "COMPLETED", "REQUESTED", "PROPOSED", "DECLINED"] | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
@@ -808,7 +878,7 @@ def list_my_visits(
 def get_my_visit(
     visit_id: int,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
     """One visit for the caller's own properties; 404 otherwise."""
     return visit_svc.get_owner_visit(db, owner_id, visit_id)
@@ -816,17 +886,19 @@ def get_my_visit(
 
 @router.patch("/visits/{visit_id}", response_model=schemas.VisitOut)
 def update_my_visit(
+    request: Request,
     visit_id: int,
     body: schemas.VisitUpdate,
     db: Session = Depends(get_db),
-    owner_id: int = Depends(require_owner),
+    owner_id: int = Depends(require_poster),
 ):
-    """Confirm/decline buyer-requested visits, counter-propose a new time on
-    a buyer request (time only -> PROPOSED, awaiting the buyer), reschedule
-    proposed/confirmed times, cancel open visits, or complete confirmed
-    ones — per the state rules. 404 when the visit is not on the caller's property, 422 for
-    invalid moves, past times, wrong-actor transitions, or a visit whose
-    lead is closed ("Lead is closed")."""
+    """Confirm or reject (REJECTED) a PENDING visit, cancel an open visit,
+    or complete a confirmed one (strict Phase 5). 404 when the visit is not
+    on the caller's property; 422 for invalid moves, any time/note edit,
+    or a visit whose lead is closed ("Lead is closed")."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "owner_visit_status", owner_id, request)
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(

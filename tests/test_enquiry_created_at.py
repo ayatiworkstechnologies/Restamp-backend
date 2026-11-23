@@ -190,8 +190,9 @@ def test_duplicate_enquiry_matches_the_create_contract(client):
     other = fresh_buyer(c)
     assert c.get(f"/buyer/enquiries/{first.json()['id']}",
                  headers=auth_header(other["access_token"])).status_code == 404
-    ho, _ = owner_header(c, phone)  # an OWNER-mode account cannot create buyer enquiries
-    assert c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=ho).status_code == 403
+    ho, _ = owner_header(c, phone)  # the listing's owner (OWNER mode)
+    # Phase 1 (approved): buyer capability exists in every mode. Own listing -> own-listing rule (422).
+    assert c.post("/buyer/enquiries", json={"property_listing_id": lid}, headers=ho).status_code == 422
     assert session.execute(
         text("SELECT COUNT(*) FROM enquiries WHERE buyer_user_id=:b AND property_listing_id=:l"),
         {"b": buyer["user_id"], "l": lid},

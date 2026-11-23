@@ -10,12 +10,27 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, fresh_pincode
+from tests.conftest import grant_posting_plan_for_user, auth_header, fresh_pincode
 
 PNG_1PX = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 )
-JPEG_BYTES = b"\xff\xd8\xff\xe0FAKEJPEG" + b"0" * 128
+
+
+def jpeg_bytes(width: int = 1, height: int = 1, pad: int = 128) -> bytes:
+    """Minimal structurally valid JPEG header (SOI, JFIF APP0, SOF0 carrying
+    the frame size, EOI) plus filler: enough for magic-byte sniffing and the
+    header dimension check; never decoded."""
+    return (
+        b"\xff\xd8"
+        + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        + b"\xff\xc0\x00\x0b\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big")
+        + b"\x01\x01\x11\x00"
+        + b"\xff\xd9" + b"0" * pad
+    )
+
+
+JPEG_BYTES = jpeg_bytes()
 
 FAKE_URL = "https://res.cloudinary.com/demo/image/upload/restamp/listings/1/photos/abc123.png"
 FAKE_PUBLIC_ID = "restamp/listings/1/photos/abc123"
@@ -71,6 +86,8 @@ def _setup_owner(c, session, phone: str, role: str = "OWNER") -> str:
             "INSERT INTO role_history (user_id, role) VALUES (:u, :r)"),
             {"u": uid, "r": role})
         session.commit()
+    if role in ("OWNER", "BROKER"):
+        grant_posting_plan_for_user(session, uid, role)  # real paid plan
     token, _ = create_access_token(uid, role)
     return token
 

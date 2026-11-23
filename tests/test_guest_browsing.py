@@ -4,7 +4,7 @@ restamp_dev only. No real SMS/network calls.
 """
 import json
 
-from tests.conftest import auth_header, register_phone, fresh_pincode
+from tests.conftest import seed_verified, admin_verify, grant_test_posting_plan, auth_header, register_phone, fresh_pincode
 
 OWNER_PHONE = "+919840123456"
 LISTING_PHONE = "+919840654321"
@@ -18,6 +18,7 @@ def _owner(c):
     out = register_phone(c, OWNER_PHONE)
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 
@@ -43,8 +44,7 @@ def _create(c, token, deal, title=None):
     )
     assert r.status_code == 201, r.text
     lid = r.json()["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify",
-                  headers=auth_header(token)).status_code == 200
+    seed_verified(c, lid)  # setup only (verification itself: admin-only)
     return lid
 
 
@@ -162,7 +162,9 @@ def test_authenticated_flows_preserved_without_leaks(client):
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
     assert r.status_code == 200, r.text
     # Plus the owner's public-safe name (none saved here) and own-listing flag.
-    assert r.json() == {"phone": OWNER_PHONE, "owner_name": None, "own_listing": False}
+    _b = r.json()  # Phase 3 adds unlock_status/free_unlocks_remaining/credit_balance (additive)
+    assert {k: _b[k] for k in ("phone", "owner_name", "own_listing")} == {"phone": OWNER_PHONE, "owner_name": None, "own_listing": False}
+    assert _b["unlock_status"] in ("UNLOCKED_FREE", "ALREADY_UNLOCKED")
     # ... and appears nowhere else, even authenticated.
     r = c.get(f"/buyer/listings/{lid}", headers=h)
     assert r.status_code == 200, r.text
@@ -201,16 +203,16 @@ def test_enquiry_403_means_wrong_role(client):
     c, _ = client
     token, lids = _seed_all_deals(c)
     lid = lids["BUY"]
-    # OWNER-role account (e.g. just posted a property) -> 403 with an
-    # actionable detail naming the required role.
+    # Phase 1 (approved): buyer capability exists in every mode, so an
+    # OWNER-mode account is never refused with 403 here. `lid` is its OWN
+    # listing: the enquiry hits the self-enquiry rule (422) and the contact
+    # reveal returns its own number flagged own_listing (no lead, no audit).
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
                headers=auth_header(token))
-    assert r.status_code == 403, r.text
-    assert r.json() == {"detail": "BUYER role required"}, r.text
-    # Same for contact reveal: eligible buyers only, never a phone on 403.
+    assert r.status_code == 422, r.text
+    assert r.json() == {"detail": "Cannot enquire on your own listing"}, r.text
     r = c.post(f"/buyer/listings/{lid}/contact", headers=auth_header(token))
-    assert r.status_code == 403, r.text
-    assert "phone" not in r.json()
+    assert r.status_code == 200 and r.json()["own_listing"] is True, r.text
     # BROKER (agent) passes the role gate but is area-limited: with no plan
     # area the enquiry is refused with the upgrade code, not the role error.
     broker = register_phone(c, "+919100888803")["access_token"]

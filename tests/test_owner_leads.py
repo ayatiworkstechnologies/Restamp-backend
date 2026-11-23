@@ -1,7 +1,7 @@
 """P3 Owner Leads MVP: reveal-to-lead linkage + GET /owner/leads (rollback-isolated)."""
 from sqlalchemy import text
 
-from tests.conftest import auth_header, make_postcode, register_phone
+from tests.conftest import grant_test_posting_plan, auth_header, make_postcode, register_phone
 
 _owner_n = {"i": 0}
 _buyer_n = {"i": 200}
@@ -46,6 +46,7 @@ def owner_header(c, phone):
     tok = register_phone(c, phone)
     h = auth_header(tok["access_token"])
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
+    grant_test_posting_plan(c, h)  # real paid plan for listing operations
     return h, tok["user_id"]
 
 
@@ -71,7 +72,9 @@ def test_reveal_creates_single_lead_and_reuses_on_repeat(client):
 
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
     assert r.status_code == 200, r.text
-    assert r.json() == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
+    _b = r.json()  # Phase 3 adds unlock_status/free_unlocks_remaining/credit_balance (additive)
+    assert {k: _b[k] for k in ("phone", "owner_name", "own_listing")} == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
+    assert _b["unlock_status"] in ("UNLOCKED_FREE", "ALREADY_UNLOCKED")
     assert enquiry_count(session, buyer["user_id"], lid) == 1
     row = session.execute(
         text("SELECT status, owner_user_id, message FROM enquiries "
@@ -87,7 +90,10 @@ def test_reveal_creates_single_lead_and_reuses_on_repeat(client):
 
     # Repeat reveal: same phone, same single lead, second audit event.
     r = c.post(f"/buyer/listings/{lid}/contact", headers=h)
-    assert r.status_code == 200 and r.json() == {"phone": owner_phone, "owner_name": "Owner", "own_listing": False}
+    _b = r.json()  # Phase 3: additive unlock fields; a repeat is ALREADY_UNLOCKED (no charge)
+    assert r.status_code == 200 and {k: _b[k] for k in ("phone", "owner_name", "own_listing")} == {
+        "phone": owner_phone, "owner_name": "Owner", "own_listing": False}
+    assert _b["unlock_status"] == "ALREADY_UNLOCKED"
     assert enquiry_count(session, buyer["user_id"], lid) == 1
     kept = session.execute(
         text("SELECT id FROM enquiries WHERE buyer_user_id=:b AND property_listing_id=:l"),

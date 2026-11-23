@@ -17,9 +17,9 @@ import uuid
 
 from ..config import settings
 
-# Reuse the exact validation contract (MIME allowlist + 10 MB cap) so the
-# endpoint behavior is unchanged by the storage move.
-from ..services.storage import MAX_IMAGE_BYTES, validate_image_upload
+# Reuse the exact validation contract (MIME allowlist + configurable size
+# cap, RESTAMP_PHOTO_MAX_BYTES) so both storage backends enforce one rule.
+from ..services.storage import max_image_bytes, size_exceeded_detail, validate_image_upload
 
 _configured = False
 
@@ -56,8 +56,8 @@ def upload_listing_image(
     """
     if not data:
         raise ValueError("Empty file")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise ValueError(f"Image exceeds {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+    if len(data) > max_image_bytes():
+        raise ValueError(size_exceeded_detail())
     _ensure_configured()
     import cloudinary.uploader
 

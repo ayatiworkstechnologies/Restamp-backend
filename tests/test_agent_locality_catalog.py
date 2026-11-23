@@ -29,7 +29,7 @@ from sqlalchemy import text
 
 from app.services import agent_plans as plan_svc
 from app.services import localities as loc_svc
-from tests.conftest import auth_header, register_phone
+from tests.conftest import grant_test_posting_plan, grant_test_posting_plan, auth_header, register_phone
 
 _n = {"i": 0}
 
@@ -49,6 +49,8 @@ def _user(c, role="BUYER"):
     h = auth_header(tok["access_token"])
     if role != "BUYER":
         assert c.post("/users/me/role", json={"role": role}, headers=h).status_code == 200
+        if role == "OWNER":
+            grant_test_posting_plan(c, h)  # real paid plan for listing operations
     return h, tok["user_id"]
 
 
@@ -635,6 +637,7 @@ def test_approved_pincodes_work_for_loader_owners_and_agents(client):
     tok = register_phone(c, f"+916774{uuid.uuid4().int % 10**6:06d}")
     ho = auth_header(tok["access_token"])
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=ho).status_code == 200
+    grant_test_posting_plan(c, ho)
     body = {"title": "OMR flat", "transaction_type": "RENT", "property_type": "APARTMENT",
             "price_rupees": 25000, "locality": name, "city": "Chennai"}
     r = c.post("/owner/listings", json={**body, "pincode": "600119"}, headers=ho)

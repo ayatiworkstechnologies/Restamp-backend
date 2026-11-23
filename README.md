@@ -150,7 +150,8 @@ RESTAMP_CORS_ORIGINS=https://restamp.in,https://www.restamp.in,https://restamp-a
   `RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1` (exact value `1`) also allows
   exactly `http://localhost:3000` (website dev server) and
   `http://localhost:8081` (Expo web). The pair is fixed in code: no other
-  port, no `127.0.0.1`, no LAN or external origin. Startup logs a warning
+  port, no `127.0.0.1`, no LAN or external origin, and
+  `RESTAMP_CORS_DEV_ORIGINS` is ignored in production. Startup logs a warning
   while it is on. CORS is not authentication; every endpoint keeps its normal
   auth. Remove the variable (or set `0`) to close it again.
 - `RESTAMP_GOOGLE_ENABLED=1` additionally requires a real

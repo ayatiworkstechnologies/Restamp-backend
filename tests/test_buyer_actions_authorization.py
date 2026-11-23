@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone, fresh_pincode
+from tests.conftest import seed_verified, admin_verify, grant_test_posting_plan, auth_header, register_phone, fresh_pincode
 
 _SEQ = {"n": 0}
 FUTURE = lambda days=7: (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
@@ -48,6 +48,7 @@ def _owner(c, phone=None):
     out = _register(c, phone)
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["role"] == "OWNER", r.text
     return out, token
@@ -80,9 +81,7 @@ def _listing(c, token, title=None):
     )
     assert r.status_code == 201, r.text
     lid = r.json()["listing_id"]
-    assert c.post(
-        f"/owner/listings/{lid}/verify", headers=auth_header(token)
-    ).status_code == 200
+    seed_verified(c, lid)  # setup only (verification itself: admin-only)
     return lid
 
 
@@ -150,7 +149,8 @@ def test_visit_requires_authentication(client):
 # --- Buyer authorization (the 403 matrix) ---------------------------------
 
 def test_enquiry_rejects_non_buyer_roles(client):
-    """OWNER accounts are refused with the actionable detail. Agents (BROKER)
+    """Phase 1: an OWNER-mode account keeps buyer capability, so on its OWN
+    listing it is refused by the own-listing rule (422). Agents (BROKER)
     pass the role gate but act only inside their plan's areas: an agent with
     no area gets 402 AGENT_AREA_NOT_IN_PLAN (see test_agent_trial.py)."""
     c, _ = client
@@ -158,8 +158,8 @@ def test_enquiry_rejects_non_buyer_roles(client):
     lid = _listing(c, otoken)
 
     r = c.post("/buyer/enquiries", json=_enquiry_body(lid), headers=auth_header(otoken))
-    assert r.status_code == 403, r.text
-    assert r.json() == {"detail": "BUYER role required"}, r.text
+    assert r.status_code == 422, r.text
+    assert r.json() == {"detail": "Cannot enquire on your own listing"}, r.text
 
     broker = _register(c)
     r = c.post(
@@ -172,8 +172,8 @@ def test_enquiry_rejects_non_buyer_roles(client):
     assert r.status_code == 402 and r.json()["detail"]["code"] == "AGENT_AREA_NOT_IN_PLAN", r.text
 
     # No row was written for the refused attempts.
-    count = c.get("/buyer/enquiries", headers=auth_header(otoken)).status_code
-    assert count == 403, "an OWNER account must not be able to read buyer enquiries"
+    r = c.get("/buyer/enquiries", headers=auth_header(otoken))
+    assert r.status_code == 200 and r.json()["total"] == 0, r.text
 
 
 def test_visit_rejects_non_buyer_roles(client):
@@ -181,13 +181,13 @@ def test_visit_rejects_non_buyer_roles(client):
     _, otoken = _owner(c)
     lid = _listing(c, otoken)
 
+    # Phase 1 (approved): buyer capability exists in every mode. Own listing -> own-listing rule.
     r = c.post("/buyer/visits", json=_visit_body(lid), headers=auth_header(otoken))
-    assert r.status_code == 403, r.text
-    assert r.json() == {"detail": "BUYER role required"}, r.text
+    assert r.status_code == 422, r.text
+    assert r.json() == {"detail": "cannot schedule a visit on your own listing"}, r.text
 
     r = c.get("/buyer/visits", headers=auth_header(otoken))
-    assert r.status_code == 403, r.text
-    assert r.json() == {"detail": "BUYER role required"}, r.text
+    assert r.status_code == 200, r.text
 
     # Agents (BROKER) pass the role gate but need the listing's area in their plan.
     broker = _register(c)
@@ -300,7 +300,7 @@ def test_buyer_schedules_visit(client):
     assert body["property_listing_id"] == lid
     assert body["buyer_user_id"] == buyer["user_id"]
     assert body["owner_user_id"] == owner["user_id"]
-    assert body["status"] == "REQUESTED" and body["initiator"] == "BUYER"
+    assert body["status"] == "PENDING" and body["initiator"] == "BUYER"
     assert body["note"] == "Evening please"
     assert body["listing"]["title"]
 
@@ -368,11 +368,10 @@ def test_visit_payload_contract(client):
 # --- The self-serve recovery the app now uses -----------------------------
 
 def test_role_switch_restores_buyer_access(client):
-    """OWNER -> BUYER unlocks the buyer endpoints; BUYER -> OWNER re-locks them.
-
-    This is the flow the app now performs before a buyer action (the account
-    posted a property, went back to browsing, and the server still held the
-    OWNER role). The switch is a real, authenticated, server-side change.
+    """Phase 1 (approved): buyer capability exists in EVERY mode. An account
+    in OWNER mode can act as a buyer on someone else's listing; switching
+    modes keeps the same user id and never locks the buyer side.
+    (Name kept for history; it previously asserted the OWNER-mode lock.)
     """
     c, _ = client
     # Another owner's listing — the one the switching account browses.
@@ -387,10 +386,10 @@ def test_role_switch_restores_buyer_access(client):
 
     assert _current_role(c, token)["role"] == "OWNER"
 
-    # Locked while the account is in OWNER mode.
-    assert c.post("/buyer/enquiries", json=_enquiry_body(listing_id), headers=h).status_code == 403
-    assert c.post("/buyer/visits", json=_visit_body(listing_id), headers=h).status_code == 403
-    assert c.get("/buyer/visits", headers=h).status_code == 403
+    # Available while the account is in OWNER mode.
+    r = c.post("/buyer/enquiries", json=_enquiry_body(listing_id), headers=h)
+    assert r.status_code == 201, r.text
+    assert c.get("/buyer/visits", headers=h).status_code == 200
 
     # The sanctioned self-serve switch.
     r = c.post("/users/me/role", json={"role": "BUYER"}, headers=h)
@@ -398,17 +397,19 @@ def test_role_switch_restores_buyer_access(client):
     assert r.json()["role"] == "BUYER", r.text
     assert _current_role(c, token)["user_id"] == account["user_id"]
 
-    # Unlocked.
+    # Same account in BUYER mode: the repeat message joins the SAME open
+    # enquiry (one active lead per buyer+listing) -> 200, not a new lead.
     r = c.post("/buyer/enquiries", json=_enquiry_body(listing_id, "Now it works"), headers=h)
-    assert r.status_code == 201, r.text
+    assert r.status_code == 200, r.text
     r = c.post("/buyer/visits", json=_visit_body(listing_id), headers=h)
     assert r.status_code == 201, r.text
     r = c.get("/buyer/visits", headers=h)
     assert r.status_code == 200, r.text
 
-    # Roles are exclusive: switching back to OWNER re-locks the buyer side.
+    # Switching back to OWNER keeps the buyer side (same account).
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
+    grant_test_posting_plan(c, h)
     assert r.status_code == 200, r.text
-    assert c.post("/buyer/enquiries", json=_enquiry_body(listing_id), headers=h).status_code == 403
-    assert c.post("/buyer/visits", json=_visit_body(listing_id), headers=h).status_code == 403
-    assert c.get("/buyer/visits", headers=h).status_code == 403
+    assert r.json()["user_id"] == account["user_id"]
+    assert c.get("/buyer/visits", headers=h).status_code == 200
+    assert c.get("/buyer/enquiries", headers=h).status_code == 200

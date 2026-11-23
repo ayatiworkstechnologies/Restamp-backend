@@ -55,6 +55,7 @@ from ..config import area_seeding_enabled
 from .localities import _sql_key, name_key
 from ..services.listings import format_price
 from ..services.media_urls import MAX_LISTING_PHOTOS, validate_listing_image_url
+from . import notifications as notification_svc
 
 # MySQL duplicate-key error code (ER_DUP_ENTRY), surfaced by the pymysql
 # driver as ``IntegrityError.orig.args[0]``. It is the only integrity error
@@ -1154,9 +1155,10 @@ def transition_verification_automatic(
         .scalar()
     )
     checks = {"action": "verified", "actor": "auto"}
+    attempt_no = int(last_attempt or 0) + 1
     db.add(Verification(
         property_listing_id=listing_id,
-        attempt_no=int(last_attempt or 0) + 1,
+        attempt_no=attempt_no,
         ruleset_version=_VERIFICATION_RULESET,
         checks_json=checks,
         result="PASS",
@@ -1164,6 +1166,8 @@ def transition_verification_automatic(
         triggered_by=None,  # system-triggered
     ))
     db.flush()
+    # System action (no actor): the owner is told their listing is verified.
+    notification_svc.notify_listing_decision(db, listing, "VERIFIED", attempt_no, actor_id=None)
     return listing
 
 

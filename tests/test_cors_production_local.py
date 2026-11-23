@@ -3,7 +3,8 @@
 Default off. When the exact value "1" is set, a production-classified backend
 additionally allows EXACTLY http://localhost:3000 and http://localhost:8081
 (config.PRODUCTION_LOCAL_DEV_ORIGINS). No other port, no 127.0.0.1, no LAN,
-no external origin, never a regex/wildcard. The configured https origins behave exactly as before.
+no external origin, never a regex/wildcard; RESTAMP_CORS_DEV_ORIGINS cannot
+widen production. The configured https origins behave exactly as before.
 """
 from __future__ import annotations
 
@@ -96,6 +97,18 @@ def test_production_https_origins_unchanged(monkeypatch, origin, enabled):
     _assert_allowed(tc, origin)
 
 
+def test_dev_origins_setting_cannot_widen_production(monkeypatch):
+    tc = _prod_app(
+        monkeypatch,
+        CORS_ALLOW_LOCALHOST_IN_PRODUCTION=True,
+        DEV_CORS_ORIGINS="http://localhost:4000,http://127.0.0.1:3000,https://evil.example",
+    )
+    for origin in ("http://localhost:4000", "http://127.0.0.1:3000", "https://evil.example"):
+        _assert_rejected(tc, origin)
+    for origin in LOCAL:
+        _assert_allowed(tc, origin)
+
+
 def test_middleware_receives_exact_list_without_regex(monkeypatch):
     import app.main as main_module
 
@@ -139,3 +152,11 @@ def test_production_validation_still_refuses_wildcard_with_opt_in(monkeypatch):
     _production(monkeypatch, CORS_ALLOW_LOCALHOST_IN_PRODUCTION=True, CORS_ORIGINS="*")
     with pytest.raises(RuntimeError, match="RESTAMP_CORS_ORIGINS"):
         validate_security_config()
+
+
+def test_stray_dev_origins_warned_and_ignored_in_production(monkeypatch, caplog):
+    _production(monkeypatch, DEV_CORS_ORIGINS="http://localhost:4000")
+    with caplog.at_level(logging.WARNING, logger="restamp.config"):
+        validate_security_config()
+    assert "RESTAMP_CORS_DEV_ORIGINS is set but ignored in production" in caplog.text
+    assert "localhost:4000" not in caplog.text  # setting name only, never its value

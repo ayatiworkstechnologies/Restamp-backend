@@ -8,7 +8,7 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import auth_header, fresh_pincode, register_phone
+from tests.conftest import grant_test_posting_plan, auth_header, fresh_pincode, register_phone
 from tests.test_owner_photos import JPEG_BYTES, PNG_1PX, _mock_cloud
 
 
@@ -16,6 +16,7 @@ def _setup_owner_with_phone(client, phone: str) -> str:
     token_out = register_phone(client, phone)
     token = token_out["access_token"]
     r = client.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(client, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 
@@ -24,7 +25,7 @@ def _post_listing(client, token, title, **overrides):
     payload = {
         "title": title, "transaction_type": "RENT", "property_type": "APARTMENT",
         "price_rupees": 25000, "price_period": "MONTHLY",
-        "locality": "Edit Nagar", "city": "Chennai", "pincode": "600040",
+        "locality": "Anna Nagar", "city": "Chennai", "pincode": "600040",
         "bedrooms": 2, "contact_phone": "+919840100001",
         "rent_terms": {"security_deposit_rupees": 100000, "maintenance_rupees": 3000,
                        "maintenance_period": "Monthly", "is_negotiable": True,
@@ -352,7 +353,7 @@ def test_delete_photo_renumbers_cover_and_destroys_cloud(client, monkeypatch):
 
     payload = {"title": "Delete Photo Flat", "transaction_type": "RENT",
                "property_type": "APARTMENT", "price_rupees": 25000,
-               "price_period": "MONTHLY", "locality": "Del Nagar",
+               "price_period": "MONTHLY", "locality": "Anna Nagar",
                "city": "Chennai", "pincode": "600040"}
     lid = c.post("/owner/listings", json=payload,
                  headers=auth_header(token)).json()["listing_id"]
@@ -383,7 +384,7 @@ def test_delete_photo_cloud_failure_still_succeeds_row_gone(client, monkeypatch)
     token = _setup_owner_with_phone(c, "+919876543409")
     payload = {"title": "Cloud Fail Flat", "transaction_type": "RENT",
                "property_type": "APARTMENT", "price_rupees": 25000,
-               "price_period": "MONTHLY", "locality": "Clf Nagar",
+               "price_period": "MONTHLY", "locality": "Anna Nagar",
                "city": "Chennai", "pincode": "600040"}
     lid = c.post("/owner/listings", json=payload,
                  headers=auth_header(token)).json()["listing_id"]
@@ -543,7 +544,7 @@ def test_service_boundary_rejects_out_of_range_pincode(client):
     try:
         listing, _ = svc.update_owner_listing(
             session, owner_id, lid,
-            {"locality": "Svc Nagar 2", "pincode": " 600089 "})
+            {"locality": "Ramapuram", "pincode": " 600089 "})
         assert listing is not None
     finally:
         sp.rollback()

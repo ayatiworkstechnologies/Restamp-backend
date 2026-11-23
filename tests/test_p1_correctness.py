@@ -39,7 +39,7 @@ import app.services.owner_listings as owner_listings
 import app.services.users_roles as users_roles
 from app.db import SessionLocal
 from app.models import AdminAccount, AuthIdentity, District, User
-from tests.conftest import _allocate_pincode, auth_header, register_phone
+from tests.conftest import grant_test_posting_plan, _allocate_pincode, auth_header, register_phone
 
 
 _TAG = None  # refreshed per test via _tag()
@@ -78,6 +78,7 @@ def _owner_token(c) -> str:
     phone = "+9198" + f"{int(uuid.uuid4().hex[:8], 16) % 10**8:08d}"
     token = register_phone(c, phone)["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 

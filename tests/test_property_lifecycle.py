@@ -8,7 +8,7 @@ nothing, and idempotent/concurrent repeats.
 """
 from sqlalchemy import text
 
-from tests.conftest import auth_header, register_phone, fresh_pincode
+from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, register_phone, fresh_pincode
 _SEQ = {"n": 0}
 
 
@@ -18,6 +18,7 @@ def _owner(c, phone=None):
     out = register_phone(c, phone)
     token = out["access_token"]
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=auth_header(token))
+    grant_test_posting_plan(c, auth_header(token))
     assert r.status_code == 200, r.text
     return token
 
@@ -78,7 +79,7 @@ def test_verify_reject_submit_lifecycle(client):
     lid = _create(c, token)["listing_id"]
 
     # PENDING -> VERIFIED (audited PASS row).
-    r = c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token))
+    r = admin_verify(c, lid)
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "VERIFIED"
     n = session.execute(text(
@@ -86,23 +87,19 @@ def test_verify_reject_submit_lifecycle(client):
         {"i": lid}).fetchone()[0]
     assert n == 1
 
-    # VERIFIED -> REJECTED is invalid (use archive for unpublishing).
-    assert c.post(f"/owner/listings/{lid}/reject", headers=auth_header(token)).status_code == 422
+# VERIFIED -> REJECTED is invalid (owner self-rejection blocked); use archive
+    # for unpublishing.
+    assert c.post(f"/owner/listings/{lid}/reject", headers=auth_header(token)).status_code == 403
     assert _db(session, lid)[0] == "VERIFIED"
 
-    # Fresh listing: PENDING -> REJECTED with reason (audited FAIL row).
+    # Fresh listing: PENDING -> REJECTED is blocked (owner self-rejection).
     lid2 = _create(c, token)["listing_id"]
     r = c.post(f"/owner/listings/{lid2}/reject", json={"reason": "Blurry photos"},
                headers=auth_header(token))
-    assert r.status_code == 200, r.text
-    assert r.json()["verification_status"] == "REJECTED"
-    row = session.execute(text(
-        "SELECT result, checks_json FROM verifications WHERE property_listing_id=:i"),
-        {"i": lid2}).fetchone()
-    assert row[0] == "FAIL"
+    assert r.status_code == 403
 
-    # REJECTED -> VERIFIED is invalid; must submit (resubmit) first.
-    assert c.post(f"/owner/listings/{lid2}/verify", headers=auth_header(token)).status_code == 422
+# REJECTED -> VERIFIED is invalid; must submit (resubmit) first.
+    assert admin_verify(c, lid2).status_code == 200
     r = c.post(f"/owner/listings/{lid2}/submit", headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["verification_status"] == "PENDING"
@@ -110,7 +107,7 @@ def test_verify_reject_submit_lifecycle(client):
     # PENDING submit repeats are idempotent.
     assert c.post(f"/owner/listings/{lid2}/submit", headers=auth_header(token)).status_code == 200
     # Now verification succeeds.
-    assert c.post(f"/owner/listings/{lid2}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid2).status_code == 200
 
 
 # --- Publishing / archiving / deal close ------------------------------------
@@ -127,7 +124,7 @@ def test_publish_requires_verified(client):
     assert _db(session, lid)[1] == "CLOSED"  # failed transition commits nothing
     # Verify then publish.
     lid2 = _create(c, token)["listing_id"]
-    assert c.post(f"/owner/listings/{lid2}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid2).status_code == 200
     assert c.post(f"/owner/listings/{lid2}/archive", headers=auth_header(token)).status_code == 200
     r = c.post(f"/owner/listings/{lid2}/publish", headers=auth_header(token))
     assert r.status_code == 200, r.text
@@ -146,7 +143,7 @@ def test_deal_close_terminal_and_validated(client):
     assert r.status_code == 422, r.text
     assert _db(session, lid)[1] == "AVAILABLE"
     # Verified close works with reason persisted.
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     r = c.post(f"/owner/listings/{lid}/status",
                json={"status": "SOLD", "closed_reason": "Deal closed"},
                headers=auth_header(token))
@@ -171,14 +168,14 @@ def test_rented_leased_paths_and_unknown_status(client):
     token = _owner(c)
     for target in ("RENTED", "LEASED"):
         lid = _create(c, token)["listing_id"]
-        assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+        assert admin_verify(c, lid).status_code == 200
         r = c.post(f"/owner/listings/{lid}/status", json={"status": target},
                    headers=auth_header(token))
         assert r.status_code == 200, (target, r.text)
         assert r.json()["listing_status"] == target
     # Unknown status is a schema 422; overlong reason is a service 422.
     lid = _create(c, token)["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     assert c.post(f"/owner/listings/{lid}/status", json={"status": "ARCHIVED"},
                    headers=auth_header(token)).status_code == 422
     assert c.post(f"/owner/listings/{lid}/status",
@@ -193,7 +190,7 @@ def test_buyer_visibility_follows_lifecycle(client):
     lid = _create(c, token)["listing_id"]
     # PENDING: invisible to buyers.
     assert c.get(f"/buyer/listings/{lid}").status_code == 404
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     assert c.get(f"/buyer/listings/{lid}").status_code == 200
     assert c.post(f"/owner/listings/{lid}/archive", headers=auth_header(token)).status_code == 200
     assert c.get(f"/buyer/listings/{lid}").status_code == 404
@@ -226,9 +223,11 @@ def test_lifecycle_authorization(client):
              else c.post(path, headers=auth_header(buyer)))
         assert r.status_code == 403, path
         # Cross-owner -> 404 (never a leak, never an oracle beyond 404).
-        r = (c.post(path, json=body, headers=auth_header(token_b)) if body
-             else c.post(path, headers=auth_header(token_b)))
-        assert r.status_code == 404, path
+# Self-verify and self-rejection are refused (403) for EVERY poster before any
+# lookup, including the listing's own owner, so it is no oracle either.
+    r = (c.post(path, json=body, headers=auth_header(token_b)) if body
+         else c.post(path, headers=auth_header(token_b)))
+    assert r.status_code == 403, path
     # Owner's own row untouched by foreign attempts.
     assert _db(session, lid)[:2] == ("PENDING", "AVAILABLE")
 
@@ -250,11 +249,11 @@ def test_concurrent_repeats_idempotent(client):
     c, session = client
     token = _owner(c)
     lid = _create(c, token)["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     # Rapid repeats (double-click / retry / racing workers): same 200 state,
     # single VERIFIED row, exactly one PASS audit row for the first flip.
     for _ in range(3):
-        r = c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token))
+        r = admin_verify(c, lid)
         assert r.status_code == 200
         assert r.json()["verification_status"] == "VERIFIED"
     n = session.execute(text(
@@ -276,7 +275,7 @@ def test_diverged_enquiry_repeat_is_404_no_snapshot(client):
     token = _owner(c)
     buyer = register_phone(c, "+919100999902")["access_token"]
     lid = _create(c, token)["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     r = c.post("/buyer/enquiries", json={"property_listing_id": lid},
                headers=auth_header(buyer))
     assert r.status_code == 201, r.text
@@ -316,7 +315,7 @@ def test_live_listing_carries_no_close_reason(client):
     c, session = client
     token = _owner(c)
     lid = _create(c, token)["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     r = c.post(f"/owner/listings/{lid}/status",
                json={"status": "CLOSED", "closed_reason": "Renovation"},
                headers=auth_header(token))
@@ -345,7 +344,7 @@ def test_rapid_archive_publish_cycles_deterministic(client):
     c, session = client
     token = _owner(c)
     lid = _create(c, token)["listing_id"]
-    assert c.post(f"/owner/listings/{lid}/verify", headers=auth_header(token)).status_code == 200
+    assert admin_verify(c, lid).status_code == 200
     for _ in range(10):
         assert c.post(f"/owner/listings/{lid}/archive",
                       headers=auth_header(token)).status_code == 200

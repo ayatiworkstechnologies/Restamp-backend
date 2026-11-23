@@ -35,13 +35,15 @@ same plan limit (add_localities with actor_id), revoke one (revoke_locality:
 the grant is removed, its history row is marked REVOKED, the plan is
 untouched), and view an agent's coverage (admin_coverage).
 
-PAYMENT IS SIMULATED, exactly like buyer plans: provider="SIMULATED", no
-money is charged. Replace with a real gateway before production billing.
+PAYMENT IS SIMULATED for subscribe_simulated(), exactly like buyer plans:
+provider="SIMULATED", no money is charged. The real gateway flow (Razorpay
+order → signed payment → subscription + coverage) lives in
+services/payments.py and activates through activate_for_payment() below.
 """
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -63,7 +65,7 @@ from ..models import (
 )
 from . import brokers as broker_svc
 from . import localities as locality_svc
-from . import users_roles
+from . import capabilities, users_roles
 
 
 @dataclass(frozen=True)
@@ -89,17 +91,7 @@ BY_KEY = {**{p.code: p for p in PLANS}, **{p.app_id: p for p in PLANS}}
 # Started once per account with start_trial; never purchasable through
 # subscribe_simulated, and upgrading to a paid tier replaces it.
 TRIAL = AgentPlan("RESTAMP_AGENT_TRIAL", "agent-trial", "Agent Free Trial", 0, None, 1)
-
-# Area access included with a Dealer plan (granted by grant_dealer_access,
-# never purchasable here). Price 0: the dealer payment covers it.
-DEALER_ACCESS = {
-    "dealer-starter": AgentPlan("RESTAMP_DEALER_AREAS_STARTER", "dealer-starter", "Dealer Starter", 0, 30, 5),
-    "dealer-growth": AgentPlan("RESTAMP_DEALER_AREAS_GROWTH", "dealer-growth", "Dealer Growth", 0, 60, 10),
-    "dealer-pro": AgentPlan("RESTAMP_DEALER_AREAS_PRO", "dealer-pro", "Dealer Pro", 0, 90, 15),
-    "dealer-unlimited": AgentPlan("RESTAMP_DEALER_AREAS_UNLIMITED", "dealer-unlimited", "Dealer Unlimited", 0, 180, 25),
-}
-DEALER_ACCESS_CODES = frozenset(p.code for p in DEALER_ACCESS.values())
-BY_CODE = {p.code: p for p in (*PLANS, TRIAL, *DEALER_ACCESS.values())}
+BY_CODE = {p.code: p for p in (*PLANS, TRIAL)}
 CODES = tuple(BY_CODE)
 
 AREA_REQUIRED_CODE = "AGENT_AREA_NOT_IN_PLAN"
@@ -115,7 +107,8 @@ def _now() -> datetime:
 
 
 def _plan_row(db: Session, plan: AgentPlan) -> Plan:
-    """Get-or-create the catalogue row for an agent plan (keeps price/name in sync)."""
+    """Get-or-create the catalogue row for an agent plan. An existing row is never
+    overwritten: admins manage it (services/subscriptions.py)."""
     row = db.query(Plan).filter(Plan.code == plan.code).first()
     label = f"{plan.locality_limit} localities"
     if row is None:
@@ -126,25 +119,33 @@ def _plan_row(db: Session, plan: AgentPlan) -> Plan:
             price_paise=plan.price_paise,
             duration_days=plan.duration_days,
             status="ACTIVE",
+            role="BROKER",
+            location_limit=plan.locality_limit,
         )
         db.add(row)
         db.flush()
-    elif (row.name, row.price_paise, row.duration_days) != (plan.name, plan.price_paise, plan.duration_days):
-        row.name, row.price_paise, row.duration_days = plan.name, plan.price_paise, plan.duration_days
-        row.description = label
-        db.flush()
     return row
+
+
+def _from_row(row: Plan) -> AgentPlan:
+    """The agent plan as stored: admin edits to name/price/locality limit apply."""
+    known = BY_CODE.get(row.code)
+    limit = row.location_limit if row.location_limit is not None else (known.locality_limit if known else 0)
+    if known is not None:
+        return replace(known, name=row.name, price_paise=row.price_paise, locality_limit=limit)
+    return AgentPlan(row.code, row.code.lower(), row.name, row.price_paise, row.duration_days, limit)
 
 
 def _active(db: Session, user_id: int):
     """Latest ACTIVE, unexpired agent subscription -> (Subscription, AgentPlan) or None."""
     row = (
-        db.query(Subscription, Plan.code)
+        db.query(Subscription, Plan)
         .join(Plan, Plan.id == Subscription.plan_id)
         .filter(
             Subscription.user_id == user_id,
             Subscription.status == "ACTIVE",
-            Plan.code.in_(CODES),
+            or_(Plan.role == "BROKER", Plan.code.in_(CODES)),
+            Subscription.suspended_at.is_(None),
             # The free trial has no end date; paid plans must not be expired.
             or_(Subscription.end_date.is_(None), Subscription.end_date > _now()),
         )
@@ -153,8 +154,8 @@ def _active(db: Session, user_id: int):
     )
     if row is None:
         return None
-    sub, code = row
-    return sub, BY_CODE[code]
+    sub, plan_row = row
+    return sub, _from_row(plan_row)
 
 
 NOT_SERVED = "None of the chosen localities are served yet."
@@ -185,6 +186,21 @@ def _refuse_when_nothing_usable(ok: list, unavailable: list[str]) -> None:
         )
 
 
+def catalogue() -> list[dict]:
+    """The purchasable agent plan cards (the free trial is not sold)."""
+    return [
+        {
+            "code": p.code,
+            "app_id": p.app_id,
+            "name": p.name,
+            "price_paise": p.price_paise,
+            "duration_days": p.duration_days,
+            "locality_limit": p.locality_limit,
+        }
+        for p in PLANS
+    ]
+
+
 def status_for(db: Session, user_id: int) -> dict:
     """The caller's agent plan (or has_plan=False) plus covered localities."""
     active = _active(db, user_id)
@@ -202,17 +218,17 @@ def status_for(db: Session, user_id: int) -> dict:
         "start_date": sub.start_date,
         "valid_until": sub.end_date,
         "is_trial": plan.code == TRIAL.code,
-        "is_dealer": plan.code in DEALER_ACCESS_CODES,
         "localities": localities,
         "localities_remaining": max(0, plan.locality_limit - len(localities)),
     }
 
 
-def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[str]) -> dict:
-    """Activate an agent plan for the chosen localities. PAYMENT IS SIMULATED."""
-    plan = BY_KEY.get(key)
-    if plan is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+def _resolve_choice(
+    db: Session, plan: AgentPlan, localities: list[str]
+) -> tuple[list[int], list[str], list[str], list[str]]:
+    """Validate a locality choice against the plan's limit: (postcode_ids,
+    canonical names, unmatched, unavailable). Raises 422 when nothing is
+    usable or the limit would be exceeded — nothing is written."""
     names = _clean_names(localities)
     if not names:
         raise HTTPException(
@@ -233,25 +249,21 @@ def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[st
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"{plan.name} covers up to {plan.locality_limit} localities.",
         )
+    canonical = sorted({r.name for r in ok if r.name})
+    return postcode_ids, canonical, unmatched, unavailable
 
-    row = _plan_row(db, plan)
-    now = _now()
-    end = now + timedelta(days=plan.duration_days)
-    payment = Payment(
-        user_id=user_id,
-        provider="SIMULATED",
-        provider_payment_id=f"SIM-{uuid.uuid4().hex[:16]}",
-        amount_paise=plan.price_paise,
-        currency="INR",
-        status="SUCCESS",
-        plan_id=row.id,
-        idempotency_key=uuid.uuid4().hex,
-        paid_at=now,
-    )
-    db.add(payment)
-    db.flush()
 
-    # One active agent plan at a time: the new purchase replaces the old one.
+def _activate(
+    db: Session, user_id: int, plan: AgentPlan, postcode_ids: list[int],
+    payment_id: int, now: datetime,
+) -> None:
+    """Activate a paid agent plan from a payment row: one active agent plan at
+    a time (the new purchase replaces the old one), coverage = exactly the
+    chosen localities (replaced grants stay visible in history, marked
+    EXPIRED), role switches to BROKER."""
+    # Dealer XOR Owner: refuse (409) before any write when the account is an
+    # Owner; otherwise record BROKER as the poster type.
+    capabilities.claim_poster_type(db, user_id, "BROKER")
     (
         db.query(Subscription)
         .filter(
@@ -261,19 +273,18 @@ def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[st
         )
         .update({Subscription.status: "EXPIRED"}, synchronize_session=False)
     )
+    end = now + timedelta(days=plan.duration_days)
     db.add(
         Subscription(
             user_id=user_id,
-            plan_id=row.id,
-            payment_id=payment.id,
+            plan_id=db.query(Plan.id).filter(Plan.code == plan.code).scalar(),
+            payment_id=payment_id,
             start_date=now,
             end_date=end,
             status="ACTIVE",
         )
     )
 
-    # Coverage = exactly the chosen localities, expiring with the plan. The
-    # replaced grants stay visible in history (marked EXPIRED, not erased).
     (
         db.query(BrokerPostcodeAccessHistory)
         .filter(
@@ -297,12 +308,77 @@ def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[st
     users_roles.set_current_role(db, user_id, "BROKER")
     db.flush()
 
+
+def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[str]) -> dict:
+    """Activate an agent plan for the chosen localities. PAYMENT IS SIMULATED.
+    Development environments only: refused (403) in production/staging."""
+    from .buyer_plans import require_simulated_purchase_allowed
+
+    require_simulated_purchase_allowed()
+    plan = BY_KEY.get(key)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    postcode_ids, _canonical, unmatched, unavailable = _resolve_choice(db, plan, localities)
+
+    row = _plan_row(db, plan)
+    now = _now()
+    payment = Payment(
+        user_id=user_id,
+        provider="SIMULATED",
+        provider_payment_id=f"SIM-{uuid.uuid4().hex[:16]}",
+        # The plan row is admin-managed: record its current price, not the code default.
+        amount_paise=row.price_paise,
+        currency="INR",
+        status="SUCCESS",
+        plan_id=row.id,
+        idempotency_key=uuid.uuid4().hex,
+        paid_at=now,
+    )
+    db.add(payment)
+    db.flush()
+
+    _activate(db, user_id, plan, postcode_ids, payment.id, now)
+
     result = status_for(db, user_id)
     result["transaction_id"] = payment.provider_payment_id
     result["amount_paise"] = plan.price_paise
     result["unmatched_localities"] = unmatched
     result["unavailable_localities"] = unavailable
     result["simulated"] = True
+    return result
+
+
+def activate_for_payment(db: Session, payment: Payment, plan: AgentPlan, localities: list[str]) -> dict:
+    """Activate an agent plan from a verified payment row (real payment flow).
+
+    The locality choice is re-validated here against the plan's limit — the
+    server decides what is grantable, never the client. Idempotent: an ACTIVE
+    subscription already tied to this payment returns the current status
+    (activated=False) without touching coverage again. The caller must hold
+    the payment row locked (FOR UPDATE) so a concurrent verify and webhook
+    cannot both activate."""
+    existing = (
+        db.query(Subscription)
+        # ANY subscription for this payment (even one later replaced/expired):
+        # a re-sent verify or webhook must never activate the same payment twice.
+        .filter(Subscription.payment_id == payment.id)
+        .first()
+    )
+    if existing is not None:
+        result = status_for(db, payment.user_id)
+        result["transaction_id"] = payment.provider_payment_id
+        result["amount_paise"] = payment.amount_paise
+        result["activated"] = False
+        return result
+    postcode_ids, _canonical, unmatched, unavailable = _resolve_choice(db, plan, localities)
+    now = _now()
+    _activate(db, payment.user_id, plan, postcode_ids, payment.id, now)
+    result = status_for(db, payment.user_id)
+    result["transaction_id"] = payment.provider_payment_id
+    result["amount_paise"] = payment.amount_paise
+    result["unmatched_localities"] = unmatched
+    result["unavailable_localities"] = unavailable
+    result["activated"] = True
     return result
 
 
@@ -519,6 +595,7 @@ def start_trial(db: Session, user_id: int, locality: str) -> dict:
     name = (locality or "").strip()
     if not name:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Choose an area.")
+    capabilities.ensure_compatible(db, user_id, "BROKER")
     if _active(db, user_id) is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent plan already active")
     used = (
@@ -562,6 +639,7 @@ def start_trial(db: Session, user_id: int, locality: str) -> dict:
         BrokerPostcodeAccessCurrent.broker_user_id == user_id
     ).delete(synchronize_session=False)
     _grant(db, user_id, user_id, postcode_ids, now, None, f"Agent free trial ({TRIAL.code})")
+    capabilities.claim_poster_type(db, user_id, "BROKER")
     users_roles.set_current_role(db, user_id, "BROKER")
     db.flush()
     return status_for(db, user_id)
@@ -592,49 +670,3 @@ def ensure_listing_in_plan(db: Session, user_id: int, listing_id: int) -> None:
             "is_trial": bool(active is not None and active[1].code == TRIAL.code),
         },
     )
-
-
-def grant_dealer_access(db: Session, user_id: int, dealer_app_id: str, payment_id: int, end) -> None:
-    """Give a dealer the area access included with their Dealer plan.
-
-    Areas start empty; the dealer picks them with add_localities (same
-    limit rules as agents). An active paid agent plan or an earlier dealer
-    access with MORE areas is kept untouched. The current role is not
-    changed: dealers post properties as OWNER.
-    """
-    access = DEALER_ACCESS.get(dealer_app_id)
-    if access is None:
-        return
-    current = _active(db, user_id)
-    if current is not None and current[1].locality_limit >= access.locality_limit and current[1].code != TRIAL.code:
-        return
-    row = _plan_row(db, access)
-    now = _now()
-    # Keep already-chosen areas: only the plan row changes, coverage stays
-    # (it is re-checked against the new limit on the next add).
-    (
-        db.query(Subscription)
-        .filter(
-            Subscription.user_id == user_id,
-            Subscription.status == "ACTIVE",
-            Subscription.plan_id.in_(db.query(Plan.id).filter(Plan.code.in_(CODES)).scalar_subquery()),
-        )
-        .update({Subscription.status: "EXPIRED"}, synchronize_session=False)
-    )
-    db.add(
-        Subscription(
-            user_id=user_id,
-            plan_id=row.id,
-            payment_id=payment_id,
-            start_date=now,
-            end_date=end,
-            status="ACTIVE",
-        )
-    )
-    db.flush()
-
-
-def has_dealer_access(db: Session, user_id: int) -> bool:
-    """True when the caller's active area plan came with a Dealer plan."""
-    active = _active(db, user_id)
-    return active is not None and active[1].code in DEALER_ACCESS_CODES

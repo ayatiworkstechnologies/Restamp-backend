@@ -19,7 +19,7 @@ from sqlalchemy import text
 
 from app import config, schemas
 from app.services import localities as loc_svc
-from tests.conftest import auth_header, fresh_pincode, register_phone
+from tests.conftest import grant_test_posting_plan, auth_header, fresh_pincode, register_phone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _n = {"i": 0}
@@ -105,6 +105,7 @@ def test_owner_pincode_fix_and_agent_add_locations_stay_active(client):
     c, session = client
     ho, _ = _user(c)
     assert c.post("/users/me/role", json={"role": "OWNER"}, headers=ho).status_code == 200
+    grant_test_posting_plan(c, ho)
     run = uuid.uuid4().hex[:5]
     name, pin, other = f"Activepet {run}", fresh_pincode(c), f"Otherpet {run}"
     loc_svc.load_master(session, [loc_svc.MasterRow(name, pin), loc_svc.MasterRow(other, fresh_pincode(c))])

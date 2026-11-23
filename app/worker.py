@@ -116,6 +116,133 @@ async def _worker_loop(stop_event: asyncio.Event) -> None:
     log.info("Auto-verification worker stopped")
 
 
+# --- Email outbox delivery (notification system Phase 3) -----------------------------
+# Runs beside the verification loop in the same process (no extra
+# infrastructure). services/email.process_outbox claims rows with
+# FOR UPDATE SKIP LOCKED and a PROCESSING lease, so several Uvicorn
+# processes may run this loop at once without ever sending a row twice, and
+# rows of a worker that died are picked up again after the lease. The blocking
+# provider call runs in a thread so the event loop keeps serving requests.
+EMAIL_INTERVAL_SECONDS = 15
+
+
+def _email_worker_disabled() -> bool:
+    """Runtime check (tests set RESTAMP_DISABLE_EMAIL_WORKER=1)."""
+    return os.environ.get("RESTAMP_DISABLE_EMAIL_WORKER", "0") == "1"
+
+
+async def _email_loop(stop_event: asyncio.Event) -> None:
+    from .services import email as email_svc
+
+    log.info("Email outbox worker started (interval=%ds)", EMAIL_INTERVAL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            await asyncio.to_thread(email_svc.process_outbox)
+        except Exception as exc:
+            log.error("Email outbox iteration failed: %s", type(exc).__name__)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=EMAIL_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    log.info("Email outbox worker stopped")
+
+
+# --- Push outbox delivery (notification system Phase 4) ------------------------------
+# Same contract as the email loop: services/push.process_outbox claims rows
+# with FOR UPDATE SKIP LOCKED and a PROCESSING lease, so several Uvicorn
+# processes may run this loop at once without ever sending a row twice. With
+# the default disabled provider the loop does nothing and no push endpoint is
+# contacted.
+PUSH_INTERVAL_SECONDS = 15
+
+
+def _push_worker_disabled() -> bool:
+    """Runtime check (tests set RESTAMP_DISABLE_PUSH_WORKER=1)."""
+    return os.environ.get("RESTAMP_DISABLE_PUSH_WORKER", "0") == "1"
+
+
+async def _push_loop(stop_event: asyncio.Event) -> None:
+    from .services import push as push_svc
+
+    log.info("Push outbox worker started (interval=%ds)", PUSH_INTERVAL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            await asyncio.to_thread(push_svc.process_outbox)
+            # Expo receipts: a ticket is not delivery (services/push.poll_receipts).
+            await asyncio.to_thread(push_svc.poll_receipts)
+        except Exception as exc:
+            log.error("Push outbox iteration failed: %s", type(exc).__name__)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=PUSH_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    log.info("Push outbox worker stopped")
+
+
+# --- Smart reminders (notification system Phase 4) -----------------------------------
+# services/reminders.run_scan scans due CONFIRMED visits (T-24h / T-1h) and
+# unanswered enquiries (2h/24h/72h) and queues reminder notifications whose
+# email/push twins are delivered by the loops above.
+REMINDERS_INTERVAL_SECONDS = 60
+
+
+def _reminders_worker_disabled() -> bool:
+    """Runtime check (tests set RESTAMP_DISABLE_REMINDER_WORKER=1)."""
+    return os.environ.get("RESTAMP_DISABLE_REMINDER_WORKER", "0") == "1"
+
+
+async def _reminders_loop(stop_event: asyncio.Event) -> None:
+    from .services import reminders as reminders_svc
+
+    log.info("Reminders worker started (interval=%ds)", REMINDERS_INTERVAL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            await asyncio.to_thread(reminders_svc.run_scan)
+        except Exception as exc:
+            log.error("Reminders iteration failed: %s", type(exc).__name__)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=REMINDERS_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    log.info("Reminders worker stopped")
+
+
+# --- M8: bounded cleanup of expired rate-limit windows ---------------------------
+RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = 3600
+
+
+def _rate_limit_cleanup_disabled() -> bool:
+    """Runtime check (RESTAMP_DISABLE_RATE_LIMIT_CLEANUP=1 turns it off)."""
+    return os.environ.get("RESTAMP_DISABLE_RATE_LIMIT_CLEANUP", "0") == "1"
+
+
+def _rate_limit_cleanup_once() -> int:
+    from .db import engine
+    from .services import rate_limit as rl_svc
+
+    with engine.connect() as conn:
+        return rl_svc.cleanup_expired_windows(conn)
+
+
+async def _rate_limit_cleanup_loop(stop_event: asyncio.Event) -> None:
+    """Hourly, bounded, never per request. Waits ONE interval before the first
+    run (so short-lived processes such as the test client never run it). A
+    failure is logged by type only and never affects rate limiting itself:
+    stale rows are merely kept until the next run."""
+    log.info("Rate-limit cleanup worker started (interval=%ds)", RATE_LIMIT_CLEANUP_INTERVAL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=RATE_LIMIT_CLEANUP_INTERVAL_SECONDS)
+            break  # stopping
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await asyncio.to_thread(_rate_limit_cleanup_once)
+        except Exception as exc:
+            log.error("Rate-limit cleanup failed: %s", type(exc).__name__)
+    log.info("Rate-limit cleanup worker stopped")
+
+
 @asynccontextmanager
 async def worker_lifespan():
     """Lifespan context manager for the background worker.
@@ -126,18 +253,34 @@ async def worker_lifespan():
             async with worker_lifespan():
                 yield
     """
+    stop_event = asyncio.Event()
+    tasks = []
     if _worker_disabled():
         log.info("Auto-verification worker disabled (RESTAMP_DISABLE_AUTO_VERIFY=1)")
-        yield
-        return
-
-    stop_event = asyncio.Event()
-    task = asyncio.create_task(_worker_loop(stop_event))
+    else:
+        tasks.append(asyncio.create_task(_worker_loop(stop_event)))
+    if _email_worker_disabled():
+        log.info("Email outbox worker disabled (RESTAMP_DISABLE_EMAIL_WORKER=1)")
+    else:
+        tasks.append(asyncio.create_task(_email_loop(stop_event)))
+    if _push_worker_disabled():
+        log.info("Push outbox worker disabled (RESTAMP_DISABLE_PUSH_WORKER=1)")
+    else:
+        tasks.append(asyncio.create_task(_push_loop(stop_event)))
+    if _reminders_worker_disabled():
+        log.info("Reminders worker disabled (RESTAMP_DISABLE_REMINDER_WORKER=1)")
+    else:
+        tasks.append(asyncio.create_task(_reminders_loop(stop_event)))
+    if _rate_limit_cleanup_disabled():
+        log.info("Rate-limit cleanup worker disabled (RESTAMP_DISABLE_RATE_LIMIT_CLEANUP=1)")
+    else:
+        tasks.append(asyncio.create_task(_rate_limit_cleanup_loop(stop_event)))
     try:
         yield
     finally:
         stop_event.set()
-        await task
+        for task in tasks:
+            await task
 
 
 def run_worker_once() -> int:

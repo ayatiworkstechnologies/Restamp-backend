@@ -22,12 +22,20 @@ from ..models import AdminAccount, AuthIdentity, RoleHistory, User, UserCurrentR
 USER_ROLES = ("BUYER", "OWNER", "BROKER")
 
 
-def create_user(db: Session, display_name: str, avatar_url: str | None = None) -> User:
-    user = User(display_name=display_name, avatar_url=avatar_url, status="active")
+def create_user(
+    db: Session, display_name: str, avatar_url: str | None = None, poster_type: str | None = None
+) -> User:
+    """Create the ONE canonical account. `poster_type` (OWNER/BROKER) is the
+    declared registration account type: it sets the exclusive poster type and
+    the starting mode, and grants no posting right (that needs a plan)."""
+    if poster_type not in (None, "OWNER", "BROKER"):
+        raise ValueError("invalid poster_type")
+    user = User(display_name=display_name, avatar_url=avatar_url, status="active", poster_type=poster_type)
     db.add(user)
     db.flush()  # assign id without committing (caller owns the transaction)
-    db.add(UserCurrentRole(user_id=user.id, role="BUYER"))
-    db.add(RoleHistory(user_id=user.id, role="BUYER"))
+    mode = poster_type or "BUYER"
+    db.add(UserCurrentRole(user_id=user.id, role=mode))
+    db.add(RoleHistory(user_id=user.id, role=mode))
     return user
 
 

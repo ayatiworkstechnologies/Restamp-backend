@@ -195,11 +195,12 @@ def test_wrong_role_cannot_view(client):
     h = auth_header(tok["access_token"])
     c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
 
+    # Phase 1 (approved): buyer capability exists in every mode.
     r = c.post(f"/buyer/viewed/{lid}", headers=h)
-    assert r.status_code == 403, r.text
+    assert r.status_code == 201, r.text
 
     r = c.get("/buyer/viewed", headers=h)
-    assert r.status_code == 403, r.text
+    assert r.status_code == 200, r.text
 
 
 def test_view_nonexistent_listing_404(client):
