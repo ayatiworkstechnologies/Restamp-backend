@@ -652,13 +652,73 @@ def is_valid_media_public_base_url(url: str | None, *, production: bool) -> bool
     return "." in host
 
 
+# Repository root (…/Restamp-backend): photos must never be written inside
+# the deployed source tree, where a redeploy or `git clean` could remove them.
+_REPO_ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+# Locations that are wiped on reboot/restart or are per-process private
+# (systemd PrivateTmp) — never persistent photo storage.
+_EPHEMERAL_ROOTS = ("/tmp", "/var/tmp", "/dev/shm", "/run", "/var/run",
+                    "/private/tmp", "/private/var/tmp", "/proc", "/sys", "/dev")
+
+
+def effective_media_root() -> str:
+    """The root storage.get_media_root() will use (env read per call)."""
+    return os.environ.get("RESTAMP_MEDIA_ROOT") or settings.MEDIA_ROOT
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def unsafe_media_root_reason(raw: str | None) -> str | None:
+    """Why ``raw`` cannot be production photo storage, or None when usable.
+
+    Requires an absolute path without '..' components that does not resolve
+    (symlinks included) to the filesystem root, a temporary/volatile
+    location, the system temp dir, or anywhere inside the repository.
+    """
+    value = (raw or "").strip()
+    if not value or not os.path.isabs(value):
+        return "must be an absolute path"
+    if ".." in value.replace("\\", "/").split("/"):
+        return "must not contain '..'"
+    resolved = os.path.realpath(value)
+    if resolved == "/":
+        return "must not be the filesystem root"
+    try:
+        import tempfile
+
+        temp_dirs = {os.path.realpath(tempfile.gettempdir())}
+    except Exception:  # pragma: no cover - gettempdir never fails in practice
+        temp_dirs = set()
+    for root in (*_EPHEMERAL_ROOTS, *temp_dirs):
+        if _within(resolved, os.path.realpath(root)) or _within(value, root):
+            return "must not be a temporary or volatile directory"
+    if _within(resolved, _REPO_ROOT) or _within(_REPO_ROOT, resolved):
+        return "must be outside the application repository"
+    return None
+
+
+def _running_on_render() -> bool:
+    # Render sets RENDER=true in every service environment.
+    return os.environ.get("RENDER", "").strip().lower() == "true"
+
+
+def _render_disk_acknowledged() -> bool:
+    return os.environ.get("RESTAMP_RENDER_PERSISTENT_DISK", "").strip() == "1"
+
+
 def validate_photo_storage_config(*, production: bool) -> None:
     """Refuse an unusable photo-storage configuration at startup.
 
     Every environment: RESTAMP_PHOTO_STORAGE must be "cloudinary" or
-    "local". Production + local: RESTAMP_MEDIA_PUBLIC_BASE_URL must be a
-    valid https base URL. Development + local with a base URL set: it must
-    at least be a valid http(s) base. Messages name settings, never values.
+    "local", the photo limits must parse, and "local" is refused on Render
+    without an acknowledged persistent disk. Production + disk storage:
+    RESTAMP_MEDIA_ROOT must be a persistent absolute directory outside the
+    repository (unsafe_media_root_reason). Production + local:
+    RESTAMP_MEDIA_PUBLIC_BASE_URL must be a valid https base URL.
+    Development + local with a base URL set: it must at least be a valid
+    http(s) base. Messages name settings, never values.
     """
     for setting, raw, limits in (
         ("RESTAMP_PHOTO_MAX_BYTES", settings.PHOTO_MAX_BYTES_RAW, PHOTO_MAX_BYTES_LIMITS),
@@ -677,6 +737,30 @@ def validate_photo_storage_config(*, production: bool) -> None:
         raise RuntimeError(
             "Invalid configuration: RESTAMP_PHOTO_STORAGE must be "
             "'cloudinary' or 'local'."
+        )
+    # Production disk storage is used in "local" mode, and also by the
+    # historical "cloudinary"-without-a-cloud fallback once a public base URL
+    # exists (without one, uploads fail closed before any write). Either way
+    # the root must be persistent, so validate it whenever disk is in play.
+    disk_in_play = mode == "local" or (
+        not settings.CLOUDINARY_CLOUD_NAME and bool(settings.MEDIA_PUBLIC_BASE_URL)
+    )
+    if production and disk_in_play:
+        reason = unsafe_media_root_reason(effective_media_root())
+        if reason:
+            raise RuntimeError(
+                "Invalid production configuration: RESTAMP_MEDIA_ROOT "
+                f"{reason}. Use a dedicated persistent directory such as "
+                "/var/www/restamp/uploads."
+            )
+    if mode == "local" and _running_on_render() and not _render_disk_acknowledged():
+        # Render's normal filesystem is wiped on every deploy/restart: photos
+        # would vanish while their DB rows remain. Only an explicitly mounted
+        # Render persistent disk may hold them (acknowledged by flag).
+        raise RuntimeError(
+            "Invalid configuration: RESTAMP_PHOTO_STORAGE=local on Render "
+            "requires a mounted persistent disk under RESTAMP_MEDIA_ROOT and "
+            "RESTAMP_RENDER_PERSISTENT_DISK=1; otherwise keep 'cloudinary'."
         )
     if mode != "local":
         return

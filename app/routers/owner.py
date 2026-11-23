@@ -39,7 +39,7 @@ from ..services import owner_listings as owner_svc
 from ..services import enquiries as enquiry_svc
 from ..services import visits as visit_svc
 from ..services import rate_limit as rl_svc
-from ..services import photo_storage
+from ..services import image_metadata, photo_storage
 from ..services import storage as storage_svc
 from ..services.media_urls import MAX_LISTING_PHOTOS
 
@@ -365,6 +365,11 @@ async def upload_listing_photo(
     # Real content check (magic bytes), whichever backend stores it: the
     # declared MIME/extension alone never decide what we accept.
     try:
+        storage_svc.validate_image_content(data, extension)
+        # Privacy: drop EXIF (GPS, device ids), XMP, IPTC and text metadata
+        # before the photo becomes public, keeping only the orientation tag.
+        # No decode/re-encode; fails closed (422) on an unwalkable structure.
+        data = image_metadata.strip_metadata(data, storage_svc.sniff_image_mime(data))
         storage_svc.validate_image_content(data, extension)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))

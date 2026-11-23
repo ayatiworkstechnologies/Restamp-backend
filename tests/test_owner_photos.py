@@ -18,15 +18,16 @@ PNG_1PX = base64.b64decode(
 
 
 def jpeg_bytes(width: int = 1, height: int = 1, pad: int = 128) -> bytes:
-    """Minimal structurally valid JPEG header (SOI, JFIF APP0, SOF0 carrying
-    the frame size, EOI) plus filler: enough for magic-byte sniffing and the
+    """Minimal structurally valid JPEG (SOI, JFIF APP0, SOF0 carrying the
+    frame size, SOS, filler scan bytes, EOI): enough for magic-byte sniffing and the
     header dimension check; never decoded."""
     return (
         b"\xff\xd8"
         + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
         + b"\xff\xc0\x00\x0b\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big")
         + b"\x01\x01\x11\x00"
-        + b"\xff\xd9" + b"0" * pad
+        + b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"  # SOS (1 component)
+        + b"0" * pad + b"\xff\xd9"
     )
 
 

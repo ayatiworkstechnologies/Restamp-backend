@@ -1,0 +1,66 @@
+# RESTAMP backend — systemd unit TEMPLATE
+#
+# Every <PLACEHOLDER> must be replaced with the value verified on the server
+# (see deploy/README.md §4). If a unit already runs the backend, do NOT
+# install this file over it: compare it and change only what §4 lists
+# (worker count, ReadWritePaths, ExecStart flags).
+#
+#   <SERVICE_USER> / <SERVICE_GROUP>  account the backend runs as
+#   <BACKEND_DIR>                     checkout, e.g. /var/www/restamp/Restamp-backend
+#   <VENV_DIR>                        virtualenv, e.g. <BACKEND_DIR>/.venv
+#   <ENV_FILE>                        root-owned env file (0640, group <SERVICE_GROUP>)
+#   <DB_CA_DIR>                       directory holding the Aiven ca.pem (read-only)
+
+[Unit]
+Description=RESTAMP FastAPI backend
+# The production database is Aiven MySQL (remote, TLS): no local mysql.service
+# dependency. Only wait for the network.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<SERVICE_USER>
+Group=<SERVICE_GROUP>
+WorkingDirectory=<BACKEND_DIR>
+EnvironmentFile=<ENV_FILE>
+# Files the backend creates (photos) are 0644 / dirs 0755 regardless of umask
+# (storage.py sets modes explicitly); keep a conservative umask for the rest.
+UMask=0027
+
+# ONE worker. app/worker.py starts the auto-verify, email, push, reminders
+# and rate-limit-cleanup loops inside EVERY Uvicorn process; several workers
+# would run each loop several times (duplicate emails/pushes). Scale only
+# after moving those loops to a single dedicated process.
+# Plain uvicorn (no uvloop/httptools: they are not in requirements.txt).
+# --proxy-headers trusts X-Forwarded-* only from the local Nginx.
+ExecStart=<VENV_DIR>/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Sandboxing. ProtectSystem=strict makes the filesystem read-only except
+# ReadWritePaths; the photo root MUST be listed or uploads fail (500).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+ReadWritePaths=/var/www/restamp/uploads
+ReadOnlyPaths=<DB_CA_DIR>
+
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

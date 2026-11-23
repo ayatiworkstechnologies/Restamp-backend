@@ -1,113 +1,75 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# RESTAMP Local Photo Storage Backup & Restore Script
-# Canonical Storage Root: /var/lib/restamp/property-photos/
+# RESTAMP property-photo backup / off-site copy / verify / restore.
+#
+#   backup               archive MEDIA_ROOT/listings + sha256 + manifest
+#   offsite <archive>    copy archive (+ .sha256, .manifest) to $OFFSITE_TARGET
+#   verify  <archive>    checksum + tar integrity
+#   restore <archive>    extract into a staging dir, then copy ONLY files that
+#                        are missing in MEDIA_ROOT (never overwrites/deletes)
+#
+# Configuration (environment; nothing secret is stored in this script):
+#   MEDIA_ROOT       default /var/www/restamp/uploads
+#   BACKUP_DIR       default /var/backups/restamp/photos   (LOCAL staging only)
+#   OFFSITE_TARGET   REQUIRED for `offsite`: an rsync destination on ANOTHER
+#                    machine/provider, e.g. backup@<HOST>:/srv/restamp-photos/
+#                    (SSH key auth), or use `rclone copy` to object storage
+#                    instead — see deploy/README.md §6.
+#   SERVICE_USER / SERVICE_GROUP   owner for restored files (restore only)
+#   KEEP_DAYS        local retention, default 7
+#
+# A local archive on the same disk is NOT a backup by itself; run `offsite`
+# after every `backup` (the cron example in the README does both).
 # ==============================================================================
 set -euo pipefail
 
-STORAGE_ROOT="/var/lib/restamp/property-photos"
-BACKUP_DIR="/var/backups/restamp/photos"
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+MEDIA_ROOT="${MEDIA_ROOT:-/var/www/restamp/uploads}"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/restamp/photos}"
+KEEP_DAYS="${KEEP_DAYS:-7}"
 
-usage() {
-    echo "Usage: $0 {backup|restore <archive_file>|verify <archive_file>}"
-    exit 1
-}
+usage() { echo "usage: $0 {backup|offsite <archive>|verify <archive>|restore <archive>}" >&2; exit 1; }
+[[ $# -ge 1 ]] || usage
 
-if [[ $# -lt 1 ]]; then
-    usage
-fi
-
-ACTION="$1"
-
-case "$ACTION" in
-    backup)
-        echo "=== Starting Photo Storage Backup ==="
-        mkdir -p "$BACKUP_DIR"
-        ARCHIVE_PATH="$BACKUP_DIR/property_photos_${TIMESTAMP}.tar.gz"
-        CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
-
-        echo "[INFO] Creating compressed archive: $ARCHIVE_PATH..."
-        # Backup using tar with atomic temporary file
-        tar -czf "${ARCHIVE_PATH}.tmp" -C "$STORAGE_ROOT" listings
-        mv "${ARCHIVE_PATH}.tmp" "$ARCHIVE_PATH"
-
-        echo "[INFO] Generating SHA-256 checksum..."
-        sha256sum "$ARCHIVE_PATH" | awk '{print $1}' > "$CHECKSUM_PATH"
-
-        SIZE_MB=$(du -m "$ARCHIVE_PATH" | cut -f1)
-        echo "[SUCCESS] Backup completed successfully. Size: ${SIZE_MB} MB"
-        echo "[INFO] Archive: $ARCHIVE_PATH"
-        echo "[INFO] Checksum: $(cat "$CHECKSUM_PATH")"
-
-        # Retain last 14 backups, remove older archives
-        echo "[INFO] Cleaning up archives older than 14 days..."
-        find "$BACKUP_DIR" -name "property_photos_*.tar.gz*" -mtime +14 -delete
-        ;;
-
-    verify)
-        if [[ $# -lt 2 ]]; then
-            echo "[ERROR] Archive file path required for verification." >&2
-            usage
-        fi
-        ARCHIVE="$2"
-        CHECKSUM_FILE="${ARCHIVE}.sha256"
-
-        if [[ ! -f "$ARCHIVE" ]]; then
-            echo "[ERROR] Archive file does not exist: $ARCHIVE" >&2
-            exit 1
-        fi
-
-        if [[ -f "$CHECKSUM_FILE" ]]; then
-            EXPECTED=$(cat "$CHECKSUM_FILE")
-            ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
-            if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-                echo "[ERROR] Checksum mismatch!" >&2
-                echo "Expected: $EXPECTED" >&2
-                echo "Actual:   $ACTUAL" >&2
-                exit 1
-            fi
-            echo "[INFO] Checksum verified: $ACTUAL"
-        fi
-
-        echo "[INFO] Testing archive integrity with tar..."
-        tar -tzf "$ARCHIVE" > /dev/null
-        echo "[SUCCESS] Archive integrity verified: $ARCHIVE"
-        ;;
-
-    restore)
-        if [[ $# -lt 2 ]]; then
-            echo "[ERROR] Archive file path required for restore." >&2
-            usage
-        fi
-        ARCHIVE="$2"
-
-        if [[ ! -f "$ARCHIVE" ]]; then
-            echo "[ERROR] Archive file does not exist: $ARCHIVE" >&2
-            exit 1
-        fi
-
-        echo "=== RESTORE WARNING ==="
-        echo "This operation will extract images from $ARCHIVE into $STORAGE_ROOT."
-        read -r -p "Are you sure you want to proceed? [y/N]: " CONFIRM
-        if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-            echo "[INFO] Restore aborted by user."
-            exit 0
-        fi
-
-        echo "[INFO] Extracting archive..."
-        tar -xzf "$ARCHIVE" -C "$STORAGE_ROOT"
-
-        echo "[INFO] Resetting directory permissions..."
-        chown -R restamp:restamp "$STORAGE_ROOT"
-        chmod 0750 "$STORAGE_ROOT" "$STORAGE_ROOT/listings"
-        find "$STORAGE_ROOT" -type d -exec chmod 0750 {} +
-        find "$STORAGE_ROOT" -type f -exec chmod 0644 {} +
-
-        echo "[SUCCESS] Restore completed successfully."
-        ;;
-
-    *)
-        usage
-        ;;
+case "$1" in
+backup)
+    install -d -m 0750 "$BACKUP_DIR"
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    archive="$BACKUP_DIR/property_photos_${ts}.tar.gz"
+    tar -czf "$archive.tmp" -C "$MEDIA_ROOT" listings
+    mv "$archive.tmp" "$archive"
+    sha256sum "$archive" | awk '{print $1}' > "$archive.sha256"
+    # Manifest: relative path + size, used to compare against property_media
+    # rows (public_id = local:<listing_id>/<uuid>.<ext>) after a restore.
+    (cd "$MEDIA_ROOT" && find listings -type f ! -name '.*' -printf '%P %s\n' | sort) > "$archive.manifest"
+    echo "[OK] $archive ($(du -h "$archive" | cut -f1), $(wc -l < "$archive.manifest") files)"
+    find "$BACKUP_DIR" -name 'property_photos_*' -mtime +"$KEEP_DAYS" -delete
+    echo "$archive"
+    ;;
+offsite)
+    [[ $# -ge 2 && -f "$2" ]] || usage
+    : "${OFFSITE_TARGET:?OFFSITE_TARGET is not set (must be another machine/provider)}"
+    rsync -a --partial "$2" "$2.sha256" "$2.manifest" "$OFFSITE_TARGET"
+    echo "[OK] copied $(basename "$2") to off-site target"
+    ;;
+verify)
+    [[ $# -ge 2 && -f "$2" ]] || usage
+    expected="$(cat "$2.sha256")"
+    actual="$(sha256sum "$2" | awk '{print $1}')"
+    [[ "$expected" == "$actual" ]] || { echo "[ERROR] checksum mismatch" >&2; exit 1; }
+    tar -tzf "$2" > /dev/null
+    echo "[OK] checksum and archive integrity verified"
+    ;;
+restore)
+    [[ $# -ge 2 && -f "$2" ]] || usage
+    : "${SERVICE_USER:?set SERVICE_USER}" "${SERVICE_GROUP:?set SERVICE_GROUP}"
+    "$0" verify "$2"
+    staging="$(mktemp -d "${BACKUP_DIR}/restore.XXXXXX")"
+    tar -xzf "$2" -C "$staging" --no-same-owner
+    # Copy only missing files; existing (possibly newer) files are untouched.
+    rsync -a --ignore-existing --chown="$SERVICE_USER:$SERVICE_GROUP" \
+          --chmod=D0755,F0644 "$staging/listings/" "$MEDIA_ROOT/listings/"
+    rm -rf "$staging"
+    echo "[OK] restore finished (missing files copied; nothing overwritten or deleted)"
+    ;;
+*) usage ;;
 esac

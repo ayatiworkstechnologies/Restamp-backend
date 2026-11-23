@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, fresh_pincode, make_postcode, register_phone
+from tests.conftest import grant_test_posting_plan, admin_verify, auth_header, fresh_pincode, make_postcode, paired_locality, register_phone
 
 
 def _setup_owner(client) -> tuple[dict, str]:
@@ -141,9 +141,11 @@ def test_owner_cannot_access_other_owner_listing(client):
         json={
             "title": "Owner A Villa",
             "price_rupees": 5000000,
-            "locality": "Whitefield",
+            # Free pincode + a locality unique to it: no reliance on rows that
+            # happen to exist in the test database.
+            "locality": "Whitefield Iso",
             "city": "Bengaluru",
-            "pincode": "600116",
+            "pincode": fresh_pincode(c),
         },
         headers=auth_header(token_a),
     )
@@ -532,7 +534,7 @@ def test_full_rent_create_persists_everywhere(client):
     c, session = client
     token = _setup_owner_with_phone(c, "+919876543271")
     body = {
-        "district": "Test District 271", "locality": "Test Nagar 271", "pincode": "600117",
+        "district": "Test District 271", "locality": "Test Nagar 271", "pincode": fresh_pincode(c),
         "sub_locality": "5th Avenue", "society_name": "Green Acres", "house_no": "Flat 402",
         "landmark": "Tower Park", "latitude": 13.0850, "longitude": 80.2101,
         "bedrooms": 2, "bathrooms": 2, "balconies": 2, "area_value": 1200,
@@ -715,15 +717,11 @@ def test_normalize_chennai_pincode_helper():
 def test_chennai_pincode_range_boundaries(client):
     c, session = client
     token = _setup_owner_with_phone(c, "+919876543281")
-    # Boundaries + interior (incl. 600089 Ramapuram) accepted. Each pin gets
-    # a unique locality: the resolver falls back to locality match before
-    # creating, so shared localities would read back a different pincode.
-    pin_localities = [
-        ("600001", "Parry's Corner"),
-        ("600089", "Ramapuram"),
-        ("600118", "Range Nagar R2"),
-        ("600040", "Anna Nagar"),
-    ]
+    # Boundaries + interior accepted. Each pin is paired with the locality
+    # that owns it in THIS test's session (created in the rolled-back
+    # transaction when unowned), so no pre-existing data is assumed.
+    pin_localities = [(pin, paired_locality(c, pin, "Range"))
+                      for pin in ("600001", "600089", "600118", "600040")]
     for idx, (pin, loc) in enumerate(pin_localities):
         r = _post_listing(c, token, f"Range Flat {idx}", pincode=pin,
                           locality=loc)
@@ -738,12 +736,13 @@ def test_chennai_pincode_range_boundaries(client):
     for idx, pin in enumerate(["600000", "600119", "600120", "600125", "600500", "560038"]):
         r = _post_listing(c, token, f"Range Reject {idx}", pincode=pin)
         assert r.status_code == 422, (pin, r.status_code, r.text)
-    # PATCH enforces the same rule on the same listing. 600089 belongs
-    # to "Ramapuram", so it is paired with that locality.
-    lid = _post_listing(c, token, "Range Patch Flat",
-                        locality="Oldwashermenpet", pincode="600021").json()["listing_id"]
+    # PATCH enforces the same rule on the same listing; 600089 is paired
+    # with whichever locality owns it in this session.
+    patch_pin = fresh_pincode(c)
+    lid = _post_listing(c, token, "Range Patch Flat", pincode=patch_pin,
+                        locality=paired_locality(c, patch_pin, "RangePatch")).json()["listing_id"]
     r = c.patch(f"/owner/listings/{lid}",
-                json={"locality": "Ramapuram", "pincode": "600089"},
+                json={"locality": dict(pin_localities)["600089"], "pincode": "600089"},
                 headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["pincode"] == "600089"

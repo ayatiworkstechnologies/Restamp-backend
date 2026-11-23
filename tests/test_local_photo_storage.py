@@ -544,6 +544,9 @@ def test_default_mode_still_uses_cloudinary_and_writes_no_file(client, monkeypat
 ])
 def test_photo_storage_startup_validation(monkeypatch, mode, base, production, ok):
     from app import config as config_module
+    # A persistent root, so these cases isolate the base-URL rule (the
+    # media-root rule has its own tests in test_photo_storage_hardening.py).
+    monkeypatch.setenv("RESTAMP_MEDIA_ROOT", "/var/www/restamp/uploads")
     monkeypatch.setattr(config_module.settings, "PHOTO_STORAGE", mode)
     monkeypatch.setattr(config_module.settings, "MEDIA_PUBLIC_BASE_URL", base)
     if ok:
@@ -560,6 +563,8 @@ def test_full_security_gate_refuses_local_production_without_base(monkeypatch):
     monkeypatch.setattr(config_module.settings, "ENV", "production")
     monkeypatch.setattr(config_module.settings, "PHOTO_STORAGE", "local")
     monkeypatch.setattr(config_module.settings, "MEDIA_PUBLIC_BASE_URL", "")
+    # Persistent root, so the base-URL rule is the one under test.
+    monkeypatch.setenv("RESTAMP_MEDIA_ROOT", "/var/www/restamp/uploads")
     with pytest.raises(RuntimeError, match="RESTAMP_MEDIA_PUBLIC_BASE_URL"):
         config_module.validate_security_config()
 
@@ -569,10 +574,14 @@ def test_full_security_gate_refuses_local_production_without_base(monkeypatch):
 # --------------------------------------------------------------------------
 
 def png_bytes(width: int, height: int) -> bytes:
-    """Create a minimal structurally valid PNG with arbitrary width/height."""
+    """Create a minimal structurally valid PNG with arbitrary width/height:
+    signature, IHDR, an (empty) IDAT and IEND — the full chunk sequence the
+    metadata stripper walks. Never decoded."""
     ihdr = b"IHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big") + b"\x08\x02\x00\x00\x00"
     crc = zlib.crc32(ihdr).to_bytes(4, "big")
-    return b"\x89PNG\r\n\x1a\n\x00\x00\x00\r" + ihdr + crc
+    idat = b"\x00\x00\x00\x00IDAT" + zlib.crc32(b"IDAT").to_bytes(4, "big")
+    iend = b"\x00\x00\x00\x00IEND" + zlib.crc32(b"IEND").to_bytes(4, "big")
+    return b"\x89PNG\r\n\x1a\n\x00\x00\x00\r" + ihdr + crc + idat + iend
 
 
 def webp_vp8(width: int, height: int) -> bytes:
@@ -688,6 +697,7 @@ def test_dimension_parsing_png_jpeg_webp():
 ])
 def test_photo_limit_startup_validation(monkeypatch, bytes_raw, dim_raw, valid):
     from app import config as config_module
+    monkeypatch.setenv("RESTAMP_MEDIA_ROOT", "/var/www/restamp/uploads")
     monkeypatch.setattr(config_module.settings, "PHOTO_STORAGE", "local")
     monkeypatch.setattr(config_module.settings, "MEDIA_PUBLIC_BASE_URL", "https://api.restamp.in")
     monkeypatch.setattr(config_module.settings, "PHOTO_MAX_BYTES_RAW", bytes_raw)

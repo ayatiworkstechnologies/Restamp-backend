@@ -312,6 +312,32 @@ def fresh_pincode(c) -> str:
     return _allocate_pincode(c.test_session)
 
 
+def paired_locality(c_or_session, pincode: str, tag: str = "") -> str:
+    """Locality name that owner listings must pair with ``pincode``.
+
+    Tests that need a SPECIFIC pincode (range boundaries, PATCH targets)
+    cannot invent a locality name: a pincode belongs to exactly one locality
+    (owner_listings.PINCODE_LOCALITY_MISMATCH). Rather than hard-coding names
+    that happen to exist in one shared database, this reads the pairing from
+    the test's own session and, when the pincode is unowned, creates the
+    location chain for it inside the test's rolled-back transaction. Never
+    modifies pre-existing rows.
+    """
+    from sqlalchemy import text as _text
+
+    session = getattr(c_or_session, "test_session", c_or_session)
+    row = session.execute(
+        _text("SELECT l.name FROM postcodes p JOIN localities l ON l.id = p.locality_id "
+              "WHERE p.pincode = :p"),
+        {"p": pincode},
+    ).fetchone()
+    if row is not None:
+        return row[0]
+    tag = f"{tag}{pincode}" if tag else f"Pair{pincode}"
+    make_postcode(session, tag, pincode=pincode)
+    return f"L1{tag}"
+
+
 def make_postcode(session, tag: str = "", pincode: str | None = None) -> int:
     """Insert the location chain down to a postcode; returns the postcode id.
 

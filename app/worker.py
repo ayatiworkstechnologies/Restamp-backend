@@ -243,6 +243,28 @@ async def _rate_limit_cleanup_loop(stop_event: asyncio.Event) -> None:
     log.info("Rate-limit cleanup worker stopped")
 
 
+def multi_worker_configured() -> bool:
+    """True when WEB_CONCURRENCY asks Uvicorn for more than one worker.
+
+    Uvicorn reads WEB_CONCURRENCY as its default --workers. Every worker
+    process runs every background loop below, so more than one worker means
+    duplicate auto-verification passes, emails, pushes and reminders. An
+    explicit --workers flag cannot be seen from inside the process; the
+    deployment template pins --workers 1 (deploy/systemd).
+    """
+    raw = os.environ.get("WEB_CONCURRENCY", "").strip()
+    return raw.isdigit() and int(raw) > 1
+
+
+def warn_if_multi_worker() -> None:
+    """Startup warning only (never refuses): behaviour is unchanged."""
+    if multi_worker_configured():
+        log.warning(
+            "WEB_CONCURRENCY > 1: background loops run once per worker process "
+            "(duplicate emails/pushes/reminders). Run a single Uvicorn worker."
+        )
+
+
 @asynccontextmanager
 async def worker_lifespan():
     """Lifespan context manager for the background worker.
@@ -255,6 +277,7 @@ async def worker_lifespan():
     """
     stop_event = asyncio.Event()
     tasks = []
+    warn_if_multi_worker()
     if _worker_disabled():
         log.info("Auto-verification worker disabled (RESTAMP_DISABLE_AUTO_VERIFY=1)")
     else:

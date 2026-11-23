@@ -51,6 +51,14 @@ services:
       - key: RESTAMP_CORS_ORIGINS
         value: "https://restamp.in,https://www.restamp.in,https://restamp-alpha.vercel.app,https://restamp-app.vercel.app"
 
+      # ── Property photo storage ─────────────────────────────────────────────
+      # RESTAMP_PHOTO_STORAGE is deliberately NOT set: Render uses the default
+      # "cloudinary". Render's filesystem is ephemeral (wiped on every deploy
+      # and restart), so never set RESTAMP_PHOTO_STORAGE=local here unless a
+      # Render persistent disk is mounted at RESTAMP_MEDIA_ROOT and verified;
+      # startup refuses local mode on Render without
+      # RESTAMP_RENDER_PERSISTENT_DISK=1. See deploy/README.md §10.
+
       # ── Google OAuth (optional) ──────────────────────────────────────────────
       - key: RESTAMP_GOOGLE_CLIENT_ID
         value: ""

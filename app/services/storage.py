@@ -72,6 +72,8 @@ _DIR_MODE = 0o755
 # The ONLY storage-name shape this module ever produces or accepts.
 _STORAGE_NAME_RE = re.compile(r"^([1-9][0-9]{0,19})/([0-9a-f]{32})\.(jpg|png|webp)$")
 _TMP_PREFIX = ".upload-"
+# Reservation retries when a concurrent delete removes the listing directory.
+_RESERVE_ATTEMPTS = 3
 
 
 # --------------------------------------------------------------------------
@@ -369,16 +371,29 @@ def save_listing_image(
     storage_name = f"{listing_id}/{uuid.uuid4().hex}{extension}"
     _check_storage_name(storage_name)
     listing_dir = ensure_listings_dir() / str(listing_id)
-    _mkdir(listing_dir)
-    final_path = _resolve_storage_path(storage_name)
 
     reserved = False
     tmp_path: str | None = None
+    final_path: Path | None = None
     try:
         # 1) Exclusive reservation of the final name: never overwrites.
-        fd = os.open(final_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(fd)
-        reserved = True
+        #    delete_stored_file() removes a listing directory once it is
+        #    empty, so a concurrent delete can rmdir it between our mkdir and
+        #    open (FileNotFoundError). Recreate and retry a bounded number of
+        #    times; once the reservation exists the directory is non-empty
+        #    and can no longer be removed underneath us.
+        for attempt in range(_RESERVE_ATTEMPTS):
+            _mkdir(listing_dir)
+            final_path = _resolve_storage_path(storage_name)
+            try:
+                fd = os.open(final_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileNotFoundError:
+                if attempt + 1 == _RESERVE_ATTEMPTS:
+                    raise
+                continue
+            os.close(fd)
+            reserved = True
+            break
         # 2) Bytes into a private temp file in the same directory/filesystem.
         tmp_fd, tmp_path = tempfile.mkstemp(prefix=_TMP_PREFIX, suffix=".tmp",
                                             dir=str(final_path.parent))

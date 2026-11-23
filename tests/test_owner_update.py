@@ -8,7 +8,7 @@ import io
 
 import pytest
 from sqlalchemy import text
-from tests.conftest import grant_test_posting_plan, auth_header, fresh_pincode, register_phone
+from tests.conftest import grant_test_posting_plan, auth_header, fresh_pincode, paired_locality, register_phone
 from tests.test_owner_photos import JPEG_BYTES, PNG_1PX, _mock_cloud
 
 
@@ -22,10 +22,14 @@ def _setup_owner_with_phone(client, phone: str) -> str:
 
 
 def _post_listing(client, token, title, **overrides):
+    # Self-contained location: a free pincode (no pre-existing owner) with a
+    # locality name unique to it, unless the caller overrides either.
+    pin = overrides.get("pincode") or fresh_pincode(client)
+    locality = overrides.get("locality") or paired_locality(client, pin, "Edit")
     payload = {
         "title": title, "transaction_type": "RENT", "property_type": "APARTMENT",
         "price_rupees": 25000, "price_period": "MONTHLY",
-        "locality": "Anna Nagar", "city": "Chennai", "pincode": "600040",
+        "locality": locality, "city": "Chennai", "pincode": pin,
         "bedrooms": 2, "contact_phone": "+919840100001",
         "rent_terms": {"security_deposit_rupees": 100000, "maintenance_rupees": 3000,
                        "maintenance_period": "Monthly", "is_negotiable": True,
@@ -351,10 +355,11 @@ def test_delete_photo_renumbers_cover_and_destroys_cloud(client, monkeypatch):
                       files={"file": (name, io.BytesIO(content), mime)},
                       data={"category": category}, headers=auth_header(token))
 
+    pin = fresh_pincode(c)
     payload = {"title": "Delete Photo Flat", "transaction_type": "RENT",
                "property_type": "APARTMENT", "price_rupees": 25000,
-               "price_period": "MONTHLY", "locality": "Anna Nagar",
-               "city": "Chennai", "pincode": "600040"}
+               "price_period": "MONTHLY", "locality": paired_locality(c, pin, "Photo"),
+               "city": "Chennai", "pincode": pin}
     lid = c.post("/owner/listings", json=payload,
                  headers=auth_header(token)).json()["listing_id"]
     first = _upload(lid, PNG_1PX, "a.png", "image/png", "Living Room").json()
@@ -382,10 +387,11 @@ def test_delete_photo_cloud_failure_still_succeeds_row_gone(client, monkeypatch)
     _mock_cloud(monkeypatch, calls)
     c, session = client
     token = _setup_owner_with_phone(c, "+919876543409")
+    pin = fresh_pincode(c)
     payload = {"title": "Cloud Fail Flat", "transaction_type": "RENT",
                "property_type": "APARTMENT", "price_rupees": 25000,
-               "price_period": "MONTHLY", "locality": "Anna Nagar",
-               "city": "Chennai", "pincode": "600040"}
+               "price_period": "MONTHLY", "locality": paired_locality(c, pin, "Photo"),
+               "city": "Chennai", "pincode": pin}
     lid = c.post("/owner/listings", json=payload,
                  headers=auth_header(token)).json()["listing_id"]
     r = c.post(f"/owner/listings/{lid}/photos",
@@ -530,7 +536,8 @@ def test_service_boundary_rejects_out_of_range_pincode(client):
     assert session.execute(text(
         "SELECT COUNT(*) FROM property_listings")).fetchone()[0] == before
     # Direct update with an out-of-range pincode fails; omitted preserves.
-    lid = _post_listing(c, token, "Svc Update Flat").json()["listing_id"]
+    svc_resp = _post_listing(c, token, "Svc Update Flat").json()
+    lid, svc_pin = svc_resp["listing_id"], svc_resp["pincode"]
     sp = session.begin_nested()
     try:
         with pytest.raises(ValueError, match="600001 and 600118"):
@@ -538,13 +545,13 @@ def test_service_boundary_rejects_out_of_range_pincode(client):
     finally:
         sp.rollback()
     assert c.get(f"/owner/listings/{lid}",
-                 headers=auth_header(token)).json()["pincode"] == "600040"
+                 headers=auth_header(token)).json()["pincode"] == svc_pin
     # In-range direct service update still works (trimmed, string kept).
     sp = session.begin_nested()
     try:
         listing, _ = svc.update_owner_listing(
             session, owner_id, lid,
-            {"locality": "Ramapuram", "pincode": " 600089 "})
+            {"locality": paired_locality(session, "600089", "Svc"), "pincode": " 600089 "})
         assert listing is not None
     finally:
         sp.rollback()
