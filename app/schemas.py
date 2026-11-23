@@ -595,11 +595,31 @@ class VisitListingSnapshot(EnquiryListingSnapshot):
     city: str | None = None
 
 
+class VisitActionsOut(BaseModel):
+    """What the AUTHENTICATED viewer may do with this visit right now,
+    computed server-side from the visit status, the viewer's side (the
+    stored buyer vs the stored owner — a dealer acting as owner is the owner
+    side) and whether the lead is closed, using the same rule table that
+    authorises PATCH /buyer|owner/visits/{id}. Each flag maps to exactly one
+    PATCH status: can_confirm -> CONFIRMED, can_reject -> REJECTED (Phase 5
+    PENDING), can_decline -> DECLINED (legacy REQUESTED/PROPOSED),
+    can_cancel -> CANCELLED, can_complete -> COMPLETED. All false for
+    terminal statuses and closed leads; repeating the current status is
+    never advertised. A display hint only: the server re-checks every PATCH."""
+
+    can_confirm: bool
+    can_reject: bool
+    can_decline: bool
+    can_cancel: bool
+    can_complete: bool
+
+
 class VisitOut(BaseModel):
     """One scheduled viewing. No phone numbers. Names (D6) are the buyer's
     chosen name and the owner's public name — null when there is none, never
     phone-based. rescheduled_at (explicit UTC) is set when the time changes
-    and cleared when the status changes; `note` is visible to both parties."""
+    and cleared when the status changes; `note` is visible to both parties.
+    `actions` is specific to the authenticated viewer (see VisitActionsOut)."""
 
     id: int
     property_listing_id: int
@@ -618,6 +638,7 @@ class VisitOut(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     rescheduled_at: datetime | None = None
+    actions: VisitActionsOut
 
 
 class VisitsResponse(BaseModel):

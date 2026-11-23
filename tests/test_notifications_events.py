@@ -143,6 +143,12 @@ def test_owner_reply_notifies_buyer_once_per_stored_reply(client):
     owner_id, oh, buyer_id, bh, lid = _pair(c)
     c.post("/buyer/enquiries", json={"property_listing_id": lid, "message": "Hi"}, headers=bh)
     eid = _enquiry_id(session, buyer_id, lid)
+    # M9: a poster may send a phone number only after the buyer unlocked this
+    # listing's contact, so record that unlock (authoritative row, no side
+    # effects) to keep testing that the notification never carries the number.
+    session.execute(text("INSERT INTO property_contact_unlocks (user_id, property_listing_id, source, unlocked_at) "
+                         "VALUES (:u, :l, 'FREE', UTC_TIMESTAMP())"), {"u": buyer_id, "l": lid})
+    session.flush()
     r = c.post(f"/owner/leads/{eid}/messages", json={"message": "Call me on 9876543210"}, headers=oh)
     assert r.status_code == 201, r.text
     r = c.post(f"/owner/leads/{eid}/messages", json={"message": "Call me on 9876543210"}, headers=oh)

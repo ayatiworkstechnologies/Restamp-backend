@@ -16,8 +16,16 @@ Actor rules (enforced here, never in the frontend):
   time is a new proposal (reject or cancel, then create another).
 - Same-state repeats are idempotent no-ops (no write, no notification).
   Anything else raises ValueError (-> 422).
-- Legacy rows created before Phase 5 (REQUESTED / PROPOSED) follow the same
-  rules as PENDING; DECLINED stays a valid terminal state for them.
+- Legacy rows created before Phase 5 (REQUESTED / PROPOSED; never created
+  any more) keep the agreement they were made under. Authority comes from
+  the STATUS, never from the initiator column:
+  * REQUESTED (a buyer's request awaiting the owner) -> CONFIRMED /
+    DECLINED: owner only; -> CANCELLED: either party.
+  * PROPOSED (a time awaiting the BUYER's acceptance: an owner proposal or
+    an owner counter-proposal, which kept initiator=BUYER) -> CONFIRMED /
+    DECLINED: buyer only; -> CANCELLED: either party.
+  * REJECTED is a Phase 5 outcome and is refused for legacy rows (they are
+    declined with DECLINED). CONFIRMED / terminal rules are shared.
 
 Creation rules: the listing must be VERIFIED + AVAILABLE with consistent
 dual ownership columns; scheduled_at must be in the future; buyers cannot
@@ -181,14 +189,47 @@ def _consistent_owner_id(db: Session, listing: PropertyListing) -> int:
     return physical.user_id
 
 
-def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
-    """VisitOut dicts for a page of visits: names, listing details and
-    locations in batched reads (no per-row queries)."""
+_VIEWERS = ("buyer", "owner")
+
+
+def _closed_lead_map(db: Session, visits: list[PropertyVisit]) -> dict[tuple[int, int, int], bool]:
+    """(listing, buyer, owner) -> lead closed?, for a page of visits in ONE
+    query (no per-visit lookup). Same rule as _lead_closed: the newest
+    enquiry for the listing + buyer + owner decides; no enquiry = not closed.
+    Errors propagate (never guessed as 'open')."""
+    keys = {(int(v.property_listing_id), int(v.buyer_user_id), int(v.owner_user_id)) for v in visits}
+    if not keys:
+        return {}
+    rows = (
+        db.query(Enquiry.id, Enquiry.property_listing_id, Enquiry.buyer_user_id, Enquiry.owner_user_id,
+                 Enquiry.status)
+        .filter(
+            Enquiry.property_listing_id.in_(sorted({k[0] for k in keys})),
+            Enquiry.buyer_user_id.in_(sorted({k[1] for k in keys})),
+        )
+        .order_by(Enquiry.id)
+        .all()
+    )
+    newest: dict[tuple[int, int, int], str] = {}
+    for _eid, lid, bid, oid, st in rows:  # ascending id: the last one seen is the newest
+        newest[(int(lid), int(bid), int(oid))] = st
+    return {k: newest.get(k) == "CLOSED" for k in keys}
+
+
+def _snapshots(db: Session, visits: list[PropertyVisit], viewer: str) -> list[dict]:
+    """VisitOut dicts for a page of visits, as seen by `viewer` ("buyer" or
+    "owner": the side the authenticated caller is on, decided by the
+    endpoint's scope check, never by the initiator column). Names, listing
+    details, locations and lead state come from batched reads (no per-row
+    queries). Required: a response can never be built without its viewer."""
     from .enquiries import _listing_info, safe_display_names
 
+    if viewer not in _VIEWERS:
+        raise ValueError("unknown viewer")
     info = _listing_info(db, [v.property_listing_id for v in visits])
     names = safe_display_names(db, [u for v in visits for u in (v.buyer_user_id, v.owner_user_id)])
     roles = _requester_roles(db, [v.id for v in visits])
+    closed = _closed_lead_map(db, visits)
     out = []
     for visit in visits:
         li = info[int(visit.property_listing_id)]
@@ -216,6 +257,11 @@ def _snapshots(db: Session, visits: list[PropertyVisit]) -> list[dict]:
             "created_at": _utc_out(visit.created_at),
             "updated_at": _utc_out(visit.updated_at),
             "rescheduled_at": _utc_out(visit.rescheduled_at),
+            "actions": visit_actions(
+                visit.status, viewer,
+                lead_closed=closed[(int(visit.property_listing_id), int(visit.buyer_user_id),
+                                    int(visit.owner_user_id))],
+            ),
         })
     return out
 
@@ -241,8 +287,8 @@ def _requester_roles(db: Session, visit_ids: list[int]) -> dict[int, str]:
     return out
 
 
-def _snapshot(db: Session, visit: PropertyVisit) -> dict:
-    return _snapshots(db, [visit])[0]
+def _snapshot(db: Session, visit: PropertyVisit, viewer: str) -> dict:
+    return _snapshots(db, [visit], viewer)[0]
 
 
 def create_buyer_visit(
@@ -293,7 +339,7 @@ def create_buyer_visit(
         dedupe_key=f"visit:{visit.id}:REQUESTED",
     )
     db.refresh(visit)
-    return _snapshot(db, visit)
+    return _snapshot(db, visit, "buyer")
 
 
 def _buyer_has_relationship(db: Session, listing_id: int, buyer_id: int) -> bool:
@@ -389,6 +435,12 @@ def create_owner_visit(
         db, listing_id, buyer_user_id, initiator="OWNER"
     ):
         raise ValueError("A visit is already active for this buyer on this listing")
+    if note:
+        # M9: no contact details in a proposal note to a buyer who has not
+        # unlocked THIS listing. Read-only; refusal (422) happens before the
+        # visit row or its notification exists.
+        from . import contact_guard
+        contact_guard.ensure_allowed(db, buyer_user_id, listing_id, note)
     visit = PropertyVisit(
         property_listing_id=listing_id,
         buyer_user_id=buyer_user_id,
@@ -409,7 +461,7 @@ def create_owner_visit(
         dedupe_key=f"visit:{visit.id}:PROPOSED",
     )
     db.refresh(visit)
-    return _snapshot(db, visit)
+    return _snapshot(db, visit, "owner")
 
 
 def list_buyer_visits(
@@ -427,14 +479,14 @@ def list_buyer_visits(
         .limit(page_size)
         .all()
     )
-    return _snapshots(db, rows), total
+    return _snapshots(db, rows, "buyer"), total
 
 
 def get_buyer_visit(db: Session, buyer_id: int, visit_id: int) -> dict:
     visit = db.get(PropertyVisit, visit_id)
     if visit is None or visit.buyer_user_id != buyer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return _snapshot(db, visit)
+    return _snapshot(db, visit, "buyer")
 
 
 def list_owner_visits(
@@ -472,14 +524,14 @@ def list_owner_visits(
         .limit(page_size)
         .all()
     )
-    return _snapshots(db, rows), total
+    return _snapshots(db, rows, "owner"), total
 
 
 def get_owner_visit(db: Session, owner_id: int, visit_id: int) -> dict:
     visit = db.get(PropertyVisit, visit_id)
     if visit is None or visit.owner_user_id != owner_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return _snapshot(db, visit)
+    return _snapshot(db, visit, "owner")
 
 
 # Allowed (status, actor) moves. "either" = the visit's buyer or owner;
@@ -491,14 +543,15 @@ _ALLOWED = {
     ("PENDING", "CONFIRMED"): ("owner",),
     ("PENDING", "REJECTED"): ("owner",),
     ("PENDING", "CANCELLED"): ("either",),
-    # Legacy rows (created before Phase 5) follow the same authority.
+    # Legacy rows (created before Phase 5) keep their original agreement, by
+    # STATUS (never by initiator). REQUESTED awaits the owner; PROPOSED awaits
+    # the buyer even when initiator=BUYER (an owner counter-proposal). No
+    # REJECTED for legacy rows: they are declined with DECLINED.
     ("REQUESTED", "CONFIRMED"): ("owner",),
-    ("REQUESTED", "REJECTED"): ("owner",),
     ("REQUESTED", "DECLINED"): ("owner",),
     ("REQUESTED", "CANCELLED"): ("either",),
-    ("PROPOSED", "CONFIRMED"): ("owner",),
-    ("PROPOSED", "REJECTED"): ("owner",),
-    ("PROPOSED", "DECLINED"): ("owner",),
+    ("PROPOSED", "CONFIRMED"): ("buyer",),
+    ("PROPOSED", "DECLINED"): ("buyer",),
     ("PROPOSED", "CANCELLED"): ("either",),
     # Confirmed: schedule immutable; it can only end.
     ("CONFIRMED", "CONFIRMED"): ("either",),
@@ -514,10 +567,56 @@ _ALLOWED = {
 _NOTIFIED_STATUSES = ("CONFIRMED", "REJECTED", "DECLINED", "CANCELLED")
 
 
+def _authority(from_status: str, to_status: str) -> tuple[str, ...] | None:
+    """Who may move a visit from `from_status` to `to_status` (None = the
+    move does not exist). The ONLY reader of _ALLOWED."""
+    return _ALLOWED.get((from_status, to_status))
+
+
+def _side_may(from_status: str, to_status: str, actor: str) -> bool:
+    """Whether `actor` ("buyer"/"owner") may make that move. Shared by
+    transition_visit (enforcement) and visit_actions (advertising), so the
+    advertised actions can never drift from what PATCH accepts."""
+    allowed = _authority(from_status, to_status)
+    return allowed is not None and ("either" in allowed or actor in allowed)
+
+
+# Viewer action flag -> the PATCH status it performs (one flag per status).
+_ACTION_TARGETS = (
+    ("can_confirm", "CONFIRMED"),
+    ("can_reject", "REJECTED"),
+    ("can_decline", "DECLINED"),
+    ("can_cancel", "CANCELLED"),
+    ("can_complete", "COMPLETED"),
+)
+
+
+def visit_actions(status: str, viewer: str, *, lead_closed: bool) -> dict[str, bool]:
+    """The actions `viewer` ("buyer"/"owner") may take on a visit in
+    `status` right now. A flag is true only when transition_visit would
+    perform that status change for this side: never on a closed lead (every
+    change is refused there), never for repeating the current status (an
+    idempotent no-op, not an action), so terminal statuses expose none."""
+    if viewer not in _VIEWERS:
+        raise ValueError("unknown viewer")
+    return {
+        flag: (not lead_closed) and target != status and _side_may(status, target, viewer)
+        for flag, target in _ACTION_TARGETS
+    }
+
+
 def _is_proposer(visit: PropertyVisit, actor: str) -> bool:
-    """The party that submitted the visit: the buyer for a buyer request,
-    the poster for a poster proposal (from the stored initiator, never the
-    client)."""
+    """The party whose proposal the visit currently is (stored data only,
+    never the client).
+
+    Legacy statuses decide by STATUS: REQUESTED is the buyer's request;
+    PROPOSED is the owner's time, including an owner counter-proposal that
+    kept initiator=BUYER, so the buyer is never told they "proposed" it.
+    PENDING keeps the Phase 5 rule: the stored initiator."""
+    if visit.status == "REQUESTED":
+        return actor == "buyer"
+    if visit.status == "PROPOSED":
+        return actor == "owner"
     return (actor == "buyer" and visit.initiator == "BUYER") or (
         actor == "owner" and visit.initiator == "OWNER"
     )
@@ -565,13 +664,13 @@ def transition_visit(
     if to_status is None:  # pragma: no cover - the request schema requires a field
         raise ValueError("status is required")
 
-    allowed = _ALLOWED.get((original_status, to_status))
+    allowed = _authority(original_status, to_status)
     if allowed is None:
         raise ValueError(f"Cannot move visit from {original_status} to {to_status}")
-    if "either" not in allowed and actor not in allowed:
+    if not _side_may(original_status, to_status, actor):
         raise ValueError(f"Only the {allowed[0]} may move visit from {original_status} to {to_status}")
     if to_status == original_status:
-        return _snapshot(db, visit)  # idempotent repeat: nothing written
+        return _snapshot(db, visit, actor)  # idempotent repeat: nothing written
 
     visit.status = to_status
     visit.rescheduled_at = None  # a status change ends the "Rescheduled" display state
@@ -580,7 +679,7 @@ def transition_visit(
     if to_status in _NOTIFIED_STATUSES:
         _notify_other_party(db, visit, actor, actor_id)
     db.refresh(visit)
-    return _snapshot(db, visit)
+    return _snapshot(db, visit, actor)  # actions for the NEW status
 
 
 def _notify_other_party(db: Session, visit: PropertyVisit, actor: str, actor_id: int) -> None:

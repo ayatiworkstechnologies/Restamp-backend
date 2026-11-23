@@ -6,7 +6,12 @@ authenticated route). Authorization: role-agnostic but strictly user-scoped —
 every query filters on the caller's id; another user's notification is a 404
 (identical to a missing one, so existence never leaks). No endpoint accepts a
 recipient/user id. `audience` is a display filter for the app's current mode,
-never an authorization input. GETs never write; POST/DELETE commit only after
+never an authorization input. It may be repeated (`?audience=BUYER&audience=OWNER`)
+to select the union of several audiences; omitted = every audience; one value
+behaves exactly as before. Each value must be BUYER, OWNER or ACCOUNT
+(anything else, including a comma-joined `BUYER,OWNER`, is a 422). Every value
+is honoured (never only the last), and list, unread count and read-all apply
+the identical filter. GETs never write; POST/DELETE commit only after
 the service call succeeded.
 """
 from __future__ import annotations
@@ -26,7 +31,7 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 def list_my_notifications(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
-    audience: schemas.NotificationAudience | None = Query(default=None),
+    audience: list[schemas.NotificationAudience] | None = Query(default=None),
     category: schemas.NotificationCategory | None = Query(default=None),
     unread_only: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
@@ -46,7 +51,7 @@ def list_my_notifications(
 def my_unread_count(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
-    audience: schemas.NotificationAudience | None = Query(default=None),
+    audience: list[schemas.NotificationAudience] | None = Query(default=None),
 ):
     return schemas.NotificationUnreadCountOut(
         unread_count=notification_svc.unread_count(db, int(user.id), audience)
@@ -57,9 +62,10 @@ def my_unread_count(
 def mark_all_my_notifications_read(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
-    audience: schemas.NotificationAudience | None = Query(default=None),
+    audience: list[schemas.NotificationAudience] | None = Query(default=None),
 ):
-    """Marks the caller's unread notifications read (optionally one audience)."""
+    """Marks the caller's unread notifications read (optionally only the
+    requested audience set; same `audience` semantics as the list)."""
     updated = notification_svc.mark_all_read(db, int(user.id), audience)
     db.commit()
     return schemas.NotificationsReadAllOut(

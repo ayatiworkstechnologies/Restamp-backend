@@ -5,6 +5,7 @@ Database passwords come from RESTAMP_DATABASE_URL; the JWT secret from RESTAMP_J
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -59,6 +60,26 @@ DOTENV_LOADED_KEYS = _load_local_dotenv()
 
 def _get(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
+
+
+def _resolve_proxy_trust() -> tuple[bool, bool]:
+    """(trusted, conflict) for forwarded client IPs (M8).
+
+    RESTAMP_TRUST_PROXY is the canonical setting; RESTAMP_CHAT_TRUST_PROXY
+    (the original Reva-only name) is a backward-compatible alias, so an
+    existing deployment keeps working. Only the exact value "1" trusts the
+    proxy. When BOTH are set and disagree, the result fails safe: the
+    forwarded header is NOT trusted and `conflict` is reported, which
+    production startup refuses (validate_security_config).
+    """
+    canonical = os.environ.get("RESTAMP_TRUST_PROXY")
+    legacy = os.environ.get("RESTAMP_CHAT_TRUST_PROXY")
+    values = [v.strip() == "1" for v in (canonical, legacy) if v is not None]
+    if not values:
+        return False, False
+    if len(values) == 2 and values[0] != values[1]:
+        return False, True
+    return values[0], False
 
 
 def _get_int(name: str, default: int) -> int:
@@ -140,6 +161,26 @@ class Settings:
     # beyond these two values.
     MEDIA_ROOT: str = _get("RESTAMP_MEDIA_ROOT", "/tmp/restamp-media")
     MEDIA_URL_PREFIX: str = "/media"
+
+    # Where NEW property-photo uploads go: "cloudinary" (default, unchanged
+    # behaviour) or "local" (server disk under MEDIA_ROOT, served at
+    # MEDIA_URL_PREFIX). Existing rows are never migrated: each row's own
+    # public_id ("local:" prefix or a Cloudinary id) decides how it is
+    # deleted, so Cloudinary credentials stay required for legacy photos.
+    # Any other value is refused at startup (validate_security_config).
+    PHOTO_STORAGE: str = _get("RESTAMP_PHOTO_STORAGE", "cloudinary").strip().lower()
+    # Absolute public base URL that local photo URLs are built from, e.g.
+    # "https://api.restamp.in" -> https://api.restamp.in/media/<id>/<file>.
+    # REQUIRED (https) for local mode in production: request.base_url is
+    # never used there, because behind Nginx it is the internal upstream
+    # (http://127.0.0.1:8000) and would be stored permanently in the DB.
+    MEDIA_PUBLIC_BASE_URL: str = _get("RESTAMP_MEDIA_PUBLIC_BASE_URL", "").strip()
+    # Per-photo limits for EVERY upload (local and Cloudinary). Kept as raw
+    # strings: parse_photo_limit() parses them, startup refuses a malformed
+    # or out-of-range value (validate_photo_storage_config), and unset keeps
+    # the historical defaults (10 MB; 10000 px per side).
+    PHOTO_MAX_BYTES_RAW: str = _get("RESTAMP_PHOTO_MAX_BYTES", "")
+    PHOTO_MAX_DIMENSION_RAW: str = _get("RESTAMP_PHOTO_MAX_DIMENSION", "")
 
     # Cloudinary (property photo uploads). Credentials come ONLY from the
     # environment — never hardcoded, never logged. When CLOUDINARY_CLOUD_NAME
@@ -240,14 +281,25 @@ class Settings:
     AGARAM_API_KEY: str = _get("AGARAM_API_KEY", _get("HF_TOKEN", _get("HUGGINGFACE_API_KEY", "")))
     AGARAM_ENABLED: bool = _get("AGARAM_ENABLED", "1") == "1"
 
-    # Public Reva assistant hardening. CHAT_TRUST_PROXY: "1" ONLY where a reverse
-    # proxy forwards the real client IP in X-Forwarded-For (Render). When on,
-    # the client IP for rate limiting is the RIGHTMOST forwarded entry (the
-    # one the trusted proxy appended); the header is otherwise ignored, so a
-    # caller can never spoof a different bucket by sending the header itself.
-    # (Named CHAT_* — the bare TRUST_PROXY name is a removed-setting lock in
-    # test_otp_core_contract.py and must stay removed.)
-    CHAT_TRUST_PROXY: bool = _get("RESTAMP_CHAT_TRUST_PROXY", "0") == "1"
+    # Forwarded client IP trust for ALL rate limiting (Reva + M8 communication
+    # limits). RESTAMP_TRUST_PROXY=1 (canonical; RESTAMP_CHAT_TRUST_PROXY is a
+    # backward-compatible alias) ONLY where a reverse proxy we control forwards
+    # the real client IP in X-Forwarded-For (Render). When on, the client IP is
+    # the RIGHTMOST forwarded entry (the one the trusted proxy appended); the
+    # header is otherwise ignored, so a caller can never spoof a different
+    # bucket by sending the header itself. Conflicting values fail safe (not
+    # trusted) and production refuses to start. The attribute is deliberately
+    # NOT named TRUST_PROXY: that bare attribute is a removed-OTP-setting lock
+    # in test_otp_core_contract.py. Independent of every OTP gate.
+    FORWARDED_IP_TRUSTED, TRUST_PROXY_CONFLICT = _resolve_proxy_trust()
+    # M8: secret for HMAC-SHA256 rate-limit keys (IPs are never stored in
+    # plaintext in communication buckets). Dedicated: must differ from the JWT
+    # secret. Required (>=32 chars, not a placeholder) in production; local
+    # development uses a fixed non-production key (see services/rate_limit).
+    RATE_LIMIT_KEY: str = _get("RESTAMP_RATE_LIMIT_KEY", "")
+    # Local test runs only: "1" disables the M8 communication limits (the test
+    # client shares one IP across the whole suite). IGNORED in production.
+    COMM_RATE_LIMITS_DISABLED: bool = _get("RESTAMP_COMM_RATE_LIMITS_DISABLED", "0") == "1"
     # Fixed-window limits (per bucket) for the AI endpoints. Shared storage
     # (rate_limit_windows) means one instance's hits count everywhere, so
     # these numbers are totals, not per-instance. 0 disables a limit (never
@@ -537,6 +589,111 @@ def is_valid_localhost_origin(origin: str) -> bool:
     return True
 
 
+PHOTO_STORAGE_MODES = ("cloudinary", "local")
+
+# (default, minimum, maximum) for the per-photo limits. The byte default is
+# the historical 10 MB contract; the upper bounds stop a typo from turning
+# the upload endpoint into a memory sink (uploads are buffered in memory).
+PHOTO_MAX_BYTES_LIMITS = (10 * 1024 * 1024, 64 * 1024, 50 * 1024 * 1024)
+# 10000 px per side covers current phone cameras (e.g. 8160x6120) while
+# refusing decompression-bomb dimensions that would choke client decoders.
+PHOTO_MAX_DIMENSION_LIMITS = (10000, 256, 30000)
+
+
+def parse_photo_limit(raw: str | None, limits: tuple[int, int, int]) -> int:
+    """Parse one photo-limit setting: unset/blank -> default; otherwise a
+    plain decimal integer within [min, max], else ValueError."""
+    default, low, high = limits
+    value = (raw or "").strip()
+    if not value:
+        return default
+    if not value.isdigit() or not value.isascii():
+        raise ValueError("not a positive integer")
+    number = int(value)
+    if number < low or number > high:
+        raise ValueError("out of range")
+    return number
+
+
+def is_valid_media_public_base_url(url: str | None, *, production: bool) -> bool:
+    """True when ``url`` is a usable base for public photo URLs.
+
+    Production: an https URL with a real public host (no credentials, no
+    query/fragment, no IP literal, no localhost/.local/.internal) and an
+    optional path, without a trailing "/". Development additionally allows
+    http and loopback/LAN hosts so local devices can load photos.
+    """
+    raw = (url or "").strip()
+    if not raw or raw.endswith("/") or any(ord(ch) <= 0x20 for ch in raw) or "\\" in raw:
+        return False
+    try:
+        parts = urlsplit(raw)
+        parts.port  # noqa: B018 — raises ValueError for a malformed port
+    except ValueError:
+        return False
+    if parts.query or parts.fragment or "?" in raw or "#" in raw:
+        return False
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        return False
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+    if not production:
+        return parts.scheme in ("http", "https")
+    if parts.scheme != "https":
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False  # IP literal: never a stable public media origin
+    except ValueError:
+        pass
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".localdomain")):
+        return False
+    return "." in host
+
+
+def validate_photo_storage_config(*, production: bool) -> None:
+    """Refuse an unusable photo-storage configuration at startup.
+
+    Every environment: RESTAMP_PHOTO_STORAGE must be "cloudinary" or
+    "local". Production + local: RESTAMP_MEDIA_PUBLIC_BASE_URL must be a
+    valid https base URL. Development + local with a base URL set: it must
+    at least be a valid http(s) base. Messages name settings, never values.
+    """
+    for setting, raw, limits in (
+        ("RESTAMP_PHOTO_MAX_BYTES", settings.PHOTO_MAX_BYTES_RAW, PHOTO_MAX_BYTES_LIMITS),
+        ("RESTAMP_PHOTO_MAX_DIMENSION", settings.PHOTO_MAX_DIMENSION_RAW,
+         PHOTO_MAX_DIMENSION_LIMITS),
+    ):
+        try:
+            parse_photo_limit(raw, limits)
+        except ValueError:
+            raise RuntimeError(
+                f"Invalid configuration: {setting} must be an integer between "
+                f"{limits[1]} and {limits[2]}."
+            ) from None
+    mode = (settings.PHOTO_STORAGE or "").strip().lower()
+    if mode not in PHOTO_STORAGE_MODES:
+        raise RuntimeError(
+            "Invalid configuration: RESTAMP_PHOTO_STORAGE must be "
+            "'cloudinary' or 'local'."
+        )
+    if mode != "local":
+        return
+    base = settings.MEDIA_PUBLIC_BASE_URL
+    if production and not is_valid_media_public_base_url(base, production=True):
+        raise RuntimeError(
+            "Invalid production configuration: RESTAMP_PHOTO_STORAGE=local "
+            "requires RESTAMP_MEDIA_PUBLIC_BASE_URL to be an absolute https "
+            "URL with a public host and no trailing slash."
+        )
+    if not production and base and not is_valid_media_public_base_url(base, production=False):
+        raise RuntimeError(
+            "Invalid configuration: RESTAMP_MEDIA_PUBLIC_BASE_URL must be an "
+            "absolute http(s) URL with no trailing slash."
+        )
+
+
 def validate_security_config() -> None:
     """Fail fast with non-sensitive errors when the configuration is unsafe.
 
@@ -588,6 +745,7 @@ def validate_security_config() -> None:
             "production (or prod/staging) for deployments, local (or "
             "development/dev/test) for development."
         )
+    validate_photo_storage_config(production=env in _PROD_ENVS)
     if env in _DEV_ENVS:
         if not _is_local_database_url(settings.DATABASE_URL):
             raise RuntimeError(
@@ -607,6 +765,32 @@ def validate_security_config() -> None:
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_JWT_SECRET must be "
             "set to a strong random value at least 32 characters long."
+        )
+    # M8: rate-limit keys are HMAC-SHA256 of the client IP with a DEDICATED
+    # secret. Without a strong one, keys could not be derived (no plaintext
+    # fallback exists), so refuse to boot. Setting names only, never values.
+    if not is_jwt_secret_strong(settings.RATE_LIMIT_KEY):
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_RATE_LIMIT_KEY must be "
+            "set to a strong random value at least 32 characters long."
+        )
+    if settings.RATE_LIMIT_KEY == settings.JWT_SECRET:
+        raise RuntimeError(
+            "Insecure production configuration: RESTAMP_RATE_LIMIT_KEY must be "
+            "a dedicated secret, different from RESTAMP_JWT_SECRET."
+        )
+    if settings.TRUST_PROXY_CONFLICT:
+        raise RuntimeError(
+            "Unsafe production configuration: RESTAMP_TRUST_PROXY and "
+            "RESTAMP_CHAT_TRUST_PROXY disagree; set only RESTAMP_TRUST_PROXY."
+        )
+    if settings.COMM_RATE_LIMITS_DISABLED:
+        # Fail safe rather than refuse: production IGNORES this local-test
+        # switch (services.rate_limit.comm_limit enforces the limits whenever
+        # is_production()), so it can never disable them here. Say so.
+        _log.warning(
+            "RESTAMP_COMM_RATE_LIMITS_DISABLED is set but ignored in production: "
+            "communication rate limits are always enforced."
         )
     if os.environ.get("RESTAMP_OTP_DISPLAY_MODE", "").strip() == "1":
         # Obsolete flag from the removed display-mode OTP: it is inert
@@ -700,12 +884,21 @@ def validate_security_config() -> None:
     # Warn loudly at startup so the trade-off is visible, naming settings
     # only (never values).
     if not settings.CLOUDINARY_CLOUD_NAME:
-        _log.warning(
-            "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
-            "is empty; listing photo uploads will fall back to local-disk storage "
-            "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
-            "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
-        )
+        if settings.PHOTO_STORAGE == "local":
+            # New uploads go to disk; Cloudinary is only needed to destroy
+            # legacy Cloudinary photos when an owner removes them.
+            _log.warning(
+                "CLOUDINARY_CLOUD_NAME is empty: removing legacy Cloudinary "
+                "listing photos will leave their Cloudinary assets in place."
+            )
+        else:
+            _log.warning(
+                "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
+                "is empty; listing photo uploads will fall back to local-disk storage "
+                "under RESTAMP_MEDIA_ROOT. Set RESTAMP_PHOTO_STORAGE=local with "
+                "RESTAMP_MEDIA_PUBLIC_BASE_URL for server storage, or configure "
+                "CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET."
+            )
     if is_staging():
         # The fixed testing OTP is ALWAYS active in staging (there is no
         # flag): anyone who can reach this backend can log in as any phone
@@ -740,12 +933,21 @@ def validate_security_config() -> None:
     # Warn loudly at startup so the trade-off is visible, naming settings
     # only (never values).
     if not settings.CLOUDINARY_CLOUD_NAME:
-        _log.warning(
-            "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
-            "is empty; listing photo uploads will fall back to local-disk storage "
-            "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
-            "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
-        )
+        if settings.PHOTO_STORAGE == "local":
+            # New uploads go to disk; Cloudinary is only needed to destroy
+            # legacy Cloudinary photos when an owner removes them.
+            _log.warning(
+                "CLOUDINARY_CLOUD_NAME is empty: removing legacy Cloudinary "
+                "listing photos will leave their Cloudinary assets in place."
+            )
+        else:
+            _log.warning(
+                "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
+                "is empty; listing photo uploads will fall back to local-disk storage "
+                "under RESTAMP_MEDIA_ROOT. Set RESTAMP_PHOTO_STORAGE=local with "
+                "RESTAMP_MEDIA_PUBLIC_BASE_URL for server storage, or configure "
+                "CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET."
+            )
     if not all(is_valid_production_origin(o) for o in cors):
         raise RuntimeError(
             "Insecure production configuration: RESTAMP_CORS_ORIGINS must contain "
@@ -786,12 +988,21 @@ def validate_security_config() -> None:
     # Warn loudly at startup so the trade-off is visible, naming settings
     # only (never values).
     if not settings.CLOUDINARY_CLOUD_NAME:
-        _log.warning(
-            "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
-            "is empty; listing photo uploads will fall back to local-disk storage "
-            "(ephemeral across restarts). Configure CLOUDINARY_CLOUD_NAME/"
-            "CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET for persistent uploads."
-        )
+        if settings.PHOTO_STORAGE == "local":
+            # New uploads go to disk; Cloudinary is only needed to destroy
+            # legacy Cloudinary photos when an owner removes them.
+            _log.warning(
+                "CLOUDINARY_CLOUD_NAME is empty: removing legacy Cloudinary "
+                "listing photos will leave their Cloudinary assets in place."
+            )
+        else:
+            _log.warning(
+                "Production media storage not fully configured: CLOUDINARY_CLOUD_NAME "
+                "is empty; listing photo uploads will fall back to local-disk storage "
+                "under RESTAMP_MEDIA_ROOT. Set RESTAMP_PHOTO_STORAGE=local with "
+                "RESTAMP_MEDIA_PUBLIC_BASE_URL for server storage, or configure "
+                "CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET."
+            )
     if (settings.DEV_MEDIA_URL_PREFIXES or "").strip():
         # Not fatal: the media-URL validator ignores it in production, so
         # production validation is unchanged. Warn so the stray setting is

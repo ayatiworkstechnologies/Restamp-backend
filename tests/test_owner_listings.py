@@ -718,9 +718,15 @@ def test_chennai_pincode_range_boundaries(client):
     # Boundaries + interior (incl. 600089 Ramapuram) accepted. Each pin gets
     # a unique locality: the resolver falls back to locality match before
     # creating, so shared localities would read back a different pincode.
-    for idx, pin in enumerate(["600001", "600089", "600118", "600040"]):
+    pin_localities = [
+        ("600001", "Parry's Corner"),
+        ("600089", "Ramapuram"),
+        ("600118", "Range Nagar R2"),
+        ("600040", "Anna Nagar"),
+    ]
+    for idx, (pin, loc) in enumerate(pin_localities):
         r = _post_listing(c, token, f"Range Flat {idx}", pincode=pin,
-                          locality=f"Range Nagar R{idx}")
+                          locality=loc)
         assert r.status_code == 201, (pin, r.status_code, r.text)
         assert r.json()["pincode"] == pin
     # Out-of-range six-digit pincodes rejected (schema-level, unbypassable
@@ -732,12 +738,12 @@ def test_chennai_pincode_range_boundaries(client):
     for idx, pin in enumerate(["600000", "600119", "600120", "600125", "600500", "560038"]):
         r = _post_listing(c, token, f"Range Reject {idx}", pincode=pin)
         assert r.status_code == 422, (pin, r.status_code, r.text)
-    # PATCH enforces the same rule on the same listing. 600089 now belongs
-    # to "Range Nagar R1" (created above), so it is paired with that locality.
+    # PATCH enforces the same rule on the same listing. 600089 belongs
+    # to "Ramapuram", so it is paired with that locality.
     lid = _post_listing(c, token, "Range Patch Flat",
-                        locality="Range Patch Nagar").json()["listing_id"]
+                        locality="Oldwashermenpet", pincode="600021").json()["listing_id"]
     r = c.patch(f"/owner/listings/{lid}",
-                json={"locality": "Range Nagar R1", "pincode": "600089"},
+                json={"locality": "Ramapuram", "pincode": "600089"},
                 headers=auth_header(token))
     assert r.status_code == 200, r.text
     assert r.json()["pincode"] == "600089"

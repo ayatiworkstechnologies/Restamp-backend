@@ -29,6 +29,13 @@ os.environ["RESTAMP_CHAT_RPM_PER_USER"] = "0"
 os.environ["RESTAMP_CHAT_RPH_PER_IP"] = "0"
 os.environ["RESTAMP_CHAT_RPH_PER_USER"] = "0"
 os.environ["RESTAMP_TRANSCRIBE_PER_HOUR_PER_IP"] = "0"
+# M8 communication limits: same reason (one shared client IP). Disabled for the
+# general suite (production ignores the switch); test_rate_limit_m8.py re-enables
+# them per test. A stable
+# non-production HMAC key so production-config tests pass the M8 startup check.
+os.environ["RESTAMP_COMM_RATE_LIMITS_DISABLED"] = "1"
+os.environ["RESTAMP_DISABLE_RATE_LIMIT_CLEANUP"] = "1"
+os.environ.setdefault("RESTAMP_RATE_LIMIT_KEY", "m8-test-rate-limit-key-0123456789abcdefghij")
 # Development-only approved photo-URL prefix used by test fixtures (ignored in
 # production; see app/services/media_urls.py). Every other host is rejected.
 os.environ["RESTAMP_DEV_MEDIA_URL_PREFIXES"] = "https://t.test/"

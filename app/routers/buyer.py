@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ from ..services import visits as visit_svc
 from ..services import viewed as viewed_svc
 from ..services import users_roles
 from ..services import agent_plans as agent_plan_svc
+from ..services import rate_limit as rl_svc
 
 router = APIRouter(prefix="/buyer", tags=["buyer"])
 
@@ -116,10 +117,14 @@ def get_similar(
 
 @router.post("/listings/{listing_id}/contact", response_model=schemas.ListingContactRevealOut)
 def reveal_listing_contact(
+    request: Request,
     listing_id: int,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
 ):
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "listing_contact", buyer_id, request)
     # Buyer-plan lead quota: a NEW property beyond the plan's limit is
     # refused with 402 BUYER_PLAN_REQUIRED before anything is revealed.
     # The 402 carries only the last 4 digits of the owner's number (teaser);
@@ -235,10 +240,14 @@ def subscribe_buyer_plan(
 
 @router.post("/enquiries", response_model=schemas.EnquiryOut, status_code=201)
 def create_buyer_enquiry(
+    request: Request,
     body: schemas.EnquiryCreate,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
 ):
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "enquiry_create", buyer_id, request)
     if body.property_listing_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     # The sender's role (BUYER or BROKER) is recorded on a new lead so the
@@ -322,6 +331,7 @@ def unsave_buyer_listing(
 
 @router.post("/visits", response_model=schemas.VisitOut, status_code=201)
 def schedule_buyer_visit(
+    request: Request,
     body: schemas.VisitCreate,
     db: Session = Depends(get_db),
     buyer_id: int = Depends(require_buyer_or_agent),
@@ -334,6 +344,9 @@ def schedule_buyer_visit(
     when the owner has closed the buyer's lead on it ("Lead is closed" —
     a new enquiry opens a fresh lead).
     """
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "buyer_visit_create", buyer_id, request)
     if body.property_listing_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     role = _agent_area_gate(db, buyer_id, body.property_listing_id)
@@ -374,6 +387,7 @@ def get_buyer_visit(
 
 @router.patch("/visits/{visit_id}", response_model=schemas.VisitOut)
 def update_buyer_visit(
+    request: Request,
     visit_id: int,
     body: schemas.VisitUpdate,
     db: Session = Depends(get_db),
@@ -383,6 +397,9 @@ def update_buyer_visit(
     under strict Phase 5. 404 when not owned, 422 for any other status, any
     time/note edit, or a visit whose lead the owner has closed ("Lead is
     closed")."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "buyer_visit_status", buyer_id, request)
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(

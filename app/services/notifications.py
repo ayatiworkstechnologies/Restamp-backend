@@ -45,6 +45,7 @@ the fixed `type` (never stored, never a screen name or path).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -408,14 +409,38 @@ def _items(db: Session, rows: list[Notification]) -> list[dict]:
     ]
 
 
-def _visible(db: Session, user_id: int, audience: str | None = None):
+AudienceFilter = str | Sequence[str] | None
+
+
+def _audience_set(audience: AudienceFilter) -> tuple[str, ...] | None:
+    """None/empty = every audience; one value or several = their union,
+    de-duplicated (a repeated value can never duplicate rows or inflate a
+    count: each row has exactly one audience and is matched against a set).
+    Unknown values are a programming error here (the router validates them
+    against schemas.NotificationAudience and answers 422 first)."""
+    if audience is None:
+        return None
+    values = (audience,) if isinstance(audience, str) else tuple(audience)
+    if not values:
+        return None
+    unknown = [a for a in values if a not in AUDIENCES]
+    if unknown:
+        raise ValueError("unknown notification audience")
+    return tuple(sorted(set(values)))
+
+
+def _visible(db: Session, user_id: int, audience: AudienceFilter = None):
+    """The caller's own undeleted rows, optionally limited to an audience
+    set. The single filter behind list, unread count and mark-all-read, so
+    all three always use identical audience semantics."""
     q = db.query(Notification).filter(Notification.user_id == user_id, Notification.deleted_at.is_(None))
-    if audience is not None:
-        q = q.filter(Notification.audience == audience)
+    audiences = _audience_set(audience)
+    if audiences is not None:
+        q = q.filter(Notification.audience.in_(audiences))
     return q
 
 
-def unread_count(db: Session, user_id: int, audience: str | None = None) -> int:
+def unread_count(db: Session, user_id: int, audience: AudienceFilter = None) -> int:
     return int(
         _visible(db, user_id, audience)
         .filter(Notification.read_at.is_(None))
@@ -430,7 +455,7 @@ def list_notifications(
     user_id: int,
     page: int,
     page_size: int,
-    audience: str | None = None,
+    audience: AudienceFilter = None,
     category: str | None = None,
     unread_only: bool = False,
 ) -> tuple[list[dict], int, int]:
@@ -462,9 +487,10 @@ def mark_read(db: Session, user_id: int, notification_id: int) -> dict:
     return _items(db, [row])[0]
 
 
-def mark_all_read(db: Session, user_id: int, audience: str | None = None) -> int:
-    """Marks every unread, undeleted row of the caller (optionally one
-    audience) read. Returns how many changed. Flushes."""
+def mark_all_read(db: Session, user_id: int, audience: AudienceFilter = None) -> int:
+    """Marks every unread, undeleted row of the caller (optionally limited to
+    one audience or a set of audiences) read. Returns how many changed.
+    Flushes."""
     updated = (
         _visible(db, user_id, audience)
         .filter(Notification.read_at.is_(None))

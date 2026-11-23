@@ -207,6 +207,42 @@ async def _reminders_loop(stop_event: asyncio.Event) -> None:
     log.info("Reminders worker stopped")
 
 
+# --- M8: bounded cleanup of expired rate-limit windows ---------------------------
+RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = 3600
+
+
+def _rate_limit_cleanup_disabled() -> bool:
+    """Runtime check (RESTAMP_DISABLE_RATE_LIMIT_CLEANUP=1 turns it off)."""
+    return os.environ.get("RESTAMP_DISABLE_RATE_LIMIT_CLEANUP", "0") == "1"
+
+
+def _rate_limit_cleanup_once() -> int:
+    from .db import engine
+    from .services import rate_limit as rl_svc
+
+    with engine.connect() as conn:
+        return rl_svc.cleanup_expired_windows(conn)
+
+
+async def _rate_limit_cleanup_loop(stop_event: asyncio.Event) -> None:
+    """Hourly, bounded, never per request. Waits ONE interval before the first
+    run (so short-lived processes such as the test client never run it). A
+    failure is logged by type only and never affects rate limiting itself:
+    stale rows are merely kept until the next run."""
+    log.info("Rate-limit cleanup worker started (interval=%ds)", RATE_LIMIT_CLEANUP_INTERVAL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=RATE_LIMIT_CLEANUP_INTERVAL_SECONDS)
+            break  # stopping
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await asyncio.to_thread(_rate_limit_cleanup_once)
+        except Exception as exc:
+            log.error("Rate-limit cleanup failed: %s", type(exc).__name__)
+    log.info("Rate-limit cleanup worker stopped")
+
+
 @asynccontextmanager
 async def worker_lifespan():
     """Lifespan context manager for the background worker.
@@ -235,6 +271,10 @@ async def worker_lifespan():
         log.info("Reminders worker disabled (RESTAMP_DISABLE_REMINDER_WORKER=1)")
     else:
         tasks.append(asyncio.create_task(_reminders_loop(stop_event)))
+    if _rate_limit_cleanup_disabled():
+        log.info("Rate-limit cleanup worker disabled (RESTAMP_DISABLE_RATE_LIMIT_CLEANUP=1)")
+    else:
+        tasks.append(asyncio.create_task(_rate_limit_cleanup_loop(stop_event)))
     try:
         yield
     finally:

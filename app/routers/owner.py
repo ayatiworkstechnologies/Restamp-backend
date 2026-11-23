@@ -22,6 +22,8 @@ No schema changes; all writes use existing property_listings / physical_properti
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy.orm import Session
 from typing import Literal
@@ -36,11 +38,13 @@ from ..services import subscriptions as sub_svc
 from ..services import owner_listings as owner_svc
 from ..services import enquiries as enquiry_svc
 from ..services import visits as visit_svc
+from ..services import rate_limit as rl_svc
 from ..services import photo_storage
 from ..services import storage as storage_svc
 from ..services.media_urls import MAX_LISTING_PHOTOS
 
 router = APIRouter(prefix="/owner", tags=["owner"])
+log = logging.getLogger("restamp.owner")
 
 
 @router.post("/listings", response_model=schemas.OwnerListingOut, status_code=201)
@@ -227,6 +231,7 @@ def get_my_lead(
 
 @router.post("/leads/{lead_id}/messages", response_model=schemas.EnquiryMessageOut, status_code=201)
 def reply_to_my_lead(
+    request: Request,
     lead_id: int,
     body: schemas.OwnerMessageIn,
     response: Response,
@@ -242,6 +247,9 @@ def reply_to_my_lead(
     the lead is not the caller's, 422 for a closed lead or an empty/over-long
     message, 429 when the per-thread message limit is reached. Private notes
     are never part of a thread."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "lead_message", owner_id, request)
     message, created = enquiry_svc.reply_as_owner(db, owner_id, lead_id, body.message)
     db.commit()
     if not created:
@@ -251,6 +259,7 @@ def reply_to_my_lead(
 
 @router.post("/leads/{lead_id}/contact", response_model=schemas.ContactRevealOut)
 def reveal_my_lead_contact(
+    request: Request,
     lead_id: int,
     db: Session = Depends(get_db),
     owner_id: int = Depends(require_poster),
@@ -261,6 +270,9 @@ def reveal_my_lead_contact(
     404 "Not found" unless the lead and its listing are the caller's; 404
     "Contact not available" when the buyer has no phone on file. Lead list
     and detail responses stay phone-free."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "lead_contact", owner_id, request)
     phone = enquiry_svc.reveal_buyer_contact(db, owner_id, lead_id)
     db.commit()
     return schemas.ContactRevealOut(phone=phone)
@@ -336,27 +348,40 @@ async def upload_listing_photo(
     # Stream with a hard cap (MIME validated above; never trust the filename).
     chunks: list[bytes] = []
     total = 0
+    max_bytes = storage_svc.max_image_bytes()  # RESTAMP_PHOTO_MAX_BYTES
     while True:
-        chunk = await file.read(storage_svc.MAX_IMAGE_BYTES // 10 or 65536)
+        chunk = await file.read(max(max_bytes // 10, 65536))
         if not chunk:
             break
         total += len(chunk)
-        if total > storage_svc.MAX_IMAGE_BYTES:
+        if total > max_bytes:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                                detail="Image exceeds 10 MB")
+                                detail=storage_svc.size_exceeded_detail())
         chunks.append(chunk)
     data = b"".join(chunks)
     if not data:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Empty file")
 
+    # Real content check (magic bytes), whichever backend stores it: the
+    # declared MIME/extension alone never decide what we accept.
+    try:
+        storage_svc.validate_image_content(data, extension)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
     mime = file.content_type.split(";")[0].strip().lower()
-    is_local = not bool(settings.CLOUDINARY_CLOUD_NAME)
+    # RESTAMP_PHOTO_STORAGE selects the backend for NEW photos only; the
+    # stored public_id ("local:" or Cloudinary) later drives deletion.
+    is_local = storage_svc.uploads_use_local_storage()
     try:
         if is_local:
+            # Resolve the public base BEFORE writing so a misconfigured
+            # production process never leaves an orphan file behind. Never
+            # request.base_url in production (internal upstream behind Nginx).
+            base_url = storage_svc.public_base_url(str(request.base_url))
             storage_name, byte_size = storage_svc.save_listing_image(listing_id, data, extension)
-            base_url = str(request.base_url).rstrip("/")
             secure_url = f"{base_url}{settings.MEDIA_URL_PREFIX}/{storage_name}"
-            public_id = f"local:{storage_name}"
+            public_id = f"{storage_svc.LOCAL_PREFIX}{storage_name}"
         else:
             secure_url, public_id, byte_size = photo_storage.upload_listing_image(
                 listing_id, data, extension, mime
@@ -364,6 +389,7 @@ async def upload_listing_photo(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except OSError:
+        log.warning("listing photo storage failed")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Upload failed")
 
     try:
@@ -378,26 +404,17 @@ async def upload_listing_photo(
         db.commit()
         db.refresh(media)
     except HTTPException:
-        if is_local:
-            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
-        else:
-            photo_storage.delete_uploaded_image(public_id)
+        storage_svc.delete_photo(public_id)
         db.rollback()
         raise
     except ValueError as e:
         # Gallery cap reached by a concurrent upload: drop the orphan, 422.
-        if is_local:
-            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
-        else:
-            photo_storage.delete_uploaded_image(public_id)
+        storage_svc.delete_photo(public_id)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception:
         # DB failure after the upload landed: destroy the orphan, persist nothing.
-        if is_local:
-            storage_svc.delete_stored_file(public_id.split("local:", 1)[1])
-        else:
-            photo_storage.delete_uploaded_image(public_id)
+        storage_svc.delete_photo(public_id)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Upload failed")
 
@@ -456,14 +473,12 @@ def update_listing(
     except ValueError as e:
         sp.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-    # Best-effort Cloudinary cleanup for implicitly removed gallery rows:
-    # the DB commit already succeeded, so a storage failure must never fail
-    # the request — at worst an orphaned asset remains (documented).
+    # Best-effort storage cleanup for implicitly removed gallery rows, routed
+    # by each row's own public_id (local: -> disk, else Cloudinary). The DB
+    # commit already succeeded, so a storage failure must never fail the
+    # request — at worst an orphaned asset remains (documented).
     for public_id in removed_public_ids:
-        try:
-            photo_storage.delete_uploaded_image(public_id)
-        except Exception:
-            pass
+        storage_svc.delete_photo(public_id)
     card = owner_svc.get_owner_listing(db, owner_id, listing.id)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error")
@@ -657,7 +672,8 @@ def delete_listing_photo(
     """Remove one gallery photo from the caller's own listing.
 
     The media row is deleted and siblings renumbered (cover stays index 0);
-    the Cloudinary asset is destroyed best-effort after the DB commit.
+    the stored file (server disk for ``local:`` ids, Cloudinary otherwise) is
+    removed best-effort after the DB commit.
     Returns 404 when the listing/photo does not belong to the caller.
     """
     # Restricted (paid) poster operation: needs the current paid Owner/Dealer
@@ -676,11 +692,9 @@ def delete_listing_photo(
     except Exception:
         sp.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Delete failed")
-    if public_id:
-        try:
-            photo_storage.delete_uploaded_image(public_id)
-        except Exception:
-            pass
+    # Routed by storage source: local: ids remove the server file, other ids
+    # destroy the legacy Cloudinary asset. Never raises (row already gone).
+    storage_svc.delete_photo(public_id)
     return None
 
 
@@ -813,6 +827,7 @@ def delete_draft(
 
 @router.post("/visits", response_model=schemas.VisitOut, status_code=201)
 def propose_owner_visit(
+    request: Request,
     body: schemas.OwnerVisitCreate,
     db: Session = Depends(get_db),
     owner_id: int = Depends(require_poster),
@@ -826,6 +841,9 @@ def propose_owner_visit(
     not live ("Visits can only be scheduled on a live listing"), or a buyer
     whose lead the owner has closed ("Lead is closed").
     """
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "owner_visit_create", owner_id, request)
     if body.property_listing_id <= 0 or body.buyer_user_id <= 0:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid request")
     try:
@@ -868,6 +886,7 @@ def get_my_visit(
 
 @router.patch("/visits/{visit_id}", response_model=schemas.VisitOut)
 def update_my_visit(
+    request: Request,
     visit_id: int,
     body: schemas.VisitUpdate,
     db: Session = Depends(get_db),
@@ -877,6 +896,9 @@ def update_my_visit(
     or complete a confirmed one (strict Phase 5). 404 when the visit is not
     on the caller's property; 422 for invalid moves, any time/note edit,
     or a visit whose lead is closed ("Lead is closed")."""
+    # M8: communication rate limit FIRST (it commits the session; nothing
+    # of this endpoint's own work may be pending yet).
+    rl_svc.comm_limit(db, "owner_visit_status", owner_id, request)
     sp = db.begin_nested()
     try:
         visit = visit_svc.transition_visit(

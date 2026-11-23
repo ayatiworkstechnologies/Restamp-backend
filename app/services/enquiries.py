@@ -52,6 +52,7 @@ from ..models import (
     PropertyListing,
 )
 from . import listings as listing_svc
+from . import contact_guard
 from . import notifications as notification_svc
 from . import visits as visit_svc
 
@@ -684,6 +685,10 @@ def reply_as_owner(db: Session, owner_id: int, lead_id: int, body: str) -> tuple
                             detail="Cannot reply to your own enquiry")
     if enquiry.status == "CLOSED":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Lead is closed")
+    # M9: no contact details to a buyer who has not unlocked THIS listing.
+    # Read-only check on server-side ids, before anything is stored or
+    # notified (refusal = 422, no message row, notification or audit row).
+    contact_guard.ensure_allowed(db, enquiry.buyer_user_id, enquiry.property_listing_id, body)
     row, created = _append_message(db, enquiry, owner_id, body)
     if created:
         # One notification per stored reply (a double tap stores nothing).

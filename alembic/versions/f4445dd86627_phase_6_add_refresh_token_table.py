@@ -41,4 +41,17 @@ def upgrade() -> None:
     # ### end Alembic commands ###
 
 def downgrade() -> None:
-    pass
+    """Downgrade schema: remove refresh_tokens and everything upgrade() created.
+
+    Order matters on MySQL/InnoDB: ix_refresh_tokens_user_id is the index
+    backing the fk_refresh_tokens_user foreign key, and MySQL refuses to drop
+    an index a foreign key still needs (error 1553). So the FK is dropped
+    first, then the three indexes, then the table. No other table references
+    refresh_tokens, so nothing else depends on it. Destroys all stored
+    refresh tokens (sessions relying on them must sign in again).
+    """
+    op.drop_constraint(op.f("fk_refresh_tokens_user"), "refresh_tokens", type_="foreignkey")
+    op.drop_index(op.f("ix_refresh_tokens_jti"), table_name="refresh_tokens")
+    op.drop_index(op.f("ix_refresh_tokens_token_hash"), table_name="refresh_tokens")
+    op.drop_index(op.f("ix_refresh_tokens_user_id"), table_name="refresh_tokens")
+    op.drop_table("refresh_tokens")
