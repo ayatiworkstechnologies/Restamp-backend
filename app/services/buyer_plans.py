@@ -4,9 +4,9 @@ A "lead" is one DISTINCT property whose owner phone the buyer revealed.
 Re-revealing a property already counted in the current window is free.
 
 Tiers (validity from activation; FREE is a rolling window):
-    RESTAMP FREE       0 leads..3     free     30 days (rolling)
-    RESTAMP PLUS       up to 10       ₹1,499   45 days
-    RESTAMP PRO        up to 20       ₹2,499   60 days
+    RESTAMP FREE       0 leads..3     free     15 days (rolling)
+    RESTAMP PLUS       up to 10       ₹1,499   30 days
+    RESTAMP PRO        up to 30       ₹2,499   60 days
     RESTAMP UNLIMITED  unlimited      ₹4,999   90 days
 
 Usage is derived from contact_reveal_audits (one row per successful reveal),
@@ -41,10 +41,10 @@ class BuyerPlan:
     leads_label: str
 
 
-FREE = BuyerPlan("RESTAMP_BUYER_FREE", "RESTAMP FREE", 0, 30, 3, "0 – 3 leads")
+FREE = BuyerPlan("RESTAMP_BUYER_FREE", "RESTAMP FREE", 0, 15, 3, "0 – 3 leads")
 PAID = (
-    BuyerPlan("RESTAMP_BUYER_PLUS", "RESTAMP PLUS", 149900, 45, 10, "4 – 10 leads"),
-    BuyerPlan("RESTAMP_BUYER_PRO", "RESTAMP PRO", 249900, 60, 20, "11 – 20 leads"),
+    BuyerPlan("RESTAMP_BUYER_PLUS", "RESTAMP PLUS", 149900, 30, 10, "4 – 10 leads"),
+    BuyerPlan("RESTAMP_BUYER_PRO", "RESTAMP PRO", 249900, 60, 30, "11 – 30 leads"),
     BuyerPlan("RESTAMP_BUYER_UNLIMITED", "RESTAMP UNLIMITED", 499900, 90, None, "Unlimited leads"),
 )
 ALL = (FREE, *PAID)

@@ -74,7 +74,8 @@ def plan_status(plan: Plan) -> str:
 def _snapshot(plan: Plan) -> dict:
     return {
         "code": plan.code, "name": plan.name, "description": plan.description, "role": plan.role,
-        "price_paise": plan.price_paise, "duration_days": plan.duration_days, "billing_cycle": plan.billing_cycle,
+        "price_paise": plan.price_paise, "mrp_paise": plan.mrp_paise,
+        "duration_days": plan.duration_days, "billing_cycle": plan.billing_cycle,
         "listing_limit": plan.listing_limit, "lead_limit": plan.lead_limit, "location_limit": plan.location_limit,
         "features": plan.features or [], "visible": bool(plan.visible), "recommended": bool(plan.recommended),
         "status": plan_status(plan), "version": plan.version,

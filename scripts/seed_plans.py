@@ -31,15 +31,16 @@ from app.services.subscriptions import _snapshot  # noqa: E402
 _OWNER_FEATURES = ["Unlimited Leads", "City Limit Reach"]
 _RM = ["Relationship Manager Assistance"]
 _SOCIAL = ["Social Media Promotion"]
-# code, name, price (rupees), validity days, listing limit (-1 = unlimited), features
+# Seller plan sheet (Nov 2026).
+# code, name, original price (rupees), offer price (rupees), validity days,
+# listing limit (-1 = unlimited), features
 OWNER_TIERS = [
-    ("RESTAMP_OWNER_STARTUP", "Startup Plan", 499, 30, 1, _OWNER_FEATURES),
-    ("RESTAMP_OWNER_SUPER", "Super Plan", 999, 45, 3, _OWNER_FEATURES),
-    ("RESTAMP_OWNER_PREMIUM", "Premium Plan", 1799, 60, 5, _OWNER_FEATURES + _RM),
-    ("RESTAMP_OWNER_ELITE", "Elite Plan", 2499, 90, 20, _OWNER_FEATURES + _RM + _SOCIAL),
-    ("RESTAMP_OWNER_SPECIAL", "Special Plan", 3499, 90, 30, _OWNER_FEATURES + _RM + _SOCIAL),
-    ("RESTAMP_OWNER_BUSINESS", "Business Plan", 49999, 90, 50, _OWNER_FEATURES + _RM + _SOCIAL),
-    ("RESTAMP_OWNER_UNLIMITED_BUSINESS", "Unlimited Business Plan", 99999, 180, -1, _OWNER_FEATURES + _RM + _SOCIAL),
+    ("RESTAMP_OWNER_SUPER", "Super Plan", 1600, 999, 45, 3, _OWNER_FEATURES),
+    ("RESTAMP_OWNER_PREMIUM", "Premium Plan", 2000, 1799, 60, 5, _OWNER_FEATURES),
+    ("RESTAMP_OWNER_ELITE", "Elite Plan", 3000, 2499, 90, 20, _OWNER_FEATURES + _RM + _SOCIAL),
+    ("RESTAMP_OWNER_SPECIAL", "Special Plan", 4000, 3499, 90, 50, _OWNER_FEATURES + _RM + _SOCIAL),
+    ("RESTAMP_OWNER_BUSINESS", "Business Plan", 70000, 49999, 90, 250, _OWNER_FEATURES + _RM + _SOCIAL),
+    ("RESTAMP_OWNER_UNLIMITED_BUSINESS", "Unlimited Business Plan", 125000, 99999, 180, -1, _OWNER_FEATURES + _RM + _SOCIAL),
 ]
 
 
@@ -57,10 +58,11 @@ def catalogue() -> list[dict]:
     rows.append(dict(code=t.code, role="BROKER", name=t.name, description="1 locality, free trial", price_paise=0,
                      duration_days=None, location_limit=t.locality_limit, sort_order=99, visible=False,
                      features=["1 locality"]))
-    for i, (code, name, rupees, days, limit, feats) in enumerate(OWNER_TIERS):
+    for i, (code, name, mrp, rupees, days, limit, feats) in enumerate(OWNER_TIERS):
         rows.append(dict(code=code, role="OWNER", name=name,
                          description="Unlimited property posts" if limit == -1 else f"{limit} property post{'s' if limit != 1 else ''}",
-                         price_paise=rupees * 100, duration_days=days, listing_limit=None if limit == -1 else limit,
+                         price_paise=rupees * 100, mrp_paise=mrp * 100, recommended=code == "RESTAMP_OWNER_ELITE",
+                         duration_days=days, listing_limit=None if limit == -1 else limit,
                          sort_order=i, features=list(feats)))
     return rows
 

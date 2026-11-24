@@ -1,7 +1,7 @@
 """RESTAMP buyer plans — phone-reveal (lead) quota over the real API.
 
 Contract:
-- FREE: 3 DISTINCT properties per rolling 30 days; the 4th new property is
+- FREE: 3 DISTINCT properties per rolling 15 days; the 4th new property is
   refused with 402 {code: BUYER_PLAN_REQUIRED} and nothing is revealed or
   audited; re-revealing an already-counted property stays free;
 - GET /buyer/plans lists the four RESTAMP plans; GET /buyer/plan reports usage;
@@ -23,9 +23,9 @@ def test_catalogue_lists_four_restamp_plans(client):
     c, _ = client
     items = c.get("/buyer/plans").json()["items"]
     assert [(i["name"], i["price_paise"], i["duration_days"], i["lead_limit"]) for i in items] == [
-        ("RESTAMP FREE", 0, 30, 3),
-        ("RESTAMP PLUS", 149900, 45, 10),
-        ("RESTAMP PRO", 249900, 60, 20),
+        ("RESTAMP FREE", 0, 15, 3),
+        ("RESTAMP PLUS", 149900, 30, 10),
+        ("RESTAMP PRO", 249900, 60, 30),
         ("RESTAMP UNLIMITED", 499900, 90, None),
     ]
 
