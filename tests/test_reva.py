@@ -109,7 +109,7 @@ def test_reva_chat_demo_plans_quote_only_real_catalogue(client):
     # (services/agent_plans.py) are quoted; nothing else.
     assert "RESTAMP PLUS" in data["reply"]
     assert "₹1,499" in data["reply"]
-    assert "Agent Starter Plan" in data["reply"]
+    assert "Dealer Starter Plan" in data["reply"]
     assert "₹2,999" in data["reply"]
     # The invented owner-plan catalogue is gone: no ₹599/"GOLD"/"PREMIUM" copy.
     assert "599" not in data["reply"]

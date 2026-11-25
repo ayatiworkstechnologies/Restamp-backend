@@ -25,6 +25,7 @@ from .routers import subscriptions as subscriptions_router
 from .routers import push as push_router
 from .routers import reva as reva_router
 from .routers import users as users_router
+from .routers import locations as locations_router
 from .services import storage as storage_svc
 from .worker import worker_lifespan
 
@@ -34,9 +35,10 @@ log = logging.getLogger("restamp")
 # - Production: ONLY the exact origins in RESTAMP_CORS_ORIGINS (validated at
 #   startup: exact public https origins, never "*", never localhost/LAN).
 #   Opt-in exception: RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 adds
-#   EXACTLY http://localhost:3000 and http://localhost:8081
-#   (config.PRODUCTION_LOCAL_DEV_ORIGINS) — no regex, no other port or host;
-#   RESTAMP_CORS_DEV_ORIGINS is ignored in production.
+#   http://localhost:3000 and http://localhost:8081
+#   (config.PRODUCTION_LOCAL_DEV_ORIGINS) plus the exact localhost /
+#   127.0.0.1 origins listed in RESTAMP_CORS_DEV_ORIGINS — exact strings,
+#   no regex, never LAN or external hosts.
 # - Development: RESTAMP_CORS_ORIGINS if set, else these local defaults
 #   (Expo web :8081, classic :19006), plus any origins in
 #   RESTAMP_CORS_DEV_ORIGINS, plus any localhost / private-LAN origin
@@ -63,7 +65,7 @@ def _cors_settings() -> dict:
         # Exactly the configured origins; never a regex, never "*" (an
         # invalid list is refused at startup by validate_security_config),
         # plus — only with RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 — the
-        # two fixed local origins. RESTAMP_CORS_DEV_ORIGINS is ignored here.
+        # validated localhost origins (config.production_local_dev_origins).
         allow_origins = list(dict.fromkeys(
             [o for o in configured if o != "*"] + production_local_dev_origins()
         ))
@@ -94,6 +96,26 @@ def _ensure_users_email_column() -> None:
         log.warning("Added missing users.email column (migration m3n4o5p6q7r8).")
     except Exception as exc:  # never block startup on this guard
         log.error("Could not ensure users.email column: %s", exc.__class__.__name__)
+
+
+def _reconcile_location_master() -> None:
+    from .db import SessionLocal
+    from .services import location_master as lm
+
+    problem = lm.storage_problem()
+    if problem:
+        log.warning("Agent location master workbook disabled: %s", problem)
+        return
+    db = SessionLocal()
+    try:
+        with lm.master_lock(db):
+            result = lm.reconcile(db)
+        level = logging.ERROR if result.get("status") == "blocked" else logging.INFO
+        log.log(level, "Agent location master: %s", result)
+    except Exception as exc:  # never block startup on this
+        log.error("Agent location master reconcile failed: %s", exc.__class__.__name__)
+    finally:
+        db.close()
 
 
 @asynccontextmanager
@@ -148,6 +170,11 @@ async def lifespan(app: FastAPI):
     if not check_db_schema():
         log.error("Database schema is not at the expected migration head.")
         raise RuntimeError("Database schema is out of date at startup.")
+
+    # Agent Location Master: bring the workbook and database to the same
+    # version (rebuild after an interrupted publish; quarantine and block on
+    # an unexplained workbook). Never fatal: agents keep the published data.
+    _reconcile_location_master()
 
     # Start background worker for automatic property verification
     async with worker_lifespan():
@@ -273,6 +300,7 @@ def create_app() -> FastAPI:
     app.include_router(push_router.router)
     app.include_router(payments_router.router)
     app.include_router(subscriptions_router.router)
+    app.include_router(locations_router.router)
 
     # Servable uploaded listing photos (local-dev storage; see storage.py).
     # Never a source directory — RESTAMP_MEDIA_ROOT lives outside the repo.

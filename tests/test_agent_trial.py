@@ -105,7 +105,7 @@ def test_trial_cannot_be_restarted_or_widened(client):
     r = c.post("/broker/trial", json={"locality": s["b"]}, headers=s["h"])
     assert r.status_code == 409  # no hopping to another area
     r = c.post("/broker/plan/localities", json={"localities": [s["b"]]}, headers=s["h"])
-    assert r.status_code == 422 and r.json()["detail"] == "Agent Free Trial covers up to 1 localities."
+    assert r.status_code == 422 and r.json()["detail"] == "Dealer Free Trial covers up to 1 localities."
     assert c.get("/broker/plan", headers=s["h"]).json()["localities"] == [s["a"]]
     # Upgrading replaces the trial; the trial can never be started again.
     up = c.post("/broker/plans/agent-starter/subscribe", json={"localities": [s["a"], s["b"]]}, headers=s["h"])

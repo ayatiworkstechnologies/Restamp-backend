@@ -279,7 +279,8 @@ def ensure_owner_can_create(db: Session, owner_id: int) -> None:
     use their Dealer plan's listing_limit; NULL/-1 = unlimited). Whether a
     current paid plan exists at all is decided first by
     capabilities.ensure_can_post (POST /owner/listings)."""
-    role = capabilities.get_poster_type(db, owner_id) or users_roles.get_current_role(db, owner_id) or "OWNER"
+    mode = users_roles.get_current_role(db, owner_id)
+    role = mode if mode in capabilities.POSTER_TYPES else (capabilities.get_poster_type(db, owner_id) or "OWNER")
     cur = current(db, owner_id, role)
     if cur is None:
         return

@@ -643,3 +643,71 @@ def admin_revoke_agent_locality(
     agent_plan_svc.revoke_locality(db, admin_id, user_id, locality_id, None)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---- Agent Location Master (individual additions only; bulk import is
+# deliberately not offered) ---------------------------------------------------
+from pydantic import BaseModel, Field  # noqa: E402
+from fastapi import Header  # noqa: E402
+
+from ..services import location_master as location_master_svc  # noqa: E402
+
+
+class LocationMasterAddIn(BaseModel):
+    locality_name: str = Field(..., max_length=255)
+    pincode: str = Field(..., max_length=20)
+    zone: str = Field(..., max_length=40)
+
+
+@router.get("/location-master")
+def admin_list_location_master(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("users.view")),
+    q: str | None = Query(default=None, max_length=255),
+    zone: Literal["North Chennai", "Central Chennai", "South Chennai"] | None = Query(default=None),
+    pincode: str | None = Query(default=None, max_length=6, pattern=r"^\d{1,6}$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+):
+    """Individual locality records (Sheet 1), searchable by name, PIN, zone."""
+    return location_master_svc.list_records(db, q=q, zone=zone, pincode=pincode, page=page, page_size=page_size)
+
+
+@router.get("/location-master/groups")
+def admin_list_location_groups(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("users.view")),
+    q: str | None = Query(default=None, max_length=255),
+    zone: Literal["North Chennai", "Central Chennai", "South Chennai"] | None = Query(default=None),
+):
+    """The published agent location groups (Sheet 2), one per PIN code."""
+    return location_master_svc.list_groups(db, q=q, zone=zone)
+
+
+@router.get("/location-master/status")
+def admin_location_master_status(
+    db: Session = Depends(get_db),
+    _admin: int = Depends(require_admin_permission("users.view")),
+):
+    """Committed / published versions, pending publications, block state."""
+    return location_master_svc.status_summary(db)
+
+
+@router.post("/location-master", status_code=status.HTTP_201_CREATED)
+def admin_add_location(
+    body: LocationMasterAddIn,
+    response: Response,
+    db: Session = Depends(get_db),
+    admin_id: int = Depends(require_admin_permission("settings.configure_platform")),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=64),
+):
+    """Add ONE locality: appended to the original master, its PIN-code group
+    updated (or created), the workbook republished. Success is returned only
+    after the workbook is published; a replayed Idempotency-Key returns the
+    original result (200)."""
+    result = location_master_svc.add_locality(
+        db, admin_id, body.locality_name, body.pincode, body.zone, idempotency_key
+    )
+    if result.get("replayed"):
+        response.status_code = status.HTTP_200_OK
+    return result

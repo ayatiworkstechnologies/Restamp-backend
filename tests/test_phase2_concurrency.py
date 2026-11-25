@@ -78,15 +78,21 @@ def _stored(uid):
 def test_concurrent_claims_exactly_one_wins(user_id):
     results = _race(user_id, lambda db, role: capabilities.claim_poster_type(db, user_id, role))
     errors = {r: v for r, v in results.items() if isinstance(v, HTTPException)}
-    winners = [r for r in results if r not in errors]
-    assert len(winners) == 1, results
-    (loser, exc), = errors.items()
-    assert exc.status_code == 409 and exc.detail["code"] == "POSTER_TYPE_CONFLICT"
-    assert _stored(user_id) == winners[0]
+    stored = _stored(user_id)
+    if stored == "BROKER":
+        # Dealer won: the Owner claim is a permitted add-on (no change).
+        assert errors == {}, results
+    else:
+        # Owner won: the Dealer claim is refused; the type never flips.
+        assert stored == "OWNER" and list(errors) == ["BROKER"], results
+        assert errors["BROKER"].status_code == 409 and errors["BROKER"].detail["code"] == "POSTER_TYPE_CONFLICT"
 
 
 def test_concurrent_try_claims_exactly_one_true(user_id):
     results = _race(user_id, lambda db, role: capabilities.try_claim(db, user_id, role))
-    assert sorted(results.values()) == [False, True], results
+    if _stored(user_id) == "BROKER":
+        assert results == {"OWNER": True, "BROKER": True}, results
+    else:
+        assert results == {"OWNER": True, "BROKER": False}, results
     winner = [r for r, ok in results.items() if ok][0]
     assert _stored(user_id) == winner

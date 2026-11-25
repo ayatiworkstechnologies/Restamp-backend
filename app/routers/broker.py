@@ -53,6 +53,7 @@ router = APIRouter(prefix="/broker", tags=["broker"])
 
 class AgentPlanSubscribeIn(BaseModel):
     localities: list[str] = Field(default_factory=list, max_length=50)
+    group_ids: list[int] = Field(default_factory=list, max_length=50)
 
 
 def _active_user(db: Session = Depends(get_db), user_id: int = Depends(get_current_user_id)) -> int:
@@ -77,7 +78,7 @@ def subscribe_agent_plan(
     """Buy an agent plan for the chosen localities. PAYMENT IS SIMULATED —
     no money is charged. Grants coverage and switches the role to BROKER.
     Development environments only: 403 in production (pay via /payments)."""
-    result = agent_plan_svc.subscribe_simulated(db, user_id, code, body.localities)
+    result = agent_plan_svc.subscribe_simulated(db, user_id, code, body.localities, body.group_ids)
     db.commit()
     return result
 
@@ -91,7 +92,7 @@ def start_agent_trial(
     """Start the agent free trial with one area: unlimited owner numbers,
     properties in that area only. 409 if a plan is active or the trial was
     already used; 422 if the area is not served."""
-    result = agent_plan_svc.start_trial(db, user_id, body.locality)
+    result = agent_plan_svc.start_trial(db, user_id, body.locality, body.group_id)
     db.commit()
     return result
 
@@ -132,7 +133,7 @@ def add_agent_plan_localities(
     the plan limit would be exceeded or nothing chosen is usable. Covered
     places are skipped; unknown and admin-disabled names are listed in
     unmatched_localities / unavailable_localities."""
-    result = agent_plan_svc.add_localities(db, user_id, body.localities)
+    result = agent_plan_svc.add_localities(db, user_id, body.localities, group_ids=body.group_ids)
     db.commit()
     return result
 

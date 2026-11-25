@@ -126,6 +126,9 @@ class CapabilitiesOut(BaseModel):
     can_post: bool = False
     active_mode: str | None
     allowed_modes: list[str]
+    # Dealer accounts may also hold an Owner plan (unlocks My Properties).
+    owner_addon_plan: dict | None = None
+    can_post_owner: bool = False
 
 
 class PosterTypeConvertIn(BaseModel):
@@ -1686,6 +1689,9 @@ class AgentPlanStatusOut(BaseModel):
     start_date: datetime | None = None
     valid_until: datetime | None = None
     localities: list[str] = Field(default_factory=list)
+    # Agent Location Master PIN groups covered (stable ids; one slot each).
+    location_groups: list[dict] = Field(default_factory=list)
+    group_ids: list[int] = Field(default_factory=list)
     localities_remaining: int | None = None
     is_trial: bool = False
 
@@ -1700,11 +1706,15 @@ class AgentPlanLocalitiesOut(AgentPlanStatusOut):
 
 
 class AgentTrialIn(BaseModel):
-    locality: str = Field(min_length=1, max_length=255)
+    """One area: a PIN group id (preferred) or a locality name (older apps)."""
+    locality: str = Field(default="", max_length=255)
+    group_id: int | None = Field(default=None, ge=1)
 
 
 class AgentLocalitiesIn(BaseModel):
+    """Locality names (older apps) and/or Agent Location Master group ids."""
     localities: list[str] = Field(default_factory=list, max_length=50)
+    group_ids: list[int] = Field(default_factory=list, max_length=50)
 
 
 class AdminAgentLocalityRow(BaseModel):

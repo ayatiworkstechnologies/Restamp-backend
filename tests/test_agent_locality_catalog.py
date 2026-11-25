@@ -261,7 +261,7 @@ def test_add_within_allowance_without_payment_and_sixth_refused(client):
     assert r.status_code == 200 and sorted(r.json()["added_localities"]) == sorted(names[3:5])
     assert r.json()["localities_remaining"] == 0
     sixth = c.post("/broker/plan/localities", json={"localities": [names[5]]}, headers=h)
-    assert sixth.status_code == 422 and sixth.json()["detail"] == "Agent Starter Plan covers up to 5 localities."
+    assert sixth.status_code == 422 and sixth.json()["detail"] == "Dealer Starter Plan covers up to 5 localities."
     assert _count(session, "SELECT COUNT(*) FROM payments WHERE user_id=:u", u=uid) == payments
     assert _count(session, "SELECT end_date FROM subscriptions WHERE user_id=:u AND status='ACTIVE'", u=uid) == end
 
@@ -386,7 +386,7 @@ def test_admin_changes_are_audited_and_preserve_plan(client):
                   headers=ha).json()["plan"]["localities_remaining"] == 0
     # Plan full (5/5): admins can't exceed it either; nothing is written.
     over = c.post(f"/admin/agents/{uid}/localities", json={"localities": [names[6]]}, headers=ha)
-    assert over.status_code == 422 and over.json()["detail"] == "Agent Starter Plan covers up to 5 localities."
+    assert over.status_code == 422 and over.json()["detail"] == "Dealer Starter Plan covers up to 5 localities."
     # Already-covered names are skipped, never duplicated.
     again = c.post(f"/admin/agents/{uid}/localities", json={"localities": [names[2].upper()]}, headers=ha)
     assert again.status_code == 200 and again.json()["added_localities"] == []

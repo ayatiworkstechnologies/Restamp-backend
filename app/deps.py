@@ -39,7 +39,7 @@ def require_role(*allowed: str, detail: str | None = None):
             # only when the account's poster type is unset or the same type
             # (mode switches already refuse this; legacy rows are re-checked).
             poster_type = capabilities.get_poster_type(db, user_id)
-            if poster_type is not None and poster_type != role:
+            if not capabilities.allows(poster_type, role):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=detail or f"{'/'.join(allowed)} role required",

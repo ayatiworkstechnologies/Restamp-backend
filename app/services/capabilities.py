@@ -96,6 +96,15 @@ def _conflict(current: str, requested: str) -> HTTPException:
     )
 
 
+def allows(current: str | None, role: str) -> bool:
+    """May an account of poster type `current` use `role` (OWNER/BROKER)?
+
+    Unset or same type: yes. A Dealer (BROKER) account may ALSO hold an
+    Owner plan (Dealer first -> Sales Hub; Owner add-on -> My Properties).
+    An Owner account still cannot become a Dealer (409)."""
+    return current is None or current == role or (current == "BROKER" and role == "OWNER")
+
+
 def get_poster_type(db: Session, user_id: int) -> str | None:
     user = db.get(User, user_id)
     return user.poster_type if user is not None else None
@@ -107,7 +116,7 @@ def ensure_compatible(db: Session, user_id: int, role: str) -> None:
     if role not in POSTER_TYPES:
         return
     current = get_poster_type(db, user_id)
-    if current is not None and current != role:
+    if not allows(current, role):
         raise _conflict(current, role)
 
 
@@ -125,7 +134,7 @@ def claim_poster_type(db: Session, user_id: int, role: str) -> None:
     if user.poster_type is None:
         user.poster_type = role
         db.flush()
-    elif user.poster_type != role:
+    elif not allows(user.poster_type, role):
         raise _conflict(user.poster_type, role)
 
 
@@ -160,12 +169,14 @@ def ensure_can_post(db: Session, user_id: int) -> None:
     mode = users_roles.get_current_role(db, user_id)
     poster_type = get_poster_type(db, user_id)
     status_ = "NONE"
-    if poster_type is not None and mode == poster_type:
-        found = _posting_plan(db, user_id, poster_type)
+    if poster_type is not None and mode in POSTER_TYPES and allows(poster_type, mode):
+        # Posting uses the plan of the current mode (a Dealer in Owner mode
+        # needs its Owner add-on plan).
+        found = _posting_plan(db, user_id, mode)
         if found is not None and not found[2]:
             return
         status_ = "TRIAL" if found is not None else "INACTIVE"
-    label = _LABEL.get(poster_type or mode or "", "Owner")
+    label = _LABEL.get(mode if mode in POSTER_TYPES else (poster_type or ""), "Owner")
     raise HTTPException(
         status_code=status.HTTP_402_PAYMENT_REQUIRED,
         detail={
@@ -274,7 +285,7 @@ def switch_mode(db: Session, user_id: int, mode: str) -> str:
     """
     if mode in POSTER_TYPES:
         current = get_poster_type(db, user_id)
-        if current is not None and current != mode:
+        if not allows(current, mode):
             raise _conflict(current, mode)
     return users_roles.set_current_role(db, user_id, mode)
 
@@ -302,7 +313,14 @@ def capabilities(db: Session, user_id: int) -> dict:
         poster_status = "INACTIVE"  # never had a plan, or expired/cancelled/suspended
     else:
         poster_status = "TRIAL" if trial else "ACTIVE"
-    allowed = ["BUYER"] + ([poster_type] if poster_type else list(POSTER_TYPES))
+    allowed = ["BUYER"] + [r for r in POSTER_TYPES if allows(poster_type, r)]
+    # Dealer accounts may add an Owner plan (My Properties).
+    owner_found = _posting_plan(db, user_id, "OWNER") if poster_type == "BROKER" else None
+    owner_addon = None
+    if owner_found is not None:
+        o_sub, o_plan, _t = owner_found
+        owner_addon = {"subscription_id": o_sub.id, "plan_code": o_plan.code,
+                       "plan_name": o_plan.name, "end_date": o_sub.end_date}
     return {
         "buyer": True,
         "poster_type": poster_type,
@@ -314,4 +332,6 @@ def capabilities(db: Session, user_id: int) -> dict:
         "can_post": poster_status == "ACTIVE",
         "active_mode": users_roles.get_current_role(db, user_id),
         "allowed_modes": allowed,
+        "owner_addon_plan": owner_addon,
+        "can_post_owner": (poster_type == "OWNER" and poster_status == "ACTIVE") or owner_addon is not None,
     }

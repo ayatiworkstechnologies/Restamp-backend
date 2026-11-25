@@ -378,9 +378,9 @@ def test_superseded_payment_replay_never_reactivates(client, razorpay, fake_rzp)
 def test_checkout_refused_for_incompatible_poster_type(client, razorpay, fake_rzp):
     c, session = client
     ah, _ = _admin(c, session)
-    code = _plan(c, ah, "OWNER")
-    h, _uid = _register(c, "DEALER")
-    r = c.post("/payments/checkout", headers=h, json={"kind": "owner", "code": code})
+    code = _plan(c, ah, "BROKER")
+    h, _uid = _register(c, "OWNER")  # an Owner account can never become a Dealer
+    r = c.post("/payments/checkout", headers=h, json={"kind": "agent", "code": code})
     assert r.status_code == 409 and r.json()["detail"]["code"] == "POSTER_TYPE_CONFLICT"
     assert fake_rzp.calls == []  # no order, no money
     r = c.post("/payments/checkout", headers=h, json={"kind": "agent", "code": "RESTAMP_AGENT_TRIAL"})

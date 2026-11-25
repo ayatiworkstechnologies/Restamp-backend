@@ -198,21 +198,21 @@ def test_owner_cannot_acquire_dealer_plan(client):
     assert _poster_type(session, uid) == "OWNER"
 
 
-def test_dealer_cannot_acquire_owner_plan_via_bypass(client):
+def test_dealer_can_add_owner_plan_via_bypass(client):
+    """Dealer first (Sales Hub), then an Owner add-on plan (My Properties)."""
     c, session = client
     ah, _ = _admin(c, session)
     code = _plan(c, ah, "OWNER")
     h, uid, _ = _register(c, "DEALER")
-    # Cannot even enter Owner mode...
     r = c.post("/users/me/role", json={"role": "OWNER"}, headers=h)
-    assert r.status_code == 409 and r.json()["detail"]["code"] == "POSTER_TYPE_CONFLICT"
-    # ...and a forced legacy OWNER mode row still cannot buy the owner plan.
-    session.execute(text("UPDATE user_current_role SET role='OWNER' WHERE user_id=:u"), {"u": uid})
-    session.flush()
+    assert r.status_code == 200, r.text
     r = c.post("/subscriptions/bypass", headers=h, json={"plan_code": code})
-    assert r.status_code == 409
-    assert _sub_count(session, uid) == 0
-    assert _poster_type(session, uid) == "BROKER"
+    assert r.status_code == 200, r.text
+    assert _sub_count(session, uid) == 1
+    assert _poster_type(session, uid) == "BROKER"  # still a Dealer account
+    caps = c.get("/users/me/capabilities", headers=h).json()
+    assert caps["owner_addon_plan"]["plan_code"] == code and caps["can_post_owner"] is True
+    assert "OWNER" in caps["allowed_modes"] and "BROKER" in caps["allowed_modes"]
 
 
 def test_mode_switching_rules(client):

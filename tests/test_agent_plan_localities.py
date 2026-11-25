@@ -106,7 +106,7 @@ def test_sixth_is_refused_and_writes_nothing(client):
 
     sixth = c.post("/broker/plan/localities", json={"localities": [names[5]]}, headers=h)
     assert sixth.status_code == 422
-    assert sixth.json()["detail"] == "Agent Starter Plan covers up to 5 localities."
+    assert sixth.json()["detail"] == "Dealer Starter Plan covers up to 5 localities."
     assert _count(session, GRANTS, uid) == grants and _count(session, HISTORY, uid) == history
     assert c.get("/broker/plan", headers=h).json()["localities_remaining"] == 0
 

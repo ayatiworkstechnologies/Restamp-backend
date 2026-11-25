@@ -148,7 +148,8 @@ def _plan_by_code(db: Session, code: str):
 
 
 async def create_checkout(
-    db: Session, user_id: int, kind: str, code: str, localities: list[str] | None = None
+    db: Session, user_id: int, kind: str, code: str, localities: list[str] | None = None,
+    group_ids: list[int] | None = None,
 ) -> dict:
     """Create a Razorpay order for a plan and record the INITIATED payment.
 
@@ -175,9 +176,13 @@ async def create_checkout(
         # Validate now; refuse before any order exists. The canonical names
         # (not the raw input) are what the webhook will re-validate.
         _postcode_ids, canonical, unmatched, unavailable = agent_plan_svc._resolve_choice(
-            db, plan, list(localities or [])
+            db, plan, list(localities or []), list(group_ids or [])
         )
-        notes["localities"] = "|".join(canonical)
+        if group_ids:
+            # Stable Agent Location Master group ids (re-validated by the webhook).
+            notes["group_ids"] = ",".join(str(int(i)) for i in group_ids)
+        else:
+            notes["localities"] = "|".join(canonical)
         result_extra = {"unmatched_localities": unmatched, "unavailable_localities": unavailable}
 
     idempotency_key = uuid.uuid4().hex
@@ -382,7 +387,8 @@ def _confirm_and_activate(db: Session, payment: Payment, provider_payment_id: st
         result = credit_svc.grant_for_payment(db, locked)
     else:
         localities = [n for n in str(notes.get("localities", "")).split("|") if n]
-        result = agent_plan_svc.activate_for_payment(db, locked, plan_obj, localities)
+        group_ids = [int(i) for i in str(notes.get("group_ids", "")).split(",") if i.strip().isdigit()]
+        result = agent_plan_svc.activate_for_payment(db, locked, plan_obj, localities, group_ids)
     result["payment_id"] = locked.id
     result["status"] = locked.status
     return result

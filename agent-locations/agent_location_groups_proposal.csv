@@ -1,0 +1,113 @@
+﻿PIN Code,Primary Location Name,Associated Localities,Chennai Zone,Number of Localities,Display Name,Naming Confidence,Name Basis,Review Note,Source Record IDs
+600001,George Town,Angappanaicken Street; Flower Bazar; Govt Stanley Hospital; Kothwal Market; M P T Admn Office; Madras Gpo; Mannady; Mint Buildings; Monegar Choultry; Muthialpet; Sembier Street; Seven Wells; Wal Tax Road,North Chennai,13,"George Town (Angappanaicken Street, Flower Bazar, Govt Stanley Hospital, Kothwal Market, M P T Admn Office, Madras Gpo, Mannady, Mint Buildings, Monegar Choultry, Muthialpet, Sembier Street, Seven Wells, Wal Tax Road) - 600001",needs approval,external name,"Not in the source records. George Town is the area covering Mannady, Sembier Street, Seven Wells, Flower Bazar, Muthialpet, etc. Source-only alternative: Mannady.","14, 70, 82, 119, 132, 139, 149, 155, 156, 161, 235, 237, 293"
+600002,Anna Road,Anna Road H O; Annaroad South; Chintadripeta; Government Estate; Madras Electricity System; Pudupet,Central Chennai,6,"Anna Road (Anna Road H O, Annaroad South, Chintadripeta, Government Estate, Madras Electricity System, Pudupet) - 600002",high,derived: 'Anna Road H O' minus 'H O',,"15, 20, 49, 81, 138, 205"
+600003,Park Town,Central Station; Dr Ambedkarnagar; Edapalayam; Madras Medical College; Park Town; Ripon Buildings,Central Chennai,6,"Park Town (Central Station, Dr Ambedkarnagar, Edapalayam, Madras Medical College, Park Town, Ripon Buildings) - 600003",medium,exact source name,,"42, 60, 61, 140, 188, 222"
+600004,Mylopore,Luz Church Road; Mandavalli; Ms Vivekanands College; Mylopore; Nochikuppam Colony; Police Head Quarters; Royapettah High Road; Santhome,Central Chennai,8,"Mylopore (Luz Church Road, Mandavalli, Ms Vivekanands College, Mylopore, Nochikuppam Colony, Police Head Quarters, Royapettah High Road, Santhome) - 600004",medium,exact source name,Source spelling; commonly 'Mylapore'. Not corrected.,"131, 148, 160, 162, 170, 197, 224, 230"
+600005,Chepauk,Chepauk; Krishnampet; Madras Presidency College; Madras University; Parthasarathy Koil; Tiruvellikeni,Central Chennai,6,"Chepauk (Chepauk, Krishnampet, Madras Presidency College, Madras University, Parthasarathy Koil, Tiruvellikeni) - 600005",medium,exact source name,Tiruvellikeni (Triplicane) also in group.,"46, 123, 141, 143, 189, 268"
+600006,Greams Road,Cathedral; Greams Road; Old College Buildings; Shastri Bhavan; Teynampet West,Central Chennai,5,"Greams Road (Cathedral, Greams Road, Old College Buildings, Shastri Bhavan, Teynampet West) - 600006",medium,exact source name,"Reviewed: present in group. Alternatives: Cathedral, Teynampet West.","38, 83, 176, 239, 259"
+600007,Vepery,Vepery,Central Chennai,1,Vepery - 600007,single,only locality,,282
+600008,Egmore,Egmore; Egmore High Road,Central Chennai,2,"Egmore (Egmore, Egmore High Road) - 600008",high,shared prefix,,"62, 63"
+600009,Fort St George,Fort St George,Central Chennai,1,Fort St George - 600009,single,only locality,,73
+600010,Kilpauk,Kilpauk; Kilpauk Garden Colony; Kilpauk Medical College; Kilpauk West; Medavakkam Tank Road; New Avadi Road,Central Chennai,6,"Kilpauk (Kilpauk, Kilpauk Garden Colony, Kilpauk Medical College, Kilpauk West, Medavakkam Tank Road, New Avadi Road) - 600010",high,exact source name,,"108, 109, 110, 111, 151, 169"
+600011,Perambur,Chinnaiah Mudali Colony; Perambur; Perambur North; Sembiam,North Chennai,4,"Perambur (Chinnaiah Mudali Colony, Perambur, Perambur North, Sembiam) - 600011",high,exact source name,,"48, 192, 195, 234"
+600012,Perambur Barracks,Decoster Road; Kosapet; Perambur Barracks; Perambur High Road; Pulianthope; Syrahans Road; Venkatesapuram,North Chennai,7,"Perambur Barracks (Decoster Road, Kosapet, Perambur Barracks, Perambur High Road, Pulianthope, Syrahans Road, Venkatesapuram) - 600012",medium,exact source name,"Reviewed: present in group (with Pulianthope, Kosapet, Perambur High Road).","58, 118, 193, 194, 206, 249, 281"
+600013,Royapuram,Kalmandapam; Kasimode; Rayapuram Madras; Rayapuram Market,North Chennai,4,"Royapuram (Kalmandapam, Kasimode, Rayapuram Madras, Rayapuram Market) - 600013",needs approval,spelling variant,Source spells it 'Rayapuram Madras' / 'Rayapuram Market'. 'Royapuram' is the common spelling but not in the source. Source-only alternative: Rayapuram.,"104, 106, 216, 217"
+600014,Royapettah,Goudiyamath Road; Jam Bazaar; Ligods Estate; Ligods Road; Pudupakkam; Royapettah; Triplicane South,Central Chennai,7,"Royapettah (Goudiyamath Road, Jam Bazaar, Ligods Estate, Ligods Road, Pudupakkam, Royapettah, Triplicane South) - 600014",medium,exact source name,,"80, 97, 128, 129, 204, 223, 276"
+600015,Saidapet Madras,Guindy North; Saidapet Madras; Saidapet West; Saidhapet North,South Chennai,4,"Saidapet Madras (Guindy North, Saidapet Madras, Saidapet West, Saidhapet North) - 600015",medium,exact source name,Group also has 'Saidhapet North' (spelling differs).,"86, 225, 226, 227"
+600016,St Thomas Mount,Alandur; Butt Road; St Thomas Mount H O; Tiruvaluvar Nagar,South Chennai,4,"St Thomas Mount (Alandur, Butt Road, St Thomas Mount H O, Tiruvaluvar Nagar) - 600016",high,derived: H O removed,,"5, 36, 248, 266"
+600017,Thayagaranagar,Habibullah Road; Hindi Prachar Sabha; North Thyagarayanagar; Panagal Park; Thayagaranagar H O; Thyagarayanagar South; Usman Road,Central Chennai,7,"Thayagaranagar (Habibullah Road, Hindi Prachar Sabha, North Thyagarayanagar, Panagal Park, Thayagaranagar H O, Thyagarayanagar South, Usman Road) - 600017",medium,derived: H O removed,Source spelling; commonly 'Thyagaraya Nagar / T. Nagar'. Not corrected.,"87, 91, 171, 186, 261, 264, 277"
+600018,Teynampet,Abiramapuram; Chamiers Road; Eldams Road; Ms Accountant General; Teynampet; Teynampet South,Central Chennai,6,"Teynampet (Abiramapuram, Chamiers Road, Eldams Road, Ms Accountant General, Teynampet, Teynampet South) - 600018",medium,exact source name,,"1, 45, 65, 159, 257, 258"
+600019,Tiruvottiyur,Kaladipet; Shanmugapuram; Tiruvottiyur Central; Tiruvottiyur; Tiruvottiyur North; Tiruvottiyur West; Wimconagar,North Chennai,7,"Tiruvottiyur (Kaladipet, Shanmugapuram, Tiruvottiyur Central, Tiruvottiyur, Tiruvottiyur North, Tiruvottiyur West, Wimconagar) - 600019",high,exact source name,,"101, 238, 270, 271, 272, 273, 297"
+600020,Adyar,Adyar; Central Institute Of Tech; Central Leather Research; Gandhi Nagar; Indra Nagar; Kasturbanagar; Sastrinagar; Technical Teachers Trg In; Theosophical Society,South Chennai,9,"Adyar (Adyar, Central Institute Of Tech, Central Leather Research, Gandhi Nagar, Indra Nagar, Kasturbanagar, Sastrinagar, Technical Teachers Trg In, Theosophical Society) - 600020",high,exact source name,,"3, 40, 41, 75, 95, 107, 231, 256, 262"
+600021,Washermanpetta,Cemetry Road; Gollawar Agraharam Road; Harinarayanapuram; Korukkupet; Washermanpeta East; Washermanpetta,North Chennai,6,"Washermanpetta (Cemetry Road, Gollawar Agraharam Road, Harinarayanapuram, Korukkupet, Washermanpeta East, Washermanpetta) - 600021",medium,exact source name,Source spelling; group also has 'Washermanpeta East'.,"39, 78, 88, 117, 294, 295"
+600022,Raj Bhavan Madras Raja,Raj Bhavan Madras Raja,South Chennai,1,Raj Bhavan Madras Raja - 600022,single,only locality,,212
+600023,Ayanavaram,Ayanavaram; Ayanavaram Rly Colony; Solai Street,North Chennai,3,"Ayanavaram (Ayanavaram, Ayanavaram Rly Colony, Solai Street) - 600023",high,exact source name,,"29, 30, 243"
+600024,Kodambakkam,Arcot Road; Kodambakkam; Kodambakkam West; Rengarajapuram,Central Chennai,4,"Kodambakkam (Arcot Road, Kodambakkam, Kodambakkam West, Rengarajapuram) - 600024",high,exact source name,,"21, 112, 113, 221"
+600025,Engineering College Directorat,Engineering College Directorat,South Chennai,1,Engineering College Directorat - 600025,single,only locality,,66
+600026,Vadapalani,Vadapalani,Central Chennai,1,Vadapalani - 600026,single,only locality,,278
+600027,Minambakkam,Madras Air Port; Minambakkam,South Chennai,2,"Minambakkam (Madras Air Port, Minambakkam) - 600027",medium,exact source name,,"137, 154"
+600028,R. A. Puram,Annamalaipuram; Fore Shore Estate; R A Puram Colony; Ramakrishnanagar,Central Chennai,4,"R. A. Puram (Annamalaipuram, Fore Shore Estate, R A Puram Colony, Ramakrishnanagar) - 600028",medium,"derived: 'R A Puram Colony' minus 'Colony', punctuation added",Reviewed: R A Puram Colony is in the group; acceptable derivation.,"16, 72, 208, 215"
+600029,Aminijikarai,Aminijikarai,Central Chennai,1,Aminijikarai - 600029,single,only locality,,12
+600030,Shenoynagar,Panchiapas College Hoste; Shenoynagar,Central Chennai,2,"Shenoynagar (Panchiapas College Hoste, Shenoynagar) - 600030",high,exact source name,,"187, 240"
+600031,Chetput,Chetput H O; Harrington Road; Service Centre; World University,Central Chennai,4,"Chetput (Chetput H O, Harrington Road, Service Centre, World University) - 600031",high,derived: H O removed,,"47, 89, 236, 298"
+600032,Guindy,Alandur North; Ekkaduthangal; Guindy Ind Estate; Hindustan Teleprinters; Madras Race Course,South Chennai,5,"Guindy (Alandur North, Ekkaduthangal, Guindy Ind Estate, Hindustan Teleprinters, Madras Race Course) - 600032",medium,derived: 'Guindy Ind Estate' minus 'Ind Estate',"Reviewed: group is Alandur North, Ekkaduthangal, Guindy Ind Estate, Hindustan Teleprinters, Madras Race Course. Acceptable derivation.","6, 64, 85, 92, 142"
+600033,West Mambalam,Kumaran Nagar; Mambalam East; Mambalam R S; Mettupalayam; West Mambalam,Central Chennai,5,"West Mambalam (Kumaran Nagar, Mambalam East, Mambalam R S, Mettupalayam, West Mambalam) - 600033",medium,exact source name,,"125, 144, 145, 153, 296"
+600034,Nungambakkam,Loyla College; Nungambakkam; Nungambakkam Bazaar; Nungambakkam High Road,Central Chennai,4,"Nungambakkam (Loyla College, Nungambakkam, Nungambakkam Bazaar, Nungambakkam High Road) - 600034",high,exact source name,,"130, 172, 173, 174"
+600035,Nandanam,Nandanam; Nandanam Bazaar,Central Chennai,2,"Nandanam (Nandanam, Nandanam Bazaar) - 600035",high,shared prefix,,"165, 166"
+600036,Indian Inst Of Technology,Indian Inst Of Technology,South Chennai,1,Indian Inst Of Technology - 600036,single,only locality,,94
+600037,Offiers Trg School,Offiers Trg School,South Chennai,1,Offiers Trg School - 600037,single,only locality,,175
+600038,I C F Colony,I C F Colony,North Chennai,1,I C F Colony - 600038,single,only locality,,93
+600039,Vyasarpady,Vyasarpady; Vysarnagar Colony; Vysarpady Coop Ind Estate,North Chennai,3,"Vyasarpady (Vyasarpady, Vysarnagar Colony, Vysarpady Coop Ind Estate) - 600039",high,exact source name,,"290, 291, 292"
+600040,Annanagar,Annanagar,Central Chennai,1,Annanagar - 600040,single,only locality,,17
+600041,Tiruvanmiyur,Tiruvanmiyur,South Chennai,1,Tiruvanmiyur - 600041,single,only locality,,267
+600042,Velacheri,Velacheri,South Chennai,1,Velacheri - 600042,single,only locality,,280
+600043,Pallavaram,Pallavaram; Pallavaram North; Pallavaram South; Rajainagar,South Chennai,4,"Pallavaram (Pallavaram, Pallavaram North, Pallavaram South, Rajainagar) - 600043",high,exact source name,,"181, 182, 183, 214"
+600044,Chromepet,Bharathipuram; Chromepet; Negelkeni; Radhanagar,South Chennai,4,"Chromepet (Bharathipuram, Chromepet, Negelkeni, Radhanagar) - 600044",high,exact source name,,"33, 55, 168, 209"
+600045,Tambaram,Tambaram H O; Tambaram West,South Chennai,2,"Tambaram (Tambaram H O, Tambaram West) - 600045",high,derived: H O removed,,"251, 254"
+600046,Tambaram IAF,Ground Training School; Tambaram I A F,South Chennai,2,"Tambaram IAF (Ground Training School, Tambaram I A F) - 600046",high,formatting of 'Tambaram I A F',Reviewed: spacing/case only.,"84, 252"
+600047,Tambaram Sanitorium,Tambaram Sanitorium,South Chennai,1,Tambaram Sanitorium - 600047,single,only locality,,253
+600048,Vandalur,Vandalur,South Chennai,1,Vandalur - 600048,single,only locality,,279
+600049,Villivakkam,Tirumangalam Road; Villivakkam; Villivakkam North; Villivakkam South,North Chennai,4,"Villivakkam (Tirumangalam Road, Villivakkam, Villivakkam North, Villivakkam South) - 600049",high,exact source name,,"265, 284, 285, 286"
+600050,Padi,Mannurpettai; Padi; Padi South,North Chennai,3,"Padi (Mannurpettai, Padi, Padi South) - 600050",high,exact source name,,"150, 178, 179"
+600051,Madhavaram Milk Colony,Madhavaram Milk Colony,North Chennai,1,Madhavaram Milk Colony - 600051,single,only locality,,135
+600052,Red Hills,Padianallur; Red Hills; Red Hills Bazaar; Regional Engg College,North Chennai,4,"Red Hills (Padianallur, Red Hills, Red Hills Bazaar, Regional Engg College) - 600052",high,exact source name,,"180, 218, 219, 220"
+600053,Ambattur,Ambattur Bazaar; Ambattur H O; Ambattur West; Mednambedu; Orgadam; Prithivipakkam; Vijayalakshmipuram,North Chennai,7,"Ambattur (Ambattur Bazaar, Ambattur H O, Ambattur West, Mednambedu, Orgadam, Prithivipakkam, Vijayalakshmipuram) - 600053",high,derived: H O removed,,"8, 9, 11, 152, 177, 203, 283"
+600054,Avadi Camp,Avadi; Avadi Camp H O; Central Vehicle Research,North Chennai,3,"Avadi Camp (Avadi, Avadi Camp H O, Central Vehicle Research) - 600054",medium,derived: H O removed,,"25, 27, 44"
+600055,Avadi IAF,Avadi Air Force Quarters; Avadi Iaf; Central Vehicle Depot,North Chennai,3,"Avadi IAF (Avadi Air Force Quarters, Avadi Iaf, Central Vehicle Depot) - 600055",high,formatting of 'Avadi Iaf',Reviewed: case only.,"26, 28, 43"
+600056,Poonamallee,Poonamallee; Poonamallee East,Central Chennai,2,"Poonamallee (Poonamallee, Poonamallee East) - 600056",high,shared prefix,,"200, 201"
+600057,Ennore,Ennur R S; Ennur Thermal Station; Ernavur,North Chennai,3,"Ennore (Ennur R S, Ennur Thermal Station, Ernavur) - 600057",needs approval,spelling variant,Source spells it 'Ennur R S' / 'Ennur Thermal Station'. Source-only alternative: Ennur.,"67, 68, 69"
+600058,Ambattur Industrial Estate,Ambattur Industrial Estate,North Chennai,1,Ambattur Industrial Estate - 600058,single,only locality,,10
+600059,Tambaram East,Christian College; Ganapathipuram; Lic Colony Tambaram; Railway Colony; Tambaram East,South Chennai,5,"Tambaram East (Christian College, Ganapathipuram, Lic Colony Tambaram, Railway Colony, Tambaram East) - 600059",medium,exact source name,,"54, 74, 127, 211, 250"
+600060,Madhavaram,Madhavaram; Madhavaram East; Moolakadai; Pozhal,North Chennai,4,"Madhavaram (Madhavaram, Madhavaram East, Moolakadai, Pozhal) - 600060",high,exact source name,,"133, 134, 157, 202"
+600061,Naganallur,Naganallur; Naganallur South; Nanganallur Bazaar; Palyanthangal; Thillaiganganagar,South Chennai,5,"Naganallur (Naganallur, Naganallur South, Nanganallur Bazaar, Palyanthangal, Thillaiganganagar) - 600061",high,exact source name,,"163, 164, 167, 184, 263"
+600062,Sathyamurthinagar,Sathyamurthinagar,North Chennai,1,Sathyamurthinagar - 600062,single,only locality,,232
+600063,Srinivasanagar,Srinivasanagar,South Chennai,1,Srinivasanagar - 600063,single,only locality,,247
+600064,Chitlapakkam,Chitlapakkam,South Chennai,1,Chitlapakkam - 600064,single,only locality,,50
+600065,Crp Camp,Crp Camp,North Chennai,1,Crp Camp - 600065,single,only locality,,56
+600066,Kadirvedu,Kadirvedu,North Chennai,1,Kadirvedu - 600066,single,only locality,,100
+600067,Solavaram,Solavaram,North Chennai,1,Solavaram - 600067,single,only locality,,244
+600068,Manali Madras,Manali Madras,North Chennai,1,Manali Madras - 600068,single,only locality,,146
+600069,Kunnathur Kanchipuram,Kunnathur Kanchipuram,South Chennai,1,Kunnathur Kanchipuram - 600069,single,only locality,,126
+600070,Anakaputhur,Anakaputhur,South Chennai,1,Anakaputhur - 600070,single,only locality,,13
+600071,Kamarajanagar,Kamarajanagar,North Chennai,1,Kamarajanagar - 600071,single,only locality,,105
+600072,Pattabiram,Pattabiram; Pattabiram East; Thandarai,North Chennai,3,"Pattabiram (Pattabiram, Pattabiram East, Thandarai) - 600072",high,exact source name,,"190, 191, 260"
+600073,Selaiyur,Selaiyur,South Chennai,1,Selaiyur - 600073,single,only locality,,233
+600074,Polichalur,Polichalur; Sithathur,South Chennai,2,"Polichalur (Polichalur, Sithathur) - 600074",medium,exact source name,"Reviewed: group is Polichalur, Sithathur.","198, 242"
+600075,Pammal,Pammal,South Chennai,1,Pammal - 600075,single,only locality,,185
+600076,Korattur R S,Korattur R S,North Chennai,1,Korattur R S - 600076,single,only locality,,116
+600077,Tiruverkadu,Tiruverkadu,Central Chennai,1,Tiruverkadu - 600077,single,only locality,,269
+600078,K K Nagar,K K Nagar; Kalignar Karunanidhinagar; Kalinga Colony,Central Chennai,3,"K K Nagar (K K Nagar, Kalignar Karunanidhinagar, Kalinga Colony) - 600078",medium,exact source name,,"99, 102, 103"
+600079,Sowcarpet,Bullion Market; Sowcarpet,North Chennai,2,"Sowcarpet (Bullion Market, Sowcarpet) - 600079",medium,exact source name,,"35, 245"
+600080,Korattur,Korattur,North Chennai,1,Korattur - 600080,single,only locality,,115
+600081,Tondikarpet,Mpt Staff Colony; Tondikarpet,North Chennai,2,"Tondikarpet (Mpt Staff Colony, Tondikarpet) - 600081",medium,exact source name,,"158, 274"
+600082,Agaram,Agaram; Jawahar Nagar; Rajah Thottam,North Chennai,3,"Agaram (Agaram, Jawahar Nagar, Rajah Thottam) - 600082",medium,exact source name,"Reviewed: group is Agaram, Jawahar Nagar, Rajah Thottam.","4, 98, 213"
+600083,Ashok Nagar,Ashok Nagar,Central Chennai,1,Ashok Nagar - 600083,single,only locality,,23
+600084,Purasawakkam,Flowers Road; Gaugadeeswaran Koil; Purasawakkam,Central Chennai,3,"Purasawakkam (Flowers Road, Gaugadeeswaran Koil, Purasawakkam) - 600084",high,exact source name,,"71, 77, 207"
+600085,Kottur,Kottur Gram; Kottur Madras,South Chennai,2,"Kottur (Kottur Gram, Kottur Madras) - 600085",high,shared prefix,,"120, 121"
+600086,Gopalapuram,Gopalapuram,Central Chennai,1,Gopalapuram - 600086,single,only locality,,79
+600087,Alwar Tirunagar,Alwar Tirunagar,Central Chennai,1,Alwar Tirunagar - 600087,single,only locality,,7
+600088,Adambakkam,Adambakkam; Ganesh Nagar,South Chennai,2,"Adambakkam (Adambakkam, Ganesh Nagar) - 600088",high,exact source name,,"2, 76"
+600089,Kudlyiruppur,Kudlyiruppur,South Chennai,1,Kudlyiruppur - 600089,single,only locality,,124
+600090,Besant Nagar,Besant Nagar; Besantnagat South,South Chennai,2,"Besant Nagar (Besant Nagar, Besantnagat South) - 600090",high,exact source name,,"31, 32"
+600091,Madipakkam,Madipakkam,South Chennai,1,Madipakkam - 600091,single,only locality,,136
+600092,Virugambakkam,Virugambakkam; Virugambakkam Bazar; Virugambakkam North,Central Chennai,3,"Virugambakkam (Virugambakkam, Virugambakkam Bazar, Virugambakkam North) - 600092",high,shared prefix,,"287, 288, 289"
+600093,Saligramam,Saligramam; Saligramam South,Central Chennai,2,"Saligramam (Saligramam, Saligramam South) - 600093",high,shared prefix,,"228, 229"
+600094,Choolaimedu,Choolaimedu; Choolaimedu Mdo,Central Chennai,2,"Choolaimedu (Choolaimedu, Choolaimedu Mdo) - 600094",high,shared prefix,,"52, 53"
+600095,Jaffarkhanpet,Jaffarkhanpet,Central Chennai,1,Jaffarkhanpet - 600095,single,only locality,,96
+600096,Perungudi,Perungudi,South Chennai,1,Perungudi - 600096,single,only locality,,196
+600097,Defence Officers Colony,Defence Officers Colony,South Chennai,1,Defence Officers Colony - 600097,single,only locality,,59
+600098,Sidco Estate,Sidco Estate,North Chennai,1,Sidco Estate - 600098,single,only locality,,241
+600099,Kolathur-Cpt,Kolathur-Cpt,North Chennai,1,Kolathur-Cpt - 600099,single,only locality,,114
+600101,Annanagar Western Extn,Annanagar Western Extn,Central Chennai,1,Annanagar Western Extn - 600101,single,only locality,,19
+600102,Annanagar East,Annanagar East,Central Chennai,1,Annanagar East - 600102,single,only locality,,18
+600103,Manali New Town,Manali New Town,North Chennai,1,Manali New Town - 600103,single,only locality,,147
+600104,High Court Buildings,High Court Buildings,North Chennai,1,High Court Buildings - 600104,single,only locality,,90
+600105,C-In-C Road,C-In-C Road,Central Chennai,1,C-In-C Road - 600105,single,only locality,,37
+600106,Arumbakkam,Arumbakkam; D G Vaishnav College,Central Chennai,2,"Arumbakkam (Arumbakkam, D G Vaishnav College) - 600106",high,exact source name,,"22, 57"
+600107,Koyambedu,Koyambedu,Central Chennai,1,Koyambedu - 600107,single,only locality,,122
+600108,Broadway,Broadway,North Chennai,1,Broadway - 600108,single,only locality,,34
+600109,Railway Car Shed Complex,Railway Car Shed Complex,North Chennai,1,Railway Car Shed Complex - 600109,single,only locality,,210
+600110,Ponniammanmedu,Ponniammanmedu,North Chennai,1,Ponniammanmedu - 600110,single,only locality,,199
+600111,Sri Ayyappanagar,Sri Ayyappanagar,Central Chennai,1,Sri Ayyappanagar - 600111,single,only locality,,246
+600112,Choolai,Ashtabujam Road; Choolai,North Chennai,2,"Choolai (Ashtabujam Road, Choolai) - 600112",high,exact source name,,"24, 51"
+600113,Taramani,Taramani; Treaning Institute,South Chennai,2,"Taramani (Taramani, Treaning Institute) - 600113",high,exact source name,,"255, 275"

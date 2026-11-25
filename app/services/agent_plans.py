@@ -79,9 +79,9 @@ class AgentPlan:
 
 
 PLANS = (
-    AgentPlan("RESTAMP_AGENT_STARTER", "agent-starter", "Agent Starter Plan", 299900, 30, 5),
-    AgentPlan("RESTAMP_AGENT_PRO", "agent-pro", "Agent Pro Plan", 699900, 30, 10),
-    AgentPlan("RESTAMP_AGENT_ELITE", "agent-elite", "Agent Elite Plan", 1499900, 30, 15),
+    AgentPlan("RESTAMP_AGENT_STARTER", "agent-starter", "Dealer Starter Plan", 299900, 30, 5),
+    AgentPlan("RESTAMP_AGENT_PRO", "agent-pro", "Dealer Pro Plan", 699900, 30, 10),
+    AgentPlan("RESTAMP_AGENT_ELITE", "agent-elite", "Dealer Elite Plan", 1499900, 30, 15),
 )
 # Accept either the server code or the app's card id.
 BY_KEY = {**{p.code: p for p in PLANS}, **{p.app_id: p for p in PLANS}}
@@ -90,7 +90,7 @@ BY_KEY = {**{p.code: p for p in PLANS}, **{p.app_id: p for p in PLANS}}
 # number reveals unlimited (the buyer reveal quota never applies to agents).
 # Started once per account with start_trial; never purchasable through
 # subscribe_simulated, and upgrading to a paid tier replaces it.
-TRIAL = AgentPlan("RESTAMP_AGENT_TRIAL", "agent-trial", "Agent Free Trial", 0, None, 1)
+TRIAL = AgentPlan("RESTAMP_AGENT_TRIAL", "agent-trial", "Dealer Free Trial", 0, None, 1)
 BY_CODE = {p.code: p for p in (*PLANS, TRIAL)}
 CODES = tuple(BY_CODE)
 
@@ -166,9 +166,49 @@ def _clean_names(localities: list[str]) -> list[str]:
     return list(dict.fromkeys(n.strip() for n in localities if n and n.strip()))
 
 
+def _slots(db: Session, postcode_ids) -> dict[str, str]:
+    """{slot key: label} for granted postcodes — what a plan's location
+    limit counts. ONE slot per Agent Location Master PIN-code group, however
+    many localities that PIN code has (adding localities to a PIN code never
+    uses more slots). Postcodes outside the master (older grants) keep the
+    previous per-locality key, so existing entitlements are never reduced."""
+    from . import location_master as lm_svc
+
+    ids = sorted({int(i) for i in postcode_ids})
+    groups = lm_svc.groups_for_postcodes(db, ids)
+    out = {f"pin:{g.pincode}": f"{g.primary_name} - {g.pincode}" for g in groups.values()}
+    out.update(locality_svc.postcode_keys(db, [i for i in ids if i not in groups]))
+    return out
+
+
 def _covered(db: Session, user_id: int) -> dict[str, str]:
-    """{place key: display name} the agent covers now (unexpired grants)."""
-    return locality_svc.postcode_keys(db, broker_svc.active_postcode_ids(db, user_id))
+    """{slot key: label} the agent covers now (unexpired grants)."""
+    return _slots(db, broker_svc.active_postcode_ids(db, user_id))
+
+
+def _covered_groups(db: Session, user_id: int) -> list[dict]:
+    """The Agent Location Master groups the agent covers (stable ids)."""
+    from . import location_master as lm_svc
+
+    groups = lm_svc.groups_for_postcodes(db, broker_svc.active_postcode_ids(db, user_id))
+    return sorted(
+        ({"id": int(g.id), "pincode": g.pincode, "primary_name": g.primary_name, "zone": g.zone}
+         for g in groups.values()),
+        key=lambda g: g["pincode"],
+    )
+
+
+def _group_choice(db: Session, group_ids) -> tuple[list[int], list[str], list[str]]:
+    """Chosen Agent Location Master groups -> (postcode ids, labels, unknown
+    ids as strings). Ids are the stable group ids from /locations/agent-groups."""
+    from . import location_master as lm_svc
+
+    found, unknown = lm_svc.resolve_group_ids(db, group_ids)
+    return (
+        sorted(int(g.postcode_id) for g in found),
+        [f"{g.primary_name} - {g.pincode}" for g in found],
+        [str(i) for i in unknown],
+    )
 
 
 def _split(resolved: list) -> tuple[list, list[str], list[str]]:
@@ -208,6 +248,7 @@ def status_for(db: Session, user_id: int) -> dict:
         return {"has_plan": False}
     sub, plan = active
     localities = sorted(_covered(db, user_id).values())
+    groups = _covered_groups(db, user_id)
     return {
         "has_plan": True,
         "plan_code": plan.code,
@@ -219,16 +260,29 @@ def status_for(db: Session, user_id: int) -> dict:
         "valid_until": sub.end_date,
         "is_trial": plan.code == TRIAL.code,
         "localities": localities,
+        "location_groups": groups,
+        "group_ids": [g["id"] for g in groups],
         "localities_remaining": max(0, plan.locality_limit - len(localities)),
     }
 
 
 def _resolve_choice(
-    db: Session, plan: AgentPlan, localities: list[str]
+    db: Session, plan: AgentPlan, localities: list[str], group_ids=None
 ) -> tuple[list[int], list[str], list[str], list[str]]:
     """Validate a locality choice against the plan's limit: (postcode_ids,
     canonical names, unmatched, unavailable). Raises 422 when nothing is
-    usable or the limit would be exceeded — nothing is written."""
+    usable or the limit would be exceeded — nothing is written. ``group_ids``
+    (Agent Location Master PIN groups) take precedence over names."""
+    if group_ids:
+        postcode_ids, labels, unknown = _group_choice(db, group_ids)
+        if not postcode_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NOT_SERVED)
+        if len(_slots(db, postcode_ids)) > plan.locality_limit:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{plan.name} covers up to {plan.locality_limit} locations.",
+            )
+        return postcode_ids, sorted(labels), unknown, []
     names = _clean_names(localities)
     if not names:
         raise HTTPException(
@@ -244,7 +298,7 @@ def _resolve_choice(
         )
     _refuse_when_nothing_usable(ok, unavailable)
     postcode_ids = sorted({pid for r in ok for pid in r.postcode_ids})
-    if len(locality_svc.postcode_keys(db, postcode_ids)) > plan.locality_limit:
+    if len(_slots(db, postcode_ids)) > plan.locality_limit:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"{plan.name} covers up to {plan.locality_limit} localities.",
@@ -309,7 +363,7 @@ def _activate(
     db.flush()
 
 
-def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[str]) -> dict:
+def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[str], group_ids=None) -> dict:
     """Activate an agent plan for the chosen localities. PAYMENT IS SIMULATED.
     Development environments only: refused (403) in production/staging."""
     from .buyer_plans import require_simulated_purchase_allowed
@@ -318,7 +372,7 @@ def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[st
     plan = BY_KEY.get(key)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    postcode_ids, _canonical, unmatched, unavailable = _resolve_choice(db, plan, localities)
+    postcode_ids, _canonical, unmatched, unavailable = _resolve_choice(db, plan, localities, group_ids)
 
     row = _plan_row(db, plan)
     now = _now()
@@ -348,7 +402,9 @@ def subscribe_simulated(db: Session, user_id: int, key: str, localities: list[st
     return result
 
 
-def activate_for_payment(db: Session, payment: Payment, plan: AgentPlan, localities: list[str]) -> dict:
+def activate_for_payment(
+    db: Session, payment: Payment, plan: AgentPlan, localities: list[str], group_ids=None
+) -> dict:
     """Activate an agent plan from a verified payment row (real payment flow).
 
     The locality choice is re-validated here against the plan's limit — the
@@ -370,7 +426,7 @@ def activate_for_payment(db: Session, payment: Payment, plan: AgentPlan, localit
         result["amount_paise"] = payment.amount_paise
         result["activated"] = False
         return result
-    postcode_ids, _canonical, unmatched, unavailable = _resolve_choice(db, plan, localities)
+    postcode_ids, _canonical, unmatched, unavailable = _resolve_choice(db, plan, localities, group_ids)
     now = _now()
     _activate(db, payment.user_id, plan, postcode_ids, payment.id, now)
     result = status_for(db, payment.user_id)
@@ -418,7 +474,9 @@ def _lock_active(db: Session, user_id: int):
     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No active agent plan")
 
 
-def add_localities(db: Session, user_id: int, localities: list[str], *, actor_id: int | None = None) -> dict:
+def add_localities(
+    db: Session, user_id: int, localities: list[str], *, actor_id: int | None = None, group_ids=None
+) -> dict:
     """Add localities to the agent's ACTIVE plan, within its limit.
 
     No payment and no new subscription: the unused allowance was already paid
@@ -429,8 +487,8 @@ def add_localities(db: Session, user_id: int, localities: list[str], *, actor_id
     exceeded (nothing is written in either case). `actor_id` is the admin
     when an admin assigns on the agent's behalf (audited); default: the agent.
     """
-    names = _clean_names(localities)
-    if not names:
+    names = _clean_names(localities or [])
+    if not names and not group_ids:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Choose at least one locality.",
@@ -439,9 +497,16 @@ def add_localities(db: Session, user_id: int, localities: list[str], *, actor_id
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     sub, plan = _lock_active(db, user_id)
 
-    resolved = locality_svc.resolve(db, names)
-    ok, unmatched, unavailable = _split(resolved)
-    _refuse_when_nothing_usable(ok, unavailable)
+    if group_ids:
+        chosen_ids, _labels, unmatched = _group_choice(db, group_ids)
+        unavailable: list[str] = []
+        if not chosen_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NOT_SERVED)
+    else:
+        resolved = locality_svc.resolve(db, names)
+        ok, unmatched, unavailable = _split(resolved)
+        _refuse_when_nothing_usable(ok, unavailable)
+        chosen_ids = [pid for r in ok for pid in r.postcode_ids]
 
     # LOCKING read: under REPEATABLE READ a plain read would reuse the
     # snapshot taken before the plan lock was granted and miss grants a
@@ -453,9 +518,9 @@ def add_localities(db: Session, user_id: int, localities: list[str], *, actor_id
         .with_for_update()
         .all()
     }
-    current = locality_svc.postcode_keys(db, current_ids)
-    new_ids = sorted({pid for r in ok for pid in r.postcode_ids if pid not in current_ids})
-    added = {k: n for k, n in locality_svc.postcode_keys(db, new_ids).items() if k not in current}
+    current = _slots(db, current_ids)
+    new_ids = sorted({pid for pid in chosen_ids if pid not in current_ids})
+    added = {k: n for k, n in _slots(db, new_ids).items() if k not in current}
     if len(current) + len(added) > plan.locality_limit:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -582,7 +647,7 @@ def admin_coverage(db: Session, agent_id: int) -> dict:
     return {"user_id": agent_id, "plan": plan, "coverage": coverage}
 
 
-def start_trial(db: Session, user_id: int, locality: str) -> dict:
+def start_trial(db: Session, user_id: int, locality: str, group_id: int | None = None) -> dict:
     """Start the agent free trial with ONE area (no payment, no expiry).
 
     Once per account: refused (409) while any agent plan is active and once a
@@ -593,11 +658,11 @@ def start_trial(db: Session, user_id: int, locality: str) -> dict:
     activation (no money). Coverage = that area's postcodes, no expiry; the
     account's role becomes BROKER."""
     name = (locality or "").strip()
-    if not name:
+    if not name and not group_id:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Choose an area.")
     capabilities.ensure_compatible(db, user_id, "BROKER")
     if _active(db, user_id) is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent plan already active")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Dealer plan already active")
     used = (
         db.query(Subscription.id)
         .join(Plan, Plan.id == Subscription.plan_id)
@@ -606,9 +671,15 @@ def start_trial(db: Session, user_id: int, locality: str) -> dict:
     )
     if used is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Free trial already used")
-    ok, unmatched, unavailable = _split(locality_svc.resolve(db, [name]))
-    _refuse_when_nothing_usable(ok, unavailable)
-    postcode_ids = sorted(set(ok[0].postcode_ids))
+    if group_id:
+        # One Agent Location Master PIN group = the trial's one area.
+        postcode_ids, _labels, _unknown = _group_choice(db, [group_id])
+        if not postcode_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NOT_SERVED)
+    else:
+        ok, unmatched, unavailable = _split(locality_svc.resolve(db, [name]))
+        _refuse_when_nothing_usable(ok, unavailable)
+        postcode_ids = sorted(set(ok[0].postcode_ids))
 
     row = _plan_row(db, TRIAL)
     now = _now()

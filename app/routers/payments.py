@@ -40,6 +40,7 @@ class CheckoutIn(BaseModel):
     kind: Literal["buyer", "agent", "owner", "credits"]
     code: str = Field(min_length=1, max_length=50)
     localities: list[str] = Field(default_factory=list, max_length=50)
+    group_ids: list[int] = Field(default_factory=list, max_length=50)
 
 
 class VerifyIn(BaseModel):
@@ -64,7 +65,7 @@ async def create_checkout(
     """Create a Razorpay order for a plan. The amount comes from the server's
     plan constants (never the client); agent localities are validated here.
     503 when the provider is unconfigured; 502 when the gateway fails."""
-    result = await payments_svc.create_checkout(db, user_id, body.kind, body.code, body.localities)
+    result = await payments_svc.create_checkout(db, user_id, body.kind, body.code, body.localities, body.group_ids)
     db.commit()
     return result
 

@@ -205,8 +205,10 @@ class Settings:
 
     # PRODUCTION ONLY: explicit opt-in that lets a local frontend call a
     # production-classified backend. Only the exact value "1" enables it, and
-    # it then allows EXACTLY the fixed origins in PRODUCTION_LOCAL_DEV_ORIGINS
-    # (below) — never RESTAMP_CORS_DEV_ORIGINS, never other ports or hosts.
+    # it then allows the fixed origins in PRODUCTION_LOCAL_DEV_ORIGINS (below)
+    # plus the exact localhost / 127.0.0.1 origins listed in
+    # RESTAMP_CORS_DEV_ORIGINS (each validated by is_valid_localhost_origin;
+    # anything else in that list is ignored). Never LAN or external hosts.
     # Default "0" (disabled): production allows only RESTAMP_CORS_ORIGINS.
     CORS_ALLOW_LOCALHOST_IN_PRODUCTION: bool = _get("RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION", "0") == "1"
 
@@ -486,8 +488,13 @@ PRODUCTION_LOCAL_DEV_ORIGINS: tuple[str, ...] = ("http://localhost:3000", "http:
 
 
 def production_local_dev_origins() -> list[str]:
-    """The local origins production allows: the fixed pair when opted in, else none."""
-    return list(PRODUCTION_LOCAL_DEV_ORIGINS) if settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION else []
+    """The local origins production allows when opted in, else none: the
+    fixed pair plus each RESTAMP_CORS_DEV_ORIGINS entry that is an exact
+    http(s) localhost / 127.0.0.1 origin. Other entries are dropped."""
+    if not settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION:
+        return []
+    extra = [o for o in parse_cors_origins(settings.DEV_CORS_ORIGINS) if is_valid_localhost_origin(o)]
+    return list(dict.fromkeys(list(PRODUCTION_LOCAL_DEV_ORIGINS) + extra))
 
 
 def parse_cors_origins(raw: str | None) -> list[str]:
@@ -916,24 +923,31 @@ def validate_security_config() -> None:
             "only exact public https origins (scheme and host, no path, no "
             "wildcard, no localhost or private-network hosts)."
         )
-    # Local frontend origins (explicit opt-in). The allowed set is fixed in
-    # code (PRODUCTION_LOCAL_DEV_ORIGINS), so there is nothing to validate —
-    # but never silently: say which origins are open. RESTAMP_CORS_DEV_ORIGINS
-    # is a development setting and is ignored here (it can never widen
-    # production CORS). Setting names / fixed origins only, never values.
+    # Local frontend origins (explicit opt-in): the fixed pair plus the
+    # exact localhost / 127.0.0.1 entries of RESTAMP_CORS_DEV_ORIGINS. Never
+    # silently: say which origins are open (all are localhost-only by
+    # construction) and how many configured entries were dropped as invalid.
+    dev_listed = parse_cors_origins(settings.DEV_CORS_ORIGINS)
     if settings.CORS_ALLOW_LOCALHOST_IN_PRODUCTION:
         _log.warning(
             "RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1: browser origins %s "
             "may call this production backend (credentialed CORS). CORS is not "
             "authentication: every endpoint still requires its normal "
             "authentication and authorization.",
-            ", ".join(PRODUCTION_LOCAL_DEV_ORIGINS),
+            ", ".join(production_local_dev_origins()),
         )
-    if parse_cors_origins(settings.DEV_CORS_ORIGINS):
+        dropped = sum(1 for o in dev_listed if not is_valid_localhost_origin(o))
+        if dropped:
+            _log.warning(
+                "RESTAMP_CORS_DEV_ORIGINS: %d entr%s ignored in production (only "
+                "exact http(s)://localhost or 127.0.0.1 origins are allowed).",
+                dropped, "y" if dropped == 1 else "ies",
+            )
+    elif dev_listed:
         _log.warning(
-            "RESTAMP_CORS_DEV_ORIGINS is set but ignored in production; use "
-            "RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 for the approved "
-            "local origins."
+            "RESTAMP_CORS_DEV_ORIGINS is set but ignored in production; set "
+            "RESTAMP_CORS_ALLOW_LOCALHOST_IN_PRODUCTION=1 to allow its "
+            "localhost origins."
         )
     if is_staging():
         # The fixed testing OTP is ALWAYS active in staging (there is no

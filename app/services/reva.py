@@ -219,13 +219,13 @@ def signed_in_context(db: Session, user_id: int) -> list[str]:
             if status.get("has_plan"):
                 remaining = status.get("localities_remaining")
                 lines.append(
-                    f"Agent plan: {status.get('plan_name')} covering "
+                    f"Dealer plan: {status.get('plan_name')} covering "
                     f"{len(status.get('localities') or [])}"
                     + (f" of {status.get('locality_limit')} areas ({remaining} unused)" if remaining is not None else "")
                     + f", valid until {status.get('valid_until') or 'no end date'}."
                 )
             else:
-                lines.append("Agent plan: none active (free trial may be available).")
+                lines.append("Dealer plan: none active (free trial may be available).")
         except Exception:
             pass
         return lines

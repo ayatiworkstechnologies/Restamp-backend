@@ -175,7 +175,7 @@ def test_agent_rules_unchanged_after_loading_the_picker_catalog(client):
     assert r.status_code == 200 and r.json()["unmatched_localities"] == ["Atlantis Nagar"]
     assert len(r.json()["added_localities"]) == 2 and r.json()["localities_remaining"] == 0
     r = c.post("/broker/plan/localities", json={"localities": [names[12]]}, headers=h)
-    assert r.status_code == 422 and r.json()["detail"] == "Agent Starter Plan covers up to 5 localities."
+    assert r.status_code == 422 and r.json()["detail"] == "Dealer Starter Plan covers up to 5 localities."
     assert session.execute(text("SELECT COUNT(*) FROM payments WHERE user_id=:u"), {"u": uid}).scalar() == payments
     assert session.execute(text("SELECT end_date FROM subscriptions WHERE user_id=:u AND status='ACTIVE'"),
                            {"u": uid}).scalar() == end
