@@ -451,7 +451,7 @@ def seed_verified(c, listing_id) -> None:
     seed VERIFIED rows directly. No HTTP route, no notification. Tests about
     who may verify use admin_verify / the routes instead."""
     from app.models import PropertyListing
-    from app.services import owner_listings as owner_svc
+    from app.services import owner_listings as owner_svc 
 
     session = c.test_session
     owner_id = session.get(PropertyListing, listing_id).user_id
